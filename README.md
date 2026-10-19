@@ -83,7 +83,14 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   <a href="https://www.youtube.com/watch?v=4UmC0u8DJmY"><img src="https://img.youtube.com/vi/4UmC0u8DJmY/hqdefault.jpg" width="49%" alt="Watch LSX4 video demonstration 2 on YouTube"></a>
 </p>
 
-### Device previews (104 playable games)
+### Device previews
+
+| [Playable](#playable) | [Low FPS playable](#low-fps-playable) | [In game](#in-game) |
+| :---: | :---: | :---: |
+
+#### Playable
+
+104 games confirmed playable on test devices.
 
 <table>
   <tr>
@@ -304,7 +311,32 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
 </details>
 
-The table mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026.
+The Playable gallery mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026.
+
+#### Low FPS playable
+
+These games reach gameplay and can be played, but performance still needs work on the tested Vivo device.
+
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/god-of-war-iii-remastered-low-fps.jpg" alt="God of War III Remastered running in LSX4 on Vivo"><br><sub><b>God of War III Remastered</b> · PS4 · Vivo</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/infamous-second-son-low-fps.jpg" alt="inFAMOUS Second Son running in LSX4 on Vivo"><br><sub><b>inFAMOUS Second Son</b> · PS4 · Vivo</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/the-order-1886-low-fps.jpg" alt="The Order: 1886 running in LSX4 on Vivo"><br><sub><b>The Order: 1886</b> · PS4 · Vivo</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/elden-ring-low-fps.jpg" alt="Elden Ring running in LSX4 on Vivo"><br><sub><b>Elden Ring</b> · PS4 · Vivo</sub></td>
+  </tr>
+</table>
+
+#### In game
+
+These games reach gameplay but are not yet classified as playable.
+
+<table>
+  <tr>
+    <td align="center"><img src="assets/screenshots/god-of-war-sons-of-sparta-ps5.png" alt="God of War Sons of Sparta running in LSX4 with the PS5 runtime"><br><sub><b>God of War Sons of Sparta</b> · PS5</sub></td>
+  </tr>
+</table>
 
 ### Playable compatibility list (104 games)
 
