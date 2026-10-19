@@ -72,7 +72,7 @@ contains the same information in a machine-readable format.
 - Implementing Mali support and improving performance on Mali devices.
 - Increasing the number of playable titles by testing currently untested games.
 
-## Playable games
+## Playable games (100+)
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
