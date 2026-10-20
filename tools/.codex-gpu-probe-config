@@ -1,0 +1,8 @@
+budget=8
+maxBytes=16777216
+buffers=0
+drawFirst=1
+drawCount=1
+drawStride=1
+drawHash=0x280bae0f
+dispatchCount=0

@@ -5,13 +5,22 @@
 #include <dlfcn.h>
 
 #include <fcntl.h>
+#include <linux/perf_event.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -22,7 +31,22 @@ using str_fn = const char* (*)();
 using init_fn = int (*)(const char*, const char*);
 using path_fn = int (*)(const char*);
 using int_fn = int (*)(int);
+using android_memory_info_fn =
+    int (*)(int, unsigned long long, unsigned long long, int);
+using android_process_memory_info_fn =
+    int (*)(unsigned long long, unsigned long long, unsigned long long);
 using option_fn = int (*)(int, int);
+using guest_cpu_backend_set_fn = int (*)(int, const char*, const char*);
+using guest_cpu_backend_set_v2_fn =
+    int (*)(int, const char*, const char*, const char*);
+using guest_cpu_backend_set_v3_fn =
+    int (*)(int, const char*, const char*, const char*, const char*, const char*,
+            const char*);
+using vulkan_driver_axis_set_fn = int (*)(int, const char*, const char*, const char*);
+using vulkan_driver_axis_set_v2_fn =
+    int (*)(int, const char*, const char*, const char*, const char*);
+using vulkan_driver_axis_probe_v2_fn =
+    const char* (*)(int, const char*, const char*, const char*, const char*);
 using json_report_fn = int (*)(const char*);
 using noarg_int_fn = int (*)();
 using pad_button_fn = int (*)(unsigned int, int);
@@ -46,6 +70,13 @@ void* g_ps5_runtime = nullptr;
 std::string g_ps5_runtime_path;
 str_fn g_ps5_abi = nullptr;
 str_fn g_ps5_status = nullptr;
+guest_cpu_backend_set_fn g_ps5_set_guest_cpu_backend = nullptr;
+guest_cpu_backend_set_v2_fn g_ps5_set_guest_cpu_backend_v2 = nullptr;
+guest_cpu_backend_set_v3_fn g_ps5_set_guest_cpu_backend_v3 = nullptr;
+str_fn g_ps5_guest_cpu_backend_status = nullptr;
+vulkan_driver_axis_set_fn g_ps5_set_vulkan_driver_axis = nullptr;
+vulkan_driver_axis_set_v2_fn g_ps5_set_vulkan_driver_axis_v2 = nullptr;
+str_fn g_ps5_vulkan_driver_status = nullptr;
 init_fn g_ps5_initialize = nullptr;
 attach_surface_fn g_ps5_attach_surface = nullptr;
 detach_surface_fn g_ps5_detach_surface = nullptr;
@@ -53,6 +84,8 @@ path_fn g_ps5_scan_game = nullptr;
 path_fn g_ps5_launch_game_jit = nullptr;
 pad_button_fn g_ps5_set_pad_button = nullptr;
 pad_axis_fn g_ps5_set_pad_axis = nullptr;
+int_fn g_ps5_set_runtime_paused = nullptr;
+str_fn g_ps5_runtime_lifecycle_status = nullptr;
 str_fn g_abi = nullptr;
 str_fn g_version = nullptr;
 str_fn g_system_info = nullptr;
@@ -66,6 +99,16 @@ present_homebrew_loader_frame_fn g_present_homebrew_loader_frame = nullptr;
 present_frame_dump_fn g_present_frame_dump = nullptr;
 str_fn g_status = nullptr;
 str_fn g_jit_status = nullptr;
+str_fn g_fex_proof_metrics = nullptr;
+str_fn g_runtime_proof_counters = nullptr;
+str_fn g_gpu_residency_metrics = nullptr;
+guest_cpu_backend_set_fn g_set_guest_cpu_backend = nullptr;
+guest_cpu_backend_set_v2_fn g_set_guest_cpu_backend_v2 = nullptr;
+guest_cpu_backend_set_v3_fn g_set_guest_cpu_backend_v3 = nullptr;
+str_fn g_guest_cpu_backend_status = nullptr;
+vulkan_driver_axis_set_fn g_set_vulkan_driver_axis = nullptr;
+vulkan_driver_axis_set_v2_fn g_set_vulkan_driver_axis_v2 = nullptr;
+str_fn g_vulkan_driver_status = nullptr;
 runtime_hud_stats_fn g_runtime_hud_stats = nullptr;
 runtime_hud_stats_fn g_ps5_runtime_hud_stats = nullptr;
 std::atomic<bool> g_active_ps5_runtime{false};
@@ -78,6 +121,7 @@ path_fn g_translator_install_helper = nullptr;
 path_fn g_translator_run_guest_elf = nullptr;
 path_fn g_prepare_translator_launch = nullptr;
 int_fn g_report_translator_result = nullptr;
+int_fn g_set_render_scale_percent = nullptr;
 json_report_fn g_report_translator_result_json = nullptr;
 str_fn g_translator_launch_request = nullptr;
 noarg_int_fn g_vortek_ring_selftest = nullptr;
@@ -98,10 +142,20 @@ pad_axis_fn g_set_pad_axis = nullptr;
 pad_touch_fn g_set_touchpad = nullptr;
 noarg_int_fn g_audio_init = nullptr;
 int_fn g_set_audio_enabled = nullptr;
+int_fn g_set_runtime_paused = nullptr;
+int_fn g_report_android_memory_pressure = nullptr;
+android_memory_info_fn g_report_android_memory_info = nullptr;
+android_process_memory_info_fn g_report_android_process_memory_info = nullptr;
+noarg_int_fn g_android_memory_pressure_monitor_requested = nullptr;
+str_fn g_runtime_lifecycle_status = nullptr;
 option_fn g_set_managed_optimization = nullptr;
 option_fn g_ps5_set_managed_optimization = nullptr;
 noarg_int_fn g_audio_probe_tone = nullptr;
 str_fn g_audio_status = nullptr;
+std::string g_guest_cpu_backend_bridge_status =
+    R"({"schema":"lsx4.guest-cpu-backend.v1","platform":"unknown","requested":"current","effective":"current","supported":true,"fallbackReason":"none","selectionLocked":false,"source":"bridge-default"})";
+std::string g_vulkan_driver_bridge_status =
+    R"({"schema":"lsx4.vulkan-driver-axis.v1","requested":"system","effective":"system","fallbackReason":"bridge-default"})";
 
 std::string g_fallback_files_root;
 std::string g_fallback_native_lib_dir;
@@ -112,6 +166,157 @@ noarg_int_fn g_stop_present_pump = nullptr;
 
 using run_embedded_elf_fn = int (*)(const char*, const char*, const char*);
 run_embedded_elf_fn g_run_embedded_linux_elf = nullptr;
+
+
+
+
+
+
+class HostPmuSampler
+{
+public:
+    static constexpr std::size_t kEventCount = 4;
+
+    struct Snapshot
+    {
+        bool available{};
+        int error{};
+        std::uint64_t timestamp_ns{};
+        std::array<std::uint64_t, kEventCount> values{};
+    };
+
+    ~HostPmuSampler()
+    {
+        CloseEvents();
+    }
+
+    Snapshot Sample()
+    {
+        std::lock_guard lock{mutex_};
+        Snapshot snapshot{};
+        timespec now{};
+        if (::clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+        {
+            snapshot.timestamp_ns = static_cast<std::uint64_t>(now.tv_sec) *
+                                        1'000'000'000ull +
+                                    static_cast<std::uint64_t>(now.tv_nsec);
+        }
+
+        if (!attempted_)
+        {
+            attempted_ = true;
+            OpenEvents();
+        }
+        snapshot.error = error_;
+        if (!available_)
+        {
+            return snapshot;
+        }
+
+        for (std::size_t index = 0; index < events_.size(); ++index)
+        {
+            PerfReadValue value{};
+            const ssize_t count = ::read(events_[index], &value, sizeof(value));
+            if (count != static_cast<ssize_t>(sizeof(value)) || value.time_running == 0)
+            {
+                error_ = count < 0 ? errno : EIO;
+                __android_log_print(ANDROID_LOG_WARN, "LSX4Pmu",
+                                    "host PMU read failed event=%zu bytes=%zd running=%llu errno=%d",
+                                    index, count,
+                                    static_cast<unsigned long long>(value.time_running),
+                                    error_);
+                snapshot.error = error_;
+                available_ = false;
+                CloseEvents();
+                return snapshot;
+            }
+            snapshot.values[index] = Scale(value);
+        }
+        snapshot.available = true;
+        return snapshot;
+    }
+
+private:
+    struct PerfReadValue
+    {
+        std::uint64_t value{};
+        std::uint64_t time_enabled{};
+        std::uint64_t time_running{};
+    };
+
+    static std::uint64_t Scale(const PerfReadValue& value)
+    {
+        if (value.time_enabled == value.time_running)
+        {
+            return value.value;
+        }
+        const long double scaled = static_cast<long double>(value.value) *
+                                   static_cast<long double>(value.time_enabled) /
+                                   static_cast<long double>(value.time_running);
+        const long double maximum =
+            static_cast<long double>(std::numeric_limits<std::uint64_t>::max());
+        return static_cast<std::uint64_t>(std::min(scaled, maximum));
+    }
+
+    void OpenEvents()
+    {
+        constexpr std::array<std::uint64_t, kEventCount> configs{
+            PERF_COUNT_HW_INSTRUCTIONS,
+            PERF_COUNT_HW_CPU_CYCLES,
+            PERF_COUNT_HW_BRANCH_INSTRUCTIONS,
+            PERF_COUNT_HW_BRANCH_MISSES,
+        };
+        for (std::size_t index = 0; index < configs.size(); ++index)
+        {
+            perf_event_attr attr{};
+            attr.type = PERF_TYPE_HARDWARE;
+            attr.size = sizeof(attr);
+            attr.config = configs[index];
+            attr.disabled = 0;
+            attr.inherit = 1;
+            attr.exclude_kernel = 1;
+            attr.exclude_hv = 1;
+            attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED |
+                               PERF_FORMAT_TOTAL_TIME_RUNNING;
+            const int fd = static_cast<int>(::syscall(
+                __NR_perf_event_open, &attr, 0, -1, -1, PERF_FLAG_FD_CLOEXEC));
+            if (fd < 0)
+            {
+                error_ = errno;
+                __android_log_print(ANDROID_LOG_WARN, "LSX4Pmu",
+                                    "host PMU unavailable event=%zu errno=%d",
+                                    index, error_);
+                CloseEvents();
+                return;
+            }
+            events_[index] = fd;
+        }
+        available_ = true;
+        __android_log_print(ANDROID_LOG_INFO, "LSX4Pmu",
+                            "host PMU enabled inherited=1 events=%zu",
+                            events_.size());
+    }
+
+    void CloseEvents()
+    {
+        for (int& fd : events_)
+        {
+            if (fd >= 0)
+            {
+                ::close(fd);
+                fd = -1;
+            }
+        }
+    }
+
+    std::mutex mutex_;
+    std::array<int, kEventCount> events_{-1, -1, -1, -1};
+    bool attempted_{};
+    bool available_{};
+    int error_{};
+};
+
+HostPmuSampler g_host_pmu_sampler;
 
 jstring to_jstring(JNIEnv* env, const std::string& value)
 {
@@ -444,6 +649,35 @@ Java_app_lsx4_android_RuntimeBridge_load(JNIEnv* env, jclass, jstring path)
         resolve_optional<present_frame_dump_fn>("executor_lsx4_runtime_present_frame_dump_file");
     g_status = resolve_optional<str_fn>("executor_lsx4_runtime_status");
     g_jit_status = resolve_optional<str_fn>("executor_lsx4_runtime_jit_status");
+    g_fex_proof_metrics = resolve_optional<str_fn>(
+        "executor_lsx4_runtime_fex_proof_metrics");
+    g_runtime_proof_counters = resolve_optional<str_fn>(
+        "executor_lsx4_runtime_proof_counters");
+    g_gpu_residency_metrics = resolve_optional<str_fn>(
+        "executor_lsx4_runtime_gpu_residency_metrics");
+    g_report_android_memory_pressure = resolve_optional<int_fn>(
+        "executor_lsx4_runtime_report_android_memory_pressure");
+    g_report_android_memory_info = resolve_optional<android_memory_info_fn>(
+        "executor_lsx4_runtime_report_android_memory_info");
+    g_report_android_process_memory_info =
+        resolve_optional<android_process_memory_info_fn>(
+            "executor_lsx4_runtime_report_android_process_memory_info");
+    g_android_memory_pressure_monitor_requested = resolve_optional<noarg_int_fn>(
+        "executor_lsx4_runtime_android_memory_pressure_monitor_requested");
+    g_set_guest_cpu_backend = resolve_optional<guest_cpu_backend_set_fn>(
+        "executor_lsx4_runtime_set_guest_cpu_backend");
+    g_set_guest_cpu_backend_v2 = resolve_optional<guest_cpu_backend_set_v2_fn>(
+        "executor_lsx4_runtime_set_guest_cpu_backend_v2");
+    g_set_guest_cpu_backend_v3 = resolve_optional<guest_cpu_backend_set_v3_fn>(
+        "executor_lsx4_runtime_set_guest_cpu_backend_v3");
+    g_guest_cpu_backend_status = resolve_optional<str_fn>(
+        "executor_lsx4_runtime_guest_cpu_backend_status");
+    g_set_vulkan_driver_axis = resolve_optional<vulkan_driver_axis_set_fn>(
+        "executor_lsx4_runtime_set_vulkan_driver_axis");
+    g_set_vulkan_driver_axis_v2 = resolve_optional<vulkan_driver_axis_set_v2_fn>(
+        "executor_lsx4_runtime_set_vulkan_driver_axis_v2");
+    g_vulkan_driver_status = resolve_optional<str_fn>(
+        "executor_lsx4_runtime_vulkan_driver_status");
     g_runtime_hud_stats =
         resolve_optional<runtime_hud_stats_fn>("executor_lsx4_runtime_hud_stats");
     g_jit_selftest = resolve_optional<str_fn>("executor_lsx4_runtime_jit_selftest");
@@ -467,6 +701,8 @@ Java_app_lsx4_android_RuntimeBridge_load(JNIEnv* env, jclass, jstring path)
         resolve_optional<path_fn>("executor_lsx4_runtime_prepare_translator_launch");
     g_report_translator_result =
         resolve_optional<int_fn>("executor_lsx4_runtime_report_translator_result");
+    g_set_render_scale_percent =
+        resolve_optional<int_fn>("executor_lsx4_runtime_set_render_scale_percent");
     g_report_translator_result_json =
         resolve_optional<json_report_fn>("executor_lsx4_runtime_report_translator_result_json");
     g_translator_launch_request =
@@ -503,6 +739,10 @@ Java_app_lsx4_android_RuntimeBridge_load(JNIEnv* env, jclass, jstring path)
     g_audio_init = resolve_optional<noarg_int_fn>("executor_lsx4_runtime_audio_init");
     g_set_audio_enabled =
         resolve_optional<int_fn>("executor_lsx4_runtime_set_audio_enabled");
+    g_set_runtime_paused =
+        resolve_optional<int_fn>("executor_lsx4_runtime_set_paused");
+    g_runtime_lifecycle_status =
+        resolve_optional<str_fn>("executor_lsx4_runtime_lifecycle_status");
     g_set_managed_optimization = resolve_optional<option_fn>(
         "executor_lsx4_runtime_set_managed_optimization");
     g_audio_probe_tone =
@@ -561,6 +801,22 @@ Java_app_lsx4_android_RuntimeBridge_loadPs5(JNIEnv* env, jclass, jstring path)
         env, "executor_lsx4_ps5_runtime_abi");
     g_ps5_status = resolve_ps5_required<str_fn>(
         env, "executor_lsx4_ps5_runtime_status");
+    g_ps5_set_guest_cpu_backend = resolve_ps5_optional<guest_cpu_backend_set_fn>(
+        "executor_lsx4_ps5_runtime_set_guest_cpu_backend");
+    g_ps5_set_guest_cpu_backend_v2 =
+        resolve_ps5_optional<guest_cpu_backend_set_v2_fn>(
+            "executor_lsx4_ps5_runtime_set_guest_cpu_backend_v2");
+    g_ps5_set_guest_cpu_backend_v3 =
+        resolve_ps5_optional<guest_cpu_backend_set_v3_fn>(
+            "executor_lsx4_ps5_runtime_set_guest_cpu_backend_v3");
+    g_ps5_guest_cpu_backend_status = resolve_ps5_optional<str_fn>(
+        "executor_lsx4_ps5_runtime_guest_cpu_backend_status");
+    g_ps5_set_vulkan_driver_axis = resolve_ps5_optional<vulkan_driver_axis_set_fn>(
+        "executor_lsx4_ps5_runtime_set_vulkan_driver_axis");
+    g_ps5_set_vulkan_driver_axis_v2 = resolve_ps5_optional<vulkan_driver_axis_set_v2_fn>(
+        "executor_lsx4_ps5_runtime_set_vulkan_driver_axis_v2");
+    g_ps5_vulkan_driver_status = resolve_ps5_optional<str_fn>(
+        "executor_lsx4_ps5_runtime_vulkan_driver_status");
     g_ps5_initialize = resolve_ps5_required<init_fn>(
         env, "executor_lsx4_ps5_runtime_initialize_android");
     g_ps5_attach_surface = resolve_ps5_required<attach_surface_fn>(
@@ -575,6 +831,10 @@ Java_app_lsx4_android_RuntimeBridge_loadPs5(JNIEnv* env, jclass, jstring path)
         env, "executor_lsx4_ps5_runtime_set_pad_button");
     g_ps5_set_pad_axis = resolve_ps5_required<pad_axis_fn>(
         env, "executor_lsx4_ps5_runtime_set_pad_axis");
+    g_ps5_set_runtime_paused = resolve_ps5_optional<int_fn>(
+        "executor_lsx4_ps5_runtime_set_paused");
+    g_ps5_runtime_lifecycle_status = resolve_ps5_optional<str_fn>(
+        "executor_lsx4_ps5_runtime_lifecycle_status");
     g_ps5_runtime_hud_stats = resolve_ps5_optional<runtime_hud_stats_fn>(
         "executor_lsx4_ps5_runtime_hud_stats");
     g_ps5_set_managed_optimization = resolve_ps5_optional<option_fn>(
@@ -596,6 +856,244 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_app_lsx4_android_RuntimeBridge_ps5Abi(JNIEnv* env, jclass)
 {
     return to_jstring(env, call_or_empty(g_ps5_abi));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_setGuestCpuBackend(
+    JNIEnv* env, jclass, jint requested_backend, jstring adapter_path,
+    jstring runtime_root, jstring launch_title_id, jstring hardware_profile,
+    jstring driver_family, jstring driver_version)
+{
+    const char* raw_adapter = adapter_path
+        ? env->GetStringUTFChars(adapter_path, nullptr) : nullptr;
+    const char* raw_root = runtime_root
+        ? env->GetStringUTFChars(runtime_root, nullptr) : nullptr;
+    const char* raw_title = launch_title_id
+        ? env->GetStringUTFChars(launch_title_id, nullptr) : nullptr;
+    const char* raw_hardware = hardware_profile
+        ? env->GetStringUTFChars(hardware_profile, nullptr) : nullptr;
+    const char* raw_driver_family = driver_family
+        ? env->GetStringUTFChars(driver_family, nullptr) : nullptr;
+    const char* raw_driver_version = driver_version
+        ? env->GetStringUTFChars(driver_version, nullptr) : nullptr;
+    const std::string adapter = raw_adapter ? raw_adapter : "";
+    const std::string root = raw_root ? raw_root : "";
+    const std::string title = raw_title ? raw_title : "";
+    const std::string hardware = raw_hardware ? raw_hardware : "";
+    const std::string family = raw_driver_family ? raw_driver_family : "";
+    const std::string version = raw_driver_version ? raw_driver_version : "";
+    if (raw_adapter)
+    {
+        env->ReleaseStringUTFChars(adapter_path, raw_adapter);
+    }
+    if (raw_root)
+    {
+        env->ReleaseStringUTFChars(runtime_root, raw_root);
+    }
+    if (raw_title)
+    {
+        env->ReleaseStringUTFChars(launch_title_id, raw_title);
+    }
+    if (raw_hardware)
+    {
+        env->ReleaseStringUTFChars(hardware_profile, raw_hardware);
+    }
+    if (raw_driver_family)
+    {
+        env->ReleaseStringUTFChars(driver_family, raw_driver_family);
+    }
+    if (raw_driver_version)
+    {
+        env->ReleaseStringUTFChars(driver_version, raw_driver_version);
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    guest_cpu_backend_set_v3_fn setter_v3 =
+        g_active_ps5_runtime.load(std::memory_order_acquire)
+            ? g_ps5_set_guest_cpu_backend_v3
+            : g_set_guest_cpu_backend_v3;
+    guest_cpu_backend_set_v2_fn setter_v2 =
+        g_active_ps5_runtime.load(std::memory_order_acquire)
+            ? g_ps5_set_guest_cpu_backend_v2
+            : g_set_guest_cpu_backend_v2;
+    guest_cpu_backend_set_fn setter =
+        g_active_ps5_runtime.load(std::memory_order_acquire)
+            ? g_ps5_set_guest_cpu_backend
+            : g_set_guest_cpu_backend;
+    if (setter_v3 || setter_v2 || setter)
+    {
+        const int effective = setter_v3
+            ? setter_v3(static_cast<int>(requested_backend), adapter.c_str(),
+                        root.c_str(), title.c_str(), hardware.c_str(),
+                        family.c_str(), version.c_str())
+            : (setter_v2
+                   ? setter_v2(static_cast<int>(requested_backend), adapter.c_str(),
+                               root.c_str(), title.c_str())
+                   : setter(static_cast<int>(requested_backend), adapter.c_str(),
+                            root.c_str()));
+        str_fn status = g_active_ps5_runtime.load(std::memory_order_acquire)
+            ? g_ps5_guest_cpu_backend_status
+            : g_guest_cpu_backend_status;
+        if (status)
+        {
+            const char* value = status();
+            g_guest_cpu_backend_bridge_status = value ? value : "{}";
+        }
+        return effective == 1 ? 1 : 0;
+    }
+
+    const bool requested_fex = requested_backend == 1;
+    g_guest_cpu_backend_bridge_status = requested_fex
+        ? R"({"schema":"lsx4.guest-cpu-backend.v1","platform":"unknown","requested":"fex-experimental","effective":"current","supported":false,"fallbackReason":"runtime-symbol-missing","selectionLocked":false,"source":"jni-bridge"})"
+        : R"({"schema":"lsx4.guest-cpu-backend.v1","platform":"unknown","requested":"current","effective":"current","supported":true,"fallbackReason":"none","selectionLocked":false,"source":"jni-bridge-legacy-runtime"})";
+    return 0;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_app_lsx4_android_RuntimeBridge_guestCpuBackendStatus(JNIEnv* env, jclass)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    str_fn status = g_active_ps5_runtime.load(std::memory_order_acquire)
+        ? g_ps5_guest_cpu_backend_status
+        : g_guest_cpu_backend_status;
+    if (status)
+    {
+        const char* value = status();
+        g_guest_cpu_backend_bridge_status = value ? value : "{}";
+    }
+    return to_jstring(env, g_guest_cpu_backend_bridge_status);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_setVulkanDriverAxis(
+    JNIEnv* env, jclass, jboolean requested_turnip, jstring native_library_dir,
+    jstring turnip_library_dir, jstring report_path, jstring turnip_sha256)
+{
+    const char* raw_native_dir = native_library_dir
+        ? env->GetStringUTFChars(native_library_dir, nullptr) : nullptr;
+    const char* raw_turnip_dir = turnip_library_dir
+        ? env->GetStringUTFChars(turnip_library_dir, nullptr) : nullptr;
+    const char* raw_report = report_path
+        ? env->GetStringUTFChars(report_path, nullptr) : nullptr;
+    const char* raw_sha = turnip_sha256
+        ? env->GetStringUTFChars(turnip_sha256, nullptr) : nullptr;
+    const std::string native_dir = raw_native_dir ? raw_native_dir : "";
+    const std::string turnip_dir = raw_turnip_dir ? raw_turnip_dir : "";
+    const std::string report = raw_report ? raw_report : "";
+    const std::string sha = raw_sha ? raw_sha : "";
+    if (raw_sha)
+        env->ReleaseStringUTFChars(turnip_sha256, raw_sha);
+    if (raw_report)
+        env->ReleaseStringUTFChars(report_path, raw_report);
+    if (raw_native_dir)
+        env->ReleaseStringUTFChars(native_library_dir, raw_native_dir);
+    if (raw_turnip_dir)
+        env->ReleaseStringUTFChars(turnip_library_dir, raw_turnip_dir);
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const bool ps5 = g_active_ps5_runtime.load(std::memory_order_acquire);
+    vulkan_driver_axis_set_fn setter =
+        ps5 ? g_ps5_set_vulkan_driver_axis : g_set_vulkan_driver_axis;
+    vulkan_driver_axis_set_v2_fn setter_v2 =
+        ps5 ? g_ps5_set_vulkan_driver_axis_v2 : g_set_vulkan_driver_axis_v2;
+    str_fn status = ps5 ? g_ps5_vulkan_driver_status : g_vulkan_driver_status;
+    if (setter_v2)
+    {
+        const int effective = setter_v2(requested_turnip ? 1 : 0, native_dir.c_str(),
+                                        turnip_dir.c_str(), report.c_str(), sha.c_str());
+        if (status)
+        {
+            const char* value = status();
+            g_vulkan_driver_bridge_status = value ? value : "{}";
+        }
+        return effective;
+    }
+    if (setter && (!requested_turnip || turnip_dir == native_dir))
+    {
+        const int effective = setter(requested_turnip ? 1 : 0, native_dir.c_str(),
+                                     report.c_str(), sha.c_str());
+        if (status)
+        {
+            const char* value = status();
+            g_vulkan_driver_bridge_status = value ? value : "{}";
+        }
+        return effective;
+    }
+    if (setter && requested_turnip)
+    {
+        g_vulkan_driver_bridge_status =
+            R"({"schema":"lsx4.vulkan-driver-axis.v1","requested":"turnip","effective":"system","fallbackReason":"runtime-driver-path-unsupported","selectionLocked":true,"source":"jni-bridge-v1-runtime"})";
+        return 0;
+    }
+    g_vulkan_driver_bridge_status = requested_turnip
+        ? R"({"schema":"lsx4.vulkan-driver-axis.v1","requested":"turnip","effective":"system","fallbackReason":"runtime-symbol-missing","selectionLocked":true})"
+        : R"({"schema":"lsx4.vulkan-driver-axis.v1","requested":"system","effective":"system","fallbackReason":"runtime-symbol-missing","selectionLocked":true})";
+    return 0;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_app_lsx4_android_RuntimeBridge_probeVulkanDriverAxis(
+    JNIEnv* env, jclass, jstring runtime_path, jstring native_library_dir,
+    jstring turnip_library_dir, jstring report_path, jstring turnip_sha256)
+{
+    const char* raw_runtime = runtime_path
+        ? env->GetStringUTFChars(runtime_path, nullptr) : nullptr;
+    const char* raw_native_dir = native_library_dir
+        ? env->GetStringUTFChars(native_library_dir, nullptr) : nullptr;
+    const char* raw_turnip_dir = turnip_library_dir
+        ? env->GetStringUTFChars(turnip_library_dir, nullptr) : nullptr;
+    const char* raw_report = report_path
+        ? env->GetStringUTFChars(report_path, nullptr) : nullptr;
+    const char* raw_sha = turnip_sha256
+        ? env->GetStringUTFChars(turnip_sha256, nullptr) : nullptr;
+    const std::string runtime = raw_runtime ? raw_runtime : "";
+    const std::string native_dir = raw_native_dir ? raw_native_dir : "";
+    const std::string turnip_dir = raw_turnip_dir ? raw_turnip_dir : "";
+    const std::string report = raw_report ? raw_report : "";
+    const std::string sha = raw_sha ? raw_sha : "";
+    if (raw_sha)
+        env->ReleaseStringUTFChars(turnip_sha256, raw_sha);
+    if (raw_report)
+        env->ReleaseStringUTFChars(report_path, raw_report);
+    if (raw_turnip_dir)
+        env->ReleaseStringUTFChars(turnip_library_dir, raw_turnip_dir);
+    if (raw_native_dir)
+        env->ReleaseStringUTFChars(native_library_dir, raw_native_dir);
+    if (raw_runtime)
+        env->ReleaseStringUTFChars(runtime_path, raw_runtime);
+
+    void* const probe_runtime = dlopen(runtime.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!probe_runtime)
+    {
+        return to_jstring(
+            env,
+            R"({"schema":"lsx4.vulkan-driver-axis.v1","requested":"turnip","effective":"system","fallbackReason":"runtime-driver-probe-dlopen-failed","selectionLocked":true,"source":"jni-probe"})");
+    }
+    const auto probe = reinterpret_cast<vulkan_driver_axis_probe_v2_fn>(
+        dlsym(probe_runtime, "executor_lsx4_runtime_probe_vulkan_driver_axis_v2"));
+    if (!probe)
+    {
+        return to_jstring(
+            env,
+            R"({"schema":"lsx4.vulkan-driver-axis.v1","requested":"turnip","effective":"system","fallbackReason":"runtime-driver-probe-missing","selectionLocked":true,"source":"jni-probe"})");
+    }
+    const char* value = probe(
+        1, native_dir.c_str(), turnip_dir.c_str(), report.c_str(), sha.c_str());
+    return to_jstring(env, value ? value : "{}");
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_app_lsx4_android_RuntimeBridge_vulkanDriverStatus(JNIEnv* env, jclass)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const bool ps5 = g_active_ps5_runtime.load(std::memory_order_acquire);
+    str_fn status = ps5 ? g_ps5_vulkan_driver_status : g_vulkan_driver_status;
+    if (status)
+    {
+        const char* value = status();
+        g_vulkan_driver_bridge_status = value ? value : "{}";
+    }
+    return to_jstring(env, g_vulkan_driver_bridge_status);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -1239,10 +1737,118 @@ Java_app_lsx4_android_RuntimeBridge_jitStatus(JNIEnv* env, jclass)
     return to_jstring(env, call_or_empty(g_jit_status));
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_setRuntimePaused(JNIEnv*, jclass, jboolean paused)
+{
+    const bool ps5 = g_active_ps5_runtime.load(std::memory_order_acquire);
+    int_fn setter = ps5 ? g_ps5_set_runtime_paused : g_set_runtime_paused;
+    if (!setter)
+    {
+        __android_log_print(ANDROID_LOG_ERROR, "LSX4",
+                            "[EXECUTOR_RUNTIME_LIFECYCLE] requested=%s platform=%s "
+                            "result=unsupported",
+                            paused ? "paused" : "running", ps5 ? "ps5" : "ps4");
+        return -2;
+    }
+    const int result = setter(paused ? 1 : 0);
+    __android_log_print(result == 0 ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, "LSX4",
+                        "[EXECUTOR_RUNTIME_LIFECYCLE] requested=%s platform=%s result=%d",
+                        paused ? "paused" : "running", ps5 ? "ps5" : "ps4", result);
+    return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_app_lsx4_android_RuntimeBridge_runtimeLifecycleStatus(JNIEnv* env, jclass)
+{
+    const bool ps5 = g_active_ps5_runtime.load(std::memory_order_acquire);
+    str_fn status = ps5 ? g_ps5_runtime_lifecycle_status : g_runtime_lifecycle_status;
+    if (status)
+    {
+        return to_jstring(env, call_or_empty(status));
+    }
+    return to_jstring(env,
+                      std::string{"{\"schema\":\"lsx4.runtime-lifecycle.v1\","
+                                  "\"platform\":\""} +
+                          (ps5 ? "ps5" : "ps4") +
+                          "\",\"supported\":false,\"effective\":\"unknown\"}");
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_app_lsx4_android_RuntimeBridge_fexProofMetrics(JNIEnv* env, jclass)
+{
+    return to_jstring(env, call_or_empty(g_fex_proof_metrics));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_app_lsx4_android_RuntimeBridge_runtimeProofCounters(JNIEnv* env, jclass)
+{
+    return to_jstring(env, call_or_empty(g_runtime_proof_counters));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_app_lsx4_android_RuntimeBridge_gpuResidencyMetrics(JNIEnv* env, jclass)
+{
+    return to_jstring(env, call_or_empty(g_gpu_residency_metrics));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_reportAndroidMemoryPressure(
+    JNIEnv*, jclass, jint level)
+{
+    return g_report_android_memory_pressure
+               ? g_report_android_memory_pressure(static_cast<int>(level))
+               : -2;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_reportAndroidMemoryInfo(
+    JNIEnv*, jclass, jint level, jlong available_bytes,
+    jlong threshold_bytes, jboolean low_memory)
+{
+    return g_report_android_memory_info
+               ? g_report_android_memory_info(
+                     static_cast<int>(level),
+                     static_cast<unsigned long long>(available_bytes),
+                     static_cast<unsigned long long>(threshold_bytes),
+                     low_memory == JNI_TRUE ? 1 : 0)
+               : -2;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_reportAndroidProcessMemoryInfo(
+    JNIEnv*, jclass, jlong total_pss_bytes, jlong graphics_bytes,
+    jlong total_swap_bytes)
+{
+    return g_report_android_process_memory_info
+               ? g_report_android_process_memory_info(
+                     static_cast<unsigned long long>(total_pss_bytes),
+                     static_cast<unsigned long long>(graphics_bytes),
+                     static_cast<unsigned long long>(total_swap_bytes))
+               : -2;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_androidMemoryPressureMonitorRequested(
+    JNIEnv*, jclass)
+{
+    return g_android_memory_pressure_monitor_requested
+               ? g_android_memory_pressure_monitor_requested()
+               : 0;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_setRenderScalePercent(JNIEnv*, jclass, jint percent)
+{
+    if (g_set_render_scale_percent == nullptr) {
+        return -1;
+    }
+    return g_set_render_scale_percent(static_cast<int>(percent));
+}
+
 extern "C" JNIEXPORT jlongArray JNICALL
 Java_app_lsx4_android_RuntimeBridge_runtimeHudStats(JNIEnv* env, jclass)
 {
-    constexpr std::size_t kValueCapacity = 92;
+    constexpr std::size_t kValueCapacity = 166;
     std::uint64_t values[kValueCapacity]{};
     const auto hud_stats =
         g_active_ps5_runtime.load(std::memory_order_acquire)
@@ -1264,6 +1870,32 @@ Java_app_lsx4_android_RuntimeBridge_runtimeHudStats(JNIEnv* env, jclass)
     if (result)
     {
         env->SetLongArrayRegion(result, 0, static_cast<jsize>(value_count), converted);
+    }
+    return result;
+}
+
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_app_lsx4_android_RuntimeBridge_hostPmuStats(JNIEnv* env, jclass)
+{
+
+
+
+    constexpr std::size_t kValueCount = 8;
+    const auto snapshot = g_host_pmu_sampler.Sample();
+    const jlong values[kValueCount]{
+        1,
+        snapshot.available ? 1 : 0,
+        static_cast<jlong>(snapshot.error),
+        static_cast<jlong>(snapshot.timestamp_ns),
+        static_cast<jlong>(snapshot.values[0]),
+        static_cast<jlong>(snapshot.values[1]),
+        static_cast<jlong>(snapshot.values[2]),
+        static_cast<jlong>(snapshot.values[3]),
+    };
+    jlongArray result = env->NewLongArray(static_cast<jsize>(kValueCount));
+    if (result)
+    {
+        env->SetLongArrayRegion(result, 0, static_cast<jsize>(kValueCount), values);
     }
     return result;
 }

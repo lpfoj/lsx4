@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="capture_screenshot">截图</string>
+    <string name="capture_record">录制视频</string>
+    <string name="capture_stop_recording">停止录制</string>
+    <string name="capture_gallery">相册</string>
+    <string name="capture_share">分享</string>
+    <string name="capture_close">关闭</string>
+    <string name="capture_cancel">取消</string>
+    <string name="capture_continue">继续</string>
+    <string name="capture_open_panel">游戏截图与录像</string>
+    <string name="capture_gallery_loading">正在加载…</string>
+    <string name="capture_gallery_empty">截图和录像将显示在这里。文件保存在 LSX4 内，直到您主动分享。</string>
+    <string name="capture_image_label">截图</string>
+    <string name="capture_video_label">视频</string>
+    <string name="capture_share_unavailable">没有可分享此文件的应用。</string>
+    <string name="capture_screenshot_saved">截图已保存到相册。</string>
+    <string name="capture_screenshot_failed">无法截取游戏画面。请等待游戏显示画面后重试。</string>
+    <string name="capture_video_saved">录像已保存到相册。</string>
+    <string name="capture_recording_failed">无法开始或完成录制。请重试并同意系统的屏幕录制请求。</string>
+    <string name="capture_storage_failed">无法保存文件。请检查设备剩余存储空间。</string>
+    <string name="capture_recording">正在录制游戏</string>
+    <string name="capture_recording_starting">正在开始录制…</string>
+    <string name="capture_finishing">正在保存…</string>
+    <string name="capture_video_only">仅视频 · 无声音</string>
+    <string name="capture_silent_status">● %1$s · 无声音</string>
+    <string name="capture_audio_explanation">Android 会录制整个屏幕，包括控制按钮和可见通知。LSX4 失去焦点时会停止录制。音频权限仅用于录制 LSX4 的播放声音，绝不使用麦克风。</string>
+    <string name="capture_allow_game_audio">允许游戏声音</string>
+    <string name="capture_audio_denied">未授予游戏声音权限。是否继续录制无声视频？</string>
+    <string name="capture_audio_requires_android10">录制内部游戏声音需要 Android 10 或更高版本。是否继续录制无声视频？</string>
+    <string name="capture_notification_channel">游戏录制</string>
+    <string name="capture_notification_detail">正在录制屏幕；仅包含 LSX4 的播放声音。点击“停止”以保存。</string>
+    <string name="game_menu_continue">继续</string>
+    <string name="game_menu_paused_hint">游戏已暂停。准备好后可继续游戏。</string>
+    <string name="game_menu_exiting">正在关闭游戏…</string>
+    <string name="game_menu_audio_focus">其他应用正在使用音频。请再次点击继续。</string>
+</resources>

@@ -1,0 +1,166 @@
+{
+  "schema": "lsx4.jit-benchmark-provenance.v1",
+  "capturedAt": "2026-08-11T19:42:35+03:00",
+  "authoritativeHandoff": "docs/JIT_BACKEND_PERF_HANDOFF_2026-08-11.md",
+  "repository": {
+    "path": "D:/LProj/PetProj/lsx4-jit-independent-wt",
+    "branch": "main",
+    "head": "a09197bf24a76b91a8415bb33d4e45f7bfa67948",
+    "funnelHead": "58fbbe860190652ff21908b676f95b0e758fe9ce",
+    "dirty": true,
+    "destructiveCleanupAllowed": false
+  },
+  "device": {
+    "serial": "10AG263F1B001HM",
+    "role": "only-authorized-current-test-device",
+    "package": "app.lsx4.android",
+    "gameProcessStoppedAfterCapture": true,
+    "installedNativeSha256": "ce7fc76f083e5e0bfe7afeca45a5521b21134f823634a6d89a8faba73b975fdf",
+    "localReleaseNativeSha256": "ce7fc76f083e5e0bfe7afeca45a5521b21134f823634a6d89a8faba73b975fdf"
+  },
+  "benchmark": {
+    "title": "Bloodborne",
+    "titleId": "CUSA03173",
+    "eboot": "/data/user/0/app.lsx4.android/files/lsx4-home/runtime-fs/user/app/CUSA03173/eboot.bin",
+    "scene": "Hunters Dream workshop/fountain",
+    "requiredActualExtent": "960x544",
+    "movementWindowMs": 14000,
+    "movementCommand": "input swipe 950 1245 950 1060 14000",
+    "requiredFrameSource": "SurfaceFlinger exact unique presented frames",
+    "requiredCpuNormalization": "same-window PMU divided by exact presented frames",
+    "forceStopAfterMeasurement": true
+  },
+  "preferences": {
+    "managed_tiered_jit": false,
+    "managed_jit_trace_compilation": false,
+    "managed_fast_guest_memory": true,
+    "persistent_jit_cache": true,
+    "managed_relaxed_fp_fusion": true,
+    "managed_audio_simd": true,
+    "managed_android_performance_hint": true,
+    "managed_vulkan_driver_calls": true,
+    "managed_arm_gpu_fast_path": true,
+    "managed_adaptive_mobile_gpu": true,
+    "managed_async_pipeline": true,
+    "managed_readback_batching": true,
+    "managed_coarse_fragment_2x2": false,
+    "managed_disable_vk_robustness": false,
+    "managed_anisotropy_mode": 2,
+    "res_mode": 4
+  },
+  "markers": [
+    {
+      "path": "files/lsx4-home/run-bisect-disable-jit-tiered-guard-direct-chain",
+      "active": true,
+      "class": "correctness-workaround",
+      "owner": "shared-runtime-jit",
+      "defect": "Mid-trace direct/resident guard chaining carried incompatible state; produced texture corruption, black rectangles and bright flashes.",
+      "created": "2026-08-10",
+      "expiry": "none",
+      "removalCondition": "Versioned edge-by-edge GPR/XMM/YMM/RFLAGS/deferred-state/fault proof plus long moving-gameplay temporal validation."
+    },
+    {
+      "path": "files/lsx4-home/run-bisect-disable-jit-preserve-all-helper-abi",
+      "active": true,
+      "class": "correctness-workaround",
+      "owner": "shared-runtime-jit",
+      "defect": "Broad helper ABI has no complete clobber, unwind, signal and fault-resume proof.",
+      "created": "2026-08-10",
+      "expiry": "none",
+      "removalCondition": "Per-helper clobber metadata and generated-code validation for every live scalar/vector register on all supported hosts."
+    },
+    {
+      "path": "files/lsx4-home/run-bisect-enable-jit-fixed-xmm-dirty-observer",
+      "active": true,
+      "class": "validated-current-path",
+      "owner": "shared-runtime-jit",
+      "defect": "Fixed-XMM residency requires exact dirty publication at observer/fault boundaries.",
+      "created": "2026-08-10",
+      "expiry": "until-folded-into-versioned-default-abi",
+      "removalCondition": "Equivalent behavior becomes unconditional and cache ABI/version proves stale records cannot bypass it."
+    },
+    {
+      "path": "files/lsx4-home/run-bisect-enable-jit-tier1-equal-footprint.codex-disabled-20260811",
+      "active": false,
+      "class": "retired-experiment",
+      "owner": "tier1-admission",
+      "defect": "Equal-footprint admission changed benchmark state and allowed bodies with no static cost win.",
+      "created": "2026-08-10",
+      "disabled": "2026-08-11",
+      "expiry": "retired",
+      "removalCondition": "Do not reactivate; replace with dynamic expected-cost admission if revisited."
+    }
+  ],
+  "suffixRules": {
+    "activeMarkerDefinition": "Only an exact marker filename queried by code is active.",
+    "inactiveExamples": [
+      ".codex-disabled-*",
+      ".ab-enabled",
+      ".diag-off",
+      ".layout-probe-backup",
+      ".codex-bak"
+    ]
+  },
+  "lastCadenceExperiment": {
+    "source": "src/executor/dynamic_translation/retiring_execution_core.cpp",
+    "tier0PromotionLoopSamplePeriodBefore": 64,
+    "tier0PromotionLoopSamplePeriodAfter": 1024,
+    "tieredLoopSafepointPeriod": 1024,
+    "correctnessGate": "passed-first-frame-and-moving-gameplay",
+    "operationalDecision": "retain-source-change-but-leave-tiered-and-trace-masters-off"
+  },
+  "exactMeasurements": [
+    {
+      "id": "tiered-off-clean",
+      "frames": 138,
+      "seconds": 14.001782,
+      "fps": 9.856,
+      "instructions": 46796537517,
+      "cycles": 22349195724,
+      "taskClockMs": 10065.5971,
+      "instructionsPerFrame": 339105344.326,
+      "cyclesPerFrame": 161950693.652,
+      "gameMainMsPerFrame": 72.939109,
+      "tier1Active": 0
+    },
+    {
+      "id": "tiered-on-strict-cadence64",
+      "frames": 136,
+      "seconds": 14.001854,
+      "fps": 9.713,
+      "instructions": 54272922738,
+      "cycles": 24469340758,
+      "taskClockMs": 10139.1495,
+      "instructionsPerFrame": 399065608.368,
+      "cyclesPerFrame": 179921623.221,
+      "gameMainMsPerFrame": 74.55257,
+      "tier1Active": 0,
+      "tier1Queued": 23,
+      "profiledEdges": 1620316
+    },
+    {
+      "id": "tiered-on-strict-cadence1024",
+      "frames": 134,
+      "seconds": 14.001208,
+      "fps": 9.57,
+      "instructions": 44300101066,
+      "cycles": 21382700304,
+      "taskClockMs": 9603.270291,
+      "instructionsPerFrame": 330597769.149,
+      "cyclesPerFrame": 159572390.328,
+      "gameMainMsPerFrame": 71.666196,
+      "tier1Active": 0,
+      "tier1Queued": 8,
+      "profiledEdges": 845684
+    }
+  ],
+  "backendPolicy": {
+    "default": "current-aarch64-jit",
+    "optionalRequested": "fex-experimental",
+    "liveSwitchAllowed": false,
+    "silentFallbackDuringBenchmarkAllowed": false,
+    "separateCacheNamespaceRequired": true,
+    "ps5RoutingMayChange": false,
+    "deepBloodbornePortGate": "complete-contract-matrix-and-external-architecture-performance-gate"
+  }
+}

@@ -21,6 +21,13 @@ extern "C" bool ExecutorJitIsExecutableGuestAddress(
     return query_result == 0 && (protection & execute_bit) != 0;
 }
 
+extern "C" bool ExecutorJitIsWritableGuestAddress(
+    const std::uint64_t address) {
+    Core::MemoryManager* const memory = Core::Memory::Instance();
+    return address != 0 && memory != nullptr &&
+           memory->IsWritableMapping(address, 1);
+}
+
 extern "C" std::uint64_t executor_jit_ensure_hle_thunk_slab() {
 #ifdef __ANDROID__
     return Core::AeroLib::EnsureAndroidX64ZeroStubSlab();

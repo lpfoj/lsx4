@@ -3,6 +3,9 @@ package app.lsx4.android;
 import android.view.Surface;
 
 public final class RuntimeBridge {
+    public static final int GUEST_CPU_BACKEND_CURRENT = GuestCpuBackend.CURRENT;
+    public static final int GUEST_CPU_BACKEND_FEX_EXPERIMENTAL =
+            GuestCpuBackend.FEX_EXPERIMENTAL;
     public static final int MANAGED_OPTIMIZATION_ARM_GPU_FAST_PATH = 1;
     public static final int MANAGED_OPTIMIZATION_COARSE_FRAGMENT_2X2 = 2;
     public static final int MANAGED_OPTIMIZATION_DISABLE_VK_ROBUSTNESS = 3;
@@ -21,6 +24,9 @@ public final class RuntimeBridge {
     public static final int MANAGED_OPTIMIZATION_HOST_FLAGM = 16;
     public static final int MANAGED_OPTIMIZATION_HOST_SVE2 = 17;
     public static final int MANAGED_OPTIMIZATION_HOST_RCPC = 18;
+    public static final int MANAGED_OPTIMIZATION_GUEST_SPIN_WAIT_EVENT = 19;
+    public static final int MANAGED_OPTIMIZATION_FSR = 20;
+    public static final int MANAGED_OPTIMIZATION_RCAS = 21;
 
     static {
         System.loadLibrary("lsx_runtime_bridge");
@@ -33,9 +39,23 @@ public final class RuntimeBridge {
     public static native String loadPs5(String path);
     public static native String ps5Abi();
     public static native String ps5Status();
+    public static native int setGuestCpuBackend(
+            int requestedBackend, String adapterPath, String runtimeRoot,
+            String launchTitleId, String hardwareProfile, String driverFamily,
+            String driverVersion);
+    public static native String guestCpuBackendStatus();
+    public static native int setVulkanDriverAxis(
+            boolean requestedTurnip, String nativeLibraryDir, String turnipLibraryDir,
+            String reportPath, String turnipSha256);
+    public static native String probeVulkanDriverAxis(
+            String runtimePath, String nativeLibraryDir, String turnipLibraryDir,
+            String reportPath, String turnipSha256);
+    public static native String vulkanDriverStatus();
 
     public static native int extractRarArchive(
             String archivePath, String destinationPath, long maximumBytes, int maximumFiles);
+    public static native String extractPs4Pkg(String packagePath, String destinationPath);
+    public static native String extractPs4PkgFd(int packageFd, String destinationPath);
     public static native int initializePs5(String rootDir, String userId);
     public static native int attachPs5Surface(Surface surface);
     public static native int detachPs5Surface();
@@ -54,6 +74,8 @@ public final class RuntimeBridge {
                                                 String envBlob, String embedSoPath);
     public static native int startServicePresentPump(String translatorDir);
     public static native int stopServicePresentPump();
+    public static native int setRuntimePaused(boolean paused);
+    public static native String runtimeLifecycleStatus();
     public static native String probeDlopen(String path);
     public static native int loadEmbeddedBox64(String path);
     public static native String embeddedBox64Info();
@@ -84,7 +106,22 @@ public final class RuntimeBridge {
     public static native String box64EntryRequest();
     public static native String status();
     public static native String jitStatus();
+    public static native String fexProofMetrics();
+    public static native String runtimeProofCounters();
+    public static native String gpuResidencyMetrics();
+    public static native int reportAndroidMemoryPressure(int level);
+    public static native int reportAndroidMemoryInfo(
+            int level, long availableBytes, long thresholdBytes,
+            boolean lowMemory);
+    public static native int reportAndroidProcessMemoryInfo(
+            long totalPssBytes, long graphicsBytes, long totalSwapBytes);
+    public static native int androidMemoryPressureMonitorRequested();
+
+
+
+    public static native int setRenderScalePercent(int percent);
     public static native long[] runtimeHudStats();
+    public static native long[] hostPmuStats();
     public static native String jitSelfTest();
     public static native int scanGame(String path);
     public static native int launchGame(String path);

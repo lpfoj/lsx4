@@ -2,12 +2,64 @@ plugins {
     id "com.android.application"
 }
 
+import groovy.json.JsonSlurper
+import java.security.MessageDigest
+import java.util.zip.ZipFile
+
+def externalAndroidBuildDir = System.getenv("LSX4_ANDROID_APP_BUILD_DIR")
+if (externalAndroidBuildDir != null && !externalAndroidBuildDir.isBlank()) {
+    layout.buildDirectory.set(file(externalAndroidBuildDir))
+}
+
 def resolvedApplicationId = providers.gradleProperty("applicationIdOverride")
         .orElse("app.lsx4.android")
 
 def generatedDebugTestAssets = layout.buildDirectory.dir("generated/lsx4DebugTestAssets")
+def generatedRuntimeJniLibs = layout.buildDirectory.dir("generated/lsx4RuntimeJniLibs")
+def configuredFexRuntimeManifest = providers.gradleProperty("lsx4FexRuntimeManifest")
+def fexRuntimeManifest = configuredFexRuntimeManifest.isPresent()
+        ? rootProject.file(configuredFexRuntimeManifest.get())
+        : rootProject.file("../../.fex-2608-artifacts/android-api26-arm64/manifest.json")
+def fexArtifactVerifier = rootProject.file("../tools/fex/verify_android_fex_artifacts.py")
+def swanstationSource = rootProject.file("../externals/swanstation")
+def swanstationBuild = rootProject.file("../build/android-arm64-swanstation")
+def swanstationCore = new File(swanstationBuild, "swanstation_libretro_android.so")
+def swanstationPackagedName = "libswanstation_libretro_android.so"
+def swanstationCommit = "5430a4a53b89fa5827c97b84ada29d23317245bc"
+def swanstationSourceDateEpoch = "1784512264"
+def swanstationNdkVersion = "29.0.14206865"
+def swanstationCmakeVersion = "3.22.1"
+def adrenoToolsSource = rootProject.file("../externals/libadrenotools")
+def adrenoToolsBuild = rootProject.file("../build/android-arm64-libadrenotools")
+def adrenoToolsCommit = "8fae8ce254dfc1344527e05301e43f37dea2df80"
+def linkerNsBypassCommit = "aa3975893d83ef1bc84c321ec60c65fbf1287887"
+def adrenoToolsArtifacts = [
+        new File(adrenoToolsBuild, "libadrenotools.so"),
+        new File(adrenoToolsBuild, "src/hook/libhook_impl.so"),
+        new File(adrenoToolsBuild, "src/hook/libmain_hook.so")
+]
+def configuredTurnipDriver = providers.gradleProperty("lsx4TurnipDriver")
+def configuredTurnipDriverSha256 = providers.gradleProperty("lsx4TurnipDriverSha256")
+def turnipPackagedName = "libvulkan_lsx4_turnip.so"
+def turnipDriver = configuredTurnipDriver.isPresent()
+        ? rootProject.file(configuredTurnipDriver.get())
+        : rootProject.file("../artifacts/turnip-mesa-26.2.1/libvulkan_lsx4_turnip.so")
+def turnipDriverSha256 = configuredTurnipDriverSha256
+        .orElse("b56a4cec9af33af61ec068efb1d8673b54bb325635ca7a2300db77df82d752cd")
+        .get()
+def configuredPython = providers.gradleProperty("lsx4Python")
+        .orElse(providers.environmentVariable("LSX4_PYTHON"))
+        .orElse("python")
 def configuredNgs2Module = providers.gradleProperty("shad4pcNgs2Module")
         .orElse(providers.environmentVariable("SHAD4PC_NGS2_MODULE"))
+def diagnosticsUploadUrl = providers.gradleProperty("lsx4DiagnosticsUploadUrl")
+        .orElse("https://llayer.tech/lsx4-diag/upload")
+def diagnosticsUploadToken = providers.gradleProperty("lsx4DiagnosticsUploadToken")
+        .orElse(providers.environmentVariable("LSX4_DIAGNOSTICS_UPLOAD_TOKEN"))
+        .orElse("")
+def buildConfigString = { String value ->
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+}
 
 def prepareDebugTestAssets = tasks.register("prepareDebugTestAssets") {
     outputs.dir(generatedDebugTestAssets)
@@ -44,16 +96,551 @@ def prepareDebugTestAssets = tasks.register("prepareDebugTestAssets") {
     }
 }
 
+def buildSwanstationAndroid = tasks.register("buildSwanstationAndroid") {
+    inputs.property("commit", swanstationCommit)
+    inputs.property("sourceDateEpoch", swanstationSourceDateEpoch)
+    inputs.property("androidAbi", "arm64-v8a")
+    inputs.property("androidPlatform", "android-26")
+    inputs.property("ndkVersion", swanstationNdkVersion)
+    inputs.property("cmakeVersion", swanstationCmakeVersion)
+    inputs.files(fileTree(swanstationSource) {
+        exclude ".git", ".git/**", "src/libretro/version.h"
+    })
+    outputs.file(swanstationCore)
+    // Re-run the cheap configure/pin gate for every APK build. File inputs alone cannot
+    // distinguish two revisions with identical checked-out contents.
+    outputs.upToDateWhen { false }
+
+    doLast {
+        File sourceCmake = new File(swanstationSource, "CMakeLists.txt")
+        if (!sourceCmake.isFile()) {
+            throw new GradleException(
+                    "Pinned SwanStation source is missing; initialize externals/swanstation: ${swanstationSource}")
+        }
+
+        ByteArrayOutputStream gitOutput = new ByteArrayOutputStream()
+        project.exec {
+            commandLine("git", "-C", swanstationSource.absolutePath, "rev-parse", "HEAD")
+            standardOutput = gitOutput
+        }
+        String actualCommit = gitOutput.toString("UTF-8").trim()
+        if (actualCommit != swanstationCommit) {
+            throw new GradleException(
+                    "SwanStation source revision mismatch: expected ${swanstationCommit}, got ${actualCommit}")
+        }
+        ByteArrayOutputStream gitStatusOutput = new ByteArrayOutputStream()
+        project.exec {
+            commandLine("git", "-C", swanstationSource.absolutePath,
+                    "status", "--porcelain", "--untracked-files=normal")
+            standardOutput = gitStatusOutput
+        }
+        String trackedChanges = gitStatusOutput.toString("UTF-8").trim()
+        if (!trackedChanges.isEmpty()) {
+            throw new GradleException(
+                    "Pinned SwanStation source has tracked local changes: ${trackedChanges}")
+        }
+
+        String executableSuffix = System.getProperty("os.name")
+                .toLowerCase(Locale.ROOT).contains("windows") ? ".exe" : ""
+        File sdkRoot = android.sdkDirectory
+        File ndkRoot = new File(sdkRoot, "ndk/${swanstationNdkVersion}")
+        File cmakeRoot = new File(sdkRoot, "cmake/${swanstationCmakeVersion}")
+        File cmakeExecutable = new File(cmakeRoot, "bin/cmake${executableSuffix}")
+        File ninjaExecutable = new File(cmakeRoot, "bin/ninja${executableSuffix}")
+        File toolchain = new File(ndkRoot, "build/cmake/android.toolchain.cmake")
+        for (File required : [cmakeExecutable, ninjaExecutable, toolchain]) {
+            if (!required.isFile()) {
+                throw new GradleException(
+                        "SwanStation Android build tool is missing: ${required}")
+            }
+        }
+
+        swanstationBuild.mkdirs()
+        Map<String, String> deterministicEnvironment = [
+                SOURCE_DATE_EPOCH: swanstationSourceDateEpoch,
+                ZERO_AR_DATE     : "1"
+        ]
+        project.exec {
+            environment(deterministicEnvironment)
+            commandLine(cmakeExecutable.absolutePath,
+                    "-S", swanstationSource.absolutePath,
+                    "-B", swanstationBuild.absolutePath,
+                    "-G", "Ninja",
+                    "-DCMAKE_MAKE_PROGRAM=${ninjaExecutable.absolutePath}",
+                    "-DCMAKE_TOOLCHAIN_FILE=${toolchain.absolutePath}",
+                    "-DANDROID_ABI=arm64-v8a",
+                    "-DANDROID_PLATFORM=android-26",
+                    "-DANDROID_STL=c++_shared",
+                    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
+                    "-DCMAKE_BUILD_TYPE=Release")
+        }
+        project.exec {
+            environment(deterministicEnvironment)
+            commandLine(cmakeExecutable.absolutePath,
+                    "--build", swanstationBuild.absolutePath,
+                    "--target", "swanstation_libretro",
+                    "--parallel")
+        }
+        if (!swanstationCore.isFile() || swanstationCore.length() <= 0L) {
+            throw new GradleException(
+                    "SwanStation Android build did not produce ${swanstationCore}")
+        }
+        logger.lifecycle("LSX4 PS1 core built from ${swanstationCommit}: ${swanstationCore}")
+    }
+}
+
+def buildAdrenoToolsAndroid = tasks.register("buildAdrenoToolsAndroid") {
+    inputs.property("commit", adrenoToolsCommit)
+    inputs.property("linkerNsBypassCommit", linkerNsBypassCommit)
+    inputs.property("androidAbi", "arm64-v8a")
+    inputs.property("androidPlatform", "android-28")
+    inputs.files(fileTree(adrenoToolsSource) {
+        exclude ".git", ".git/**", "lib/linkernsbypass/.git",
+                "lib/linkernsbypass/.git/**"
+    })
+    outputs.files(adrenoToolsArtifacts)
+
+    doLast {
+        File sourceCmake = new File(adrenoToolsSource, "CMakeLists.txt")
+        if (!sourceCmake.isFile()) {
+            throw new GradleException(
+                    "Pinned libadrenotools source is missing: ${adrenoToolsSource}")
+        }
+        ByteArrayOutputStream gitOutput = new ByteArrayOutputStream()
+        project.exec {
+            commandLine("git", "-C", adrenoToolsSource.absolutePath, "rev-parse", "HEAD")
+            standardOutput = gitOutput
+        }
+        String actualCommit = gitOutput.toString("UTF-8").trim()
+        if (actualCommit != adrenoToolsCommit) {
+            throw new GradleException(
+                    "libadrenotools revision mismatch: expected ${adrenoToolsCommit}, got ${actualCommit}")
+        }
+        gitOutput.reset()
+        project.exec {
+            commandLine("git", "-C",
+                    new File(adrenoToolsSource, "lib/linkernsbypass").absolutePath,
+                    "rev-parse", "HEAD")
+            standardOutput = gitOutput
+        }
+        String actualBypassCommit = gitOutput.toString("UTF-8").trim()
+        if (actualBypassCommit != linkerNsBypassCommit) {
+            throw new GradleException(
+                    "liblinkernsbypass revision mismatch: expected ${linkerNsBypassCommit}, got ${actualBypassCommit}")
+        }
+
+        String executableSuffix = System.getProperty("os.name")
+                .toLowerCase(Locale.ROOT).contains("windows") ? ".exe" : ""
+        File sdkRoot = android.sdkDirectory
+        File ndkRoot = new File(sdkRoot, "ndk/${swanstationNdkVersion}")
+        File cmakeRoot = new File(sdkRoot, "cmake/${swanstationCmakeVersion}")
+        File cmakeExecutable = new File(cmakeRoot, "bin/cmake${executableSuffix}")
+        File ninjaExecutable = new File(cmakeRoot, "bin/ninja${executableSuffix}")
+        File toolchain = new File(ndkRoot, "build/cmake/android.toolchain.cmake")
+        for (File required : [cmakeExecutable, ninjaExecutable, toolchain]) {
+            if (!required.isFile()) {
+                throw new GradleException(
+                        "libadrenotools Android build tool is missing: ${required}")
+            }
+        }
+
+        adrenoToolsBuild.mkdirs()
+        project.exec {
+            commandLine(cmakeExecutable.absolutePath,
+                    "-S", adrenoToolsSource.absolutePath,
+                    "-B", adrenoToolsBuild.absolutePath,
+                    "-G", "Ninja",
+                    "-DCMAKE_MAKE_PROGRAM=${ninjaExecutable.absolutePath}",
+                    "-DCMAKE_TOOLCHAIN_FILE=${toolchain.absolutePath}",
+                    "-DANDROID_ABI=arm64-v8a",
+                    "-DANDROID_PLATFORM=android-28",
+                    "-DANDROID_STL=c++_shared",
+                    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
+                    "-DBUILD_SHARED_LIBS=ON",
+                    "-DCMAKE_BUILD_TYPE=Release")
+        }
+        project.exec {
+            commandLine(cmakeExecutable.absolutePath,
+                    "--build", adrenoToolsBuild.absolutePath,
+                    "--parallel")
+        }
+        for (File artifact : adrenoToolsArtifacts) {
+            if (!artifact.isFile() || artifact.length() <= 0L) {
+                throw new GradleException(
+                        "libadrenotools build did not produce ${artifact}")
+            }
+        }
+        logger.lifecycle("LSX4 libadrenotools built from ${adrenoToolsCommit}")
+    }
+}
+
+def prepareRuntimeJniLibs = tasks.register("prepareRuntimeJniLibs") {
+    dependsOn(buildSwanstationAndroid, buildAdrenoToolsAndroid)
+    File ps4Runtime = rootProject.file("../build/android-arm64-release/liblsx4_executor_android.so")
+    File ps5Runtime = rootProject.file("../build/android-arm64-ps5both/liblsx4_executor_ps5_android.so")
+    List<File> ps4RuntimeSources = [
+            rootProject.file("../src/executor/native_runtime_api.cpp"),
+            rootProject.file("../src/executor/cpu_tuning.h"),
+            rootProject.file("../src/executor/fex_backend_abi_v3.h"),
+            rootProject.file("../src/executor/fex_backend_loader.cpp"),
+            rootProject.file("../src/executor/fex_backend_loader.h"),
+            rootProject.file("../src/executor/dynamic_translation/retiring_execution_core.cpp"),
+            rootProject.file("../src/executor/dynamic_translation/retiring_execution_core.h"),
+            rootProject.file("../src/executor/ps1_classic_runtime.cpp"),
+            rootProject.file("../src/executor/ps1_classic_runtime.h"),
+            rootProject.file("../funnel-arm/src/common/cpu_tuning_policy.h"),
+            rootProject.file("../funnel-arm/src/common/recursive_lock.cpp"),
+            rootProject.file("../funnel-arm/src/common/shared_first_mutex.h"),
+            rootProject.file("../funnel-arm/src/common/thread.cpp"),
+            rootProject.file("../funnel-arm/src/common/thread.h"),
+            rootProject.file("../funnel-arm/src/core/aerolib/stubs.cpp"),
+            rootProject.file("../funnel-arm/src/core/linker.cpp"),
+            rootProject.file("../funnel-arm/src/core/libraries/ajm/ajm_context.cpp"),
+            rootProject.file("../funnel-arm/src/core/libraries/audio/audioout.cpp"),
+            rootProject.file("../funnel-arm/src/core/libraries/kernel/aio.cpp"),
+            rootProject.file("../funnel-arm/src/core/libraries/kernel/equeue.cpp"),
+            rootProject.file("../funnel-arm/src/core/libraries/kernel/time.cpp"),
+            rootProject.file("../funnel-arm/src/core/libraries/kernel/threads/pthread.cpp"),
+            rootProject.file("../funnel-arm/src/core/libraries/save_data/dialog/savedatadialog_ui.cpp"),
+            rootProject.file("../funnel-arm/src/video_core/amdgpu/liverpool.cpp"),
+            rootProject.file("../funnel-arm/src/video_core/amdgpu/liverpool.h"),
+            rootProject.file("../funnel-arm/src/video_core/renderer_vulkan/vk_driver_axis.cpp"),
+            rootProject.file("../funnel-arm/src/video_core/renderer_vulkan/vk_driver_axis.h"),
+            rootProject.file("../funnel-arm/src/video_core/renderer_vulkan/vk_platform.cpp"),
+            rootProject.file("../funnel-arm/src/video_core/renderer_vulkan/vk_instance.cpp"),
+            rootProject.file("../funnel-arm/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp"),
+            rootProject.file("../funnel-arm/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp"),
+            rootProject.file("../funnel-arm/src/video_core/renderer_vulkan/vk_pipeline_cache.h"),
+            rootProject.file("../funnel-arm/src/video_core/renderer_vulkan/vk_rasterizer.cpp"),
+            rootProject.file("../funnel-arm/src/video_core/renderer_vulkan/vk_rasterizer.h"),
+            rootProject.file("../funnel-arm/src/shader_recompiler/info.h")
+    ]
+    List<File> ps5RuntimeSources = [
+            rootProject.file("../src/executor/ps5_desktop/runtime_api.cpp"),
+            rootProject.file("../src/executor/ps5_desktop/fex_contract.cpp"),
+            rootProject.file("../src/executor/ps5_desktop/fex_contract.h"),
+            rootProject.file("../src/executor/dynamic_translation/retiring_execution_core.cpp"),
+            rootProject.file("../src/executor/dynamic_translation/retiring_execution_core.h")
+    ]
+    inputs.files(ps4Runtime, ps5Runtime, swanstationCore, turnipDriver,
+            adrenoToolsArtifacts,
+            fexRuntimeManifest, fexArtifactVerifier, ps4RuntimeSources,
+            ps5RuntimeSources)
+    outputs.dir(generatedRuntimeJniLibs)
+    outputs.upToDateWhen { false }
+    doLast {
+        if (!ps4Runtime.isFile()) {
+            throw new GradleException("Build the current lsx4_executor_android runtime before assembling the APK: ${ps4Runtime}")
+        }
+        if (!ps4RuntimeSources.every { File source -> source.isFile() }) {
+            throw new GradleException(
+                    "One or more PS4 runtime sources are missing: ${ps4RuntimeSources}")
+        }
+        File newestPs4Source = ps4RuntimeSources.max {
+            File source -> source.lastModified()
+        }
+        if (ps4Runtime.lastModified() < newestPs4Source.lastModified()) {
+            throw new GradleException(
+                    "Refusing to package stale lsx4_executor_android: runtime ${ps4Runtime.lastModified()} " +
+                            "is older than ${newestPs4Source} ${newestPs4Source.lastModified()}. " +
+                            "Rebuild target lsx4_executor_android first.")
+        }
+        if (ps5Runtime.isFile()) {
+            File newestPs5Source = ps5RuntimeSources.max {
+                File source -> source.lastModified()
+            }
+            if (!ps5RuntimeSources.every { File source -> source.isFile() }) {
+                throw new GradleException(
+                        "One or more PS5 runtime sources are missing: ${ps5RuntimeSources}")
+            }
+            if (ps5Runtime.lastModified() < newestPs5Source.lastModified()) {
+                throw new GradleException(
+                        "Refusing to package stale lsx4_executor_ps5_android: runtime ${ps5Runtime.lastModified()} " +
+                                "is older than ${newestPs5Source} ${newestPs5Source.lastModified()}. " +
+                                "Rebuild target lsx4_executor_ps5_android first.")
+            }
+        }
+        if (!swanstationCore.isFile()) {
+            throw new GradleException(
+                    "Build the pinned SwanStation Android core before assembling the APK: ${swanstationCore}")
+        }
+        if (!turnipDriver.isFile() || turnipDriver.length() <= 0L) {
+            throw new GradleException(
+                    "Build the pinned Mesa 26.2 Turnip artifact before assembling: ${turnipDriver}")
+        }
+        MessageDigest turnipDigest = MessageDigest.getInstance("SHA-256")
+        turnipDriver.withInputStream { InputStream stream ->
+            byte[] buffer = new byte[64 * 1024]
+            for (int count = stream.read(buffer); count >= 0; count = stream.read(buffer)) {
+                if (count > 0) {
+                    turnipDigest.update(buffer, 0, count)
+                }
+            }
+        }
+        String actualTurnipSha256 = turnipDigest.digest().encodeHex().toString()
+        if (actualTurnipSha256 != turnipDriverSha256) {
+            throw new GradleException(
+                    "Turnip artifact SHA-256 mismatch: expected ${turnipDriverSha256}, got ${actualTurnipSha256}")
+        }
+        if (!fexRuntimeManifest.isFile()) {
+            throw new GradleException("Build and attest the FEX Android runtime before assembling the APK: ${fexRuntimeManifest}")
+        }
+        if (!fexArtifactVerifier.isFile()) {
+            throw new GradleException("FEX artifact verifier is missing: ${fexArtifactVerifier}")
+        }
+
+        project.exec {
+            commandLine(configuredPython.get(), fexArtifactVerifier.absolutePath,
+                    "--manifest", fexRuntimeManifest.absolutePath)
+        }
+
+        def manifest = new JsonSlurper().parse(fexRuntimeManifest)
+        Map expectedFexArtifacts = [
+                adapter: "liblsx4_fex_backend_v3.so",
+                bridge : "liblsx4_fex2608_context_bridge.so",
+                fexcore: "libFEXCore.so"
+        ]
+        if (!(manifest.artifacts instanceof Map) ||
+                manifest.artifacts.keySet() as Set != expectedFexArtifacts.keySet()) {
+            throw new GradleException("FEX manifest must contain exactly ${expectedFexArtifacts.keySet()}: ${fexRuntimeManifest}")
+        }
+
+        List<File> fexArtifacts = expectedFexArtifacts.collect { String role, String expectedName ->
+            File artifact = file(manifest.artifacts[role].path)
+            if (!artifact.isFile() || artifact.name != expectedName) {
+                throw new GradleException("FEX manifest ${role} artifact is missing or has the wrong name: ${artifact}")
+            }
+            return artifact
+        }
+
+        File outputRoot = generatedRuntimeJniLibs.get().asFile
+        File stagingRoot = new File(outputRoot.parentFile, outputRoot.name + ".staging")
+        File backupRoot = new File(outputRoot.parentFile, outputRoot.name + ".backup")
+        File stagingAbi = new File(stagingRoot, "arm64-v8a")
+        delete(stagingRoot, backupRoot)
+        stagingAbi.mkdirs()
+
+        copy {
+            from(ps4Runtime)
+            if (ps5Runtime.isFile()) {
+                from(ps5Runtime)
+            }
+            from(fexArtifacts)
+            from(adrenoToolsArtifacts)
+            // Diagnostic drivers commonly carry a descriptive filename. The runtime and
+            // Android nativeLibraryDir contract intentionally use one stable basename.
+            from(turnipDriver) {
+                rename { turnipPackagedName }
+            }
+            // Upstream deliberately emits a prefix-less libretro filename. Android's JNI
+            // packager requires lib*.so, and the runtime dlopens this packaged basename
+            // directly; no DT_NEEDED consumer depends on the unchanged upstream SONAME.
+            from(swanstationCore) {
+                rename { swanstationPackagedName }
+            }
+            into(stagingAbi)
+        }
+
+        File stagedPs1Core = new File(stagingAbi, swanstationPackagedName)
+        if (!stagedPs1Core.isFile() || stagedPs1Core.length() <= 0L) {
+            throw new GradleException(
+                    "Verified runtime JNI staging is missing the PS1 core: ${stagedPs1Core}")
+        }
+
+        project.exec {
+            commandLine(configuredPython.get(), fexArtifactVerifier.absolutePath,
+                    "--manifest", fexRuntimeManifest.absolutePath,
+                    "--packaged-dir", stagingAbi.absolutePath)
+        }
+
+        boolean oldOutputMoved = false
+        try {
+            if (outputRoot.exists()) {
+                oldOutputMoved = outputRoot.renameTo(backupRoot)
+                if (!oldOutputMoved) {
+                    throw new GradleException("Cannot atomically stage the previous runtime JNI directory: ${outputRoot}")
+                }
+            }
+            if (!stagingRoot.renameTo(outputRoot)) {
+                throw new GradleException("Cannot publish the verified runtime JNI directory: ${stagingRoot}")
+            }
+            delete(backupRoot)
+        } catch (Throwable error) {
+            if (oldOutputMoved && !outputRoot.exists()) {
+                backupRoot.renameTo(outputRoot)
+            }
+            throw error
+        }
+    }
+}
+
+def registerFexPackagingVerifier = { String variantName ->
+    String capitalizedVariant = variantName.capitalize()
+    String stripTaskName = "strip${capitalizedVariant}DebugSymbols"
+    def verifierTask = tasks.register("verify${capitalizedVariant}FexPackaging") {
+        dependsOn(stripTaskName)
+        inputs.files(fexRuntimeManifest, fexArtifactVerifier)
+        outputs.upToDateWhen { false }
+        doLast {
+            File packagedAbi = layout.buildDirectory.dir(
+                    "intermediates/stripped_native_libs/${variantName}/${stripTaskName}/out/lib/arm64-v8a"
+            ).get().asFile
+            File packagedLibcxx = new File(packagedAbi, "libc++_shared.so")
+            if (!packagedAbi.isDirectory() || !packagedLibcxx.isFile()) {
+                throw new GradleException("Cannot verify the actual ${variantName} native-library staging directory: ${packagedAbi}")
+            }
+            project.exec {
+                commandLine(configuredPython.get(), fexArtifactVerifier.absolutePath,
+                        "--manifest", fexRuntimeManifest.absolutePath,
+                        "--packaged-dir", packagedAbi.absolutePath,
+                        "--packaged-libcxx", packagedLibcxx.absolutePath)
+            }
+        }
+    }
+    return verifierTask
+}
+
+def verifyDebugFexPackaging = registerFexPackagingVerifier("debug")
+def verifyReleaseFexPackaging = registerFexPackagingVerifier("release")
+
+def sha256Stream = { InputStream stream ->
+    MessageDigest digest = MessageDigest.getInstance("SHA-256")
+    byte[] buffer = new byte[64 * 1024]
+    for (int count = stream.read(buffer); count >= 0; count = stream.read(buffer)) {
+        if (count > 0) {
+            digest.update(buffer, 0, count)
+        }
+    }
+    return digest.digest().encodeHex().toString()
+}
+
+def verifyPs1CoreInApks = { String variantName ->
+    File apkDirectory = layout.buildDirectory.dir("outputs/apk/${variantName}").get().asFile
+    Set<File> apks = fileTree(apkDirectory) {
+        include "*.apk"
+    }.files
+    if (apks.isEmpty()) {
+        throw new GradleException(
+                "Cannot verify PS1 core packaging; no ${variantName} APK exists under ${apkDirectory}")
+    }
+    String expectedEntry = "lib/arm64-v8a/${swanstationPackagedName}"
+    String stripTaskName = "strip${variantName.capitalize()}DebugSymbols"
+    File strippedPs1Core = layout.buildDirectory.file(
+            "intermediates/stripped_native_libs/${variantName}/${stripTaskName}/out/${expectedEntry}"
+    ).get().asFile
+    if (!strippedPs1Core.isFile() || strippedPs1Core.length() <= 0L) {
+        throw new GradleException(
+                "Cannot verify PS1 core packaging; stripped source is missing: ${strippedPs1Core}")
+    }
+    String expectedSha256
+    strippedPs1Core.withInputStream { stream ->
+        expectedSha256 = sha256Stream(stream)
+    }
+    apks.each { File apk ->
+        ZipFile archive = new ZipFile(apk)
+        try {
+            def entry = archive.getEntry(expectedEntry)
+            if (entry == null || entry.size <= 0L) {
+                throw new GradleException(
+                        "APK ${apk} is missing the required PS1 core entry ${expectedEntry}")
+            }
+            def swanstationEntries = archive.entries().findAll { zipEntry ->
+                !zipEntry.directory && zipEntry.name.toLowerCase(Locale.ROOT).contains("swanstation")
+            }
+            if (swanstationEntries.size() != 1 || swanstationEntries[0].name != expectedEntry) {
+                throw new GradleException(
+                        "APK ${apk} has an ambiguous PS1 core set: ${swanstationEntries*.name}")
+            }
+            if (archive.getEntry("lib/arm64-v8a/libc++_shared.so") == null) {
+                throw new GradleException(
+                        "APK ${apk} is missing libc++_shared.so required by the PS1 core")
+            }
+            String packagedSha256
+            archive.getInputStream(entry).withCloseable { stream ->
+                packagedSha256 = sha256Stream(stream)
+            }
+            if (packagedSha256 != expectedSha256) {
+                throw new GradleException(
+                        "APK ${apk} PS1 core hash mismatch: expected ${expectedSha256}, got ${packagedSha256}")
+            }
+            logger.lifecycle("LSX4 PS1 APK packaging verified: ${apk.name}!/${expectedEntry}")
+        } finally {
+            archive.close()
+        }
+    }
+}
+
+def verifyTurnipDriverInApks = { String variantName ->
+    File apkDirectory = layout.buildDirectory.dir("outputs/apk/${variantName}").get().asFile
+    Set<File> apks = fileTree(apkDirectory) {
+        include "*.apk"
+    }.files
+    if (apks.isEmpty()) {
+        throw new GradleException(
+                "Cannot verify Turnip packaging; no ${variantName} APK exists under ${apkDirectory}")
+    }
+    String expectedEntry = "lib/arm64-v8a/${turnipPackagedName}"
+    apks.each { File apk ->
+        ZipFile archive = new ZipFile(apk)
+        try {
+            def entry = archive.getEntry(expectedEntry)
+            if (entry == null || entry.size <= 0L) {
+                throw new GradleException(
+                        "APK ${apk} is missing the required Turnip entry ${expectedEntry}")
+            }
+            def turnipEntries = archive.entries().findAll { zipEntry ->
+                !zipEntry.directory &&
+                        zipEntry.name.startsWith("lib/arm64-v8a/") &&
+                        zipEntry.name.toLowerCase(Locale.ROOT).contains("turnip")
+            }
+            if (turnipEntries.size() != 1 || turnipEntries[0].name != expectedEntry) {
+                throw new GradleException(
+                        "APK ${apk} has an ambiguous Turnip driver set: ${turnipEntries*.name}")
+            }
+            String packagedSha256
+            archive.getInputStream(entry).withCloseable { stream ->
+                packagedSha256 = sha256Stream(stream)
+            }
+            if (packagedSha256 != turnipDriverSha256) {
+                throw new GradleException(
+                        "APK ${apk} Turnip hash mismatch: expected ${turnipDriverSha256}, got ${packagedSha256}")
+            }
+            logger.lifecycle(
+                    "LSX4 Turnip APK packaging verified: ${apk.name}!/${expectedEntry} sha256=${packagedSha256}")
+        } finally {
+            archive.close()
+        }
+    }
+}
+
 android {
     namespace "app.lsx4.android"
     compileSdk 35
+    // PS4, PS5, FEX and SwanStation artifacts are all produced with this
+    // libc++ ABI. Letting AGP choose the older default NDK packaged an
+    // incompatible libc++_shared.so and made the PS4 runtime fail at dlopen.
+    ndkVersion swanstationNdkVersion
+
+    signingConfigs {
+        debug {
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
+        }
+    }
 
     defaultConfig {
+        buildConfigField "String", "LSX4_COMPATIBILITY_REPORT_URL", groovy.json.JsonOutput.toJson(providers.gradleProperty("lsx4CompatibilityReportUrl").orElse("https://lsx45.app/api/v1/compatibility-reports").get())
         applicationId resolvedApplicationId.get()
-        minSdk 29
+        minSdk 26
         targetSdk 35
         versionCode 1
         versionName "0.1.0"
+
+        buildConfigField "String", "LSX4_DIAGNOSTICS_URL",
+                buildConfigString(diagnosticsUploadUrl.get())
+        buildConfigField "String", "LSX4_DIAGNOSTICS_UPLOAD_TOKEN",
+                buildConfigString(diagnosticsUploadToken.get())
 
         ndk {
             abiFilters "arm64-v8a"
@@ -77,10 +664,27 @@ android {
     packagingOptions {
         jniLibs {
             useLegacyPackaging true
+            // Runtime targets own their symbol policy. Keeping the exact target artifacts here
+            // also makes diagnostics freshness checks compare the bytes that will be loaded.
+            keepDebugSymbols += [
+                    "**/libc++_shared.so",
+                    "**/liblsx4_executor_android.so",
+                    "**/liblsx4_executor_ps5_android.so",
+                    "**/liblsx4_fex_backend_v3.so",
+                    "**/liblsx4_fex2608_context_bridge.so",
+                    "**/libFEXCore.so"
+            ]
         }
     }
 
+    buildFeatures {
+        buildConfig true
+    }
+
     sourceSets {
+        main {
+            jniLibs.srcDir(generatedRuntimeJniLibs)
+        }
         debug {
             assets.srcDir(generatedDebugTestAssets)
         }
@@ -88,11 +692,37 @@ android {
 }
 
 dependencies {
+    implementation "androidx.core:core:1.15.0"
     implementation "org.apache.commons:commons-compress:1.28.0"
+    testImplementation "junit:junit:4.13.2"
 }
 
 tasks.configureEach { task ->
-    if (task.name == "mergeDebugAssets") {
+    String normalizedName = task.name.toLowerCase(Locale.ROOT)
+    if (task.name == "mergeDebugAssets" ||
+            (normalizedName.contains("debug") && normalizedName.contains("lint"))) {
         task.dependsOn(prepareDebugTestAssets)
+    }
+    if (normalizedName.startsWith("merge") &&
+            (normalizedName.endsWith("jnilibfolders") || normalizedName.endsWith("nativelibs"))) {
+        task.dependsOn(prepareRuntimeJniLibs)
+    }
+    if (["packageDebug", "packageDebugBundle", "packageDebugUniversalApk"].contains(task.name)) {
+        task.dependsOn(verifyDebugFexPackaging)
+    }
+    if (["packageRelease", "packageReleaseBundle", "packageReleaseUniversalApk"].contains(task.name)) {
+        task.dependsOn(verifyReleaseFexPackaging)
+    }
+    if (task.name == "packageDebug") {
+        task.doLast {
+            verifyPs1CoreInApks("debug")
+            verifyTurnipDriverInApks("debug")
+        }
+    }
+    if (task.name == "packageRelease") {
+        task.doLast {
+            verifyPs1CoreInApks("release")
+            verifyTurnipDriverInApks("release")
+        }
     }
 }

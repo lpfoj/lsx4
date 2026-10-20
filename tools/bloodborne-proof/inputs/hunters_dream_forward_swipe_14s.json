@@ -1,0 +1,24 @@
+{
+  "schema": "lsx4-bloodborne-proof-input/v1",
+  "id": "hunters-dream-forward-swipe-14s-v1",
+  "kind": "swipe",
+  "gameplayInputAllowed": true,
+  "crossAllowed": false,
+  "requiresGameplayAndVisualGate": true,
+  "coordinateSpace": {
+    "width": 3168,
+    "height": 1440
+  },
+  "gesture": {
+    "x1": 950,
+    "y1": 1245,
+    "x2": 950,
+    "y2": 1060,
+    "durationMilliseconds": 14000
+  },
+  "measurementDurationSeconds": 14,
+  "movementEvidenceRequired": true,
+  "routeTraversalDistanceClaimed": false,
+  "fpsVerdictControlledByCampaignPhase": true,
+  "purpose": "Matched moving workload after the exact Hunter's Dream gameplay and visual gates."
+}

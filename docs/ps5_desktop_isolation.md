@@ -1,5 +1,10 @@
 # PS5 desktop isolation
 
+> [!IMPORTANT]
+> Before any device/FPS/playable measurement, run `scripts/preflight-vivo-performance-test.ps1`;
+> stale Android Studio process-trackers and known profiler loads make the result invalid. See the
+> mandatory [performance-test preflight](PERFORMANCE_TEST_PREFLIGHT.md).
+
 The current device-test checkpoint and exact continuation procedure are in
 [`PS5_RUNTIME_HANDOFF.md`](../PS5_RUNTIME_HANDOFF.md).
 

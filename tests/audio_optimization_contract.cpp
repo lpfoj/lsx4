@@ -88,6 +88,53 @@ bool CheckImmediateToggle() {
   return !disabled.used_simd && guard.generation != enabled_generation;
 }
 
+bool CheckPerChannelVolumeBeforeStdDownmix() {
+  // Std physical order is FL/FR/FC/LFE/BL/BR/SL/SR. The gain array is
+  // canonical/semantic, matching sceAudioOutSetVolume channel flags.
+  const std::array<float, 8> source{0.25f, -0.5f, 0.75f, 0.875f,
+                                    -0.625f, 0.5f, 0.375f, -0.25f};
+  const std::array<float, 8> gains{1.0f, 1.0f, 0.0f, 0.0f,
+                                   0.0f, 0.0f, 0.0f, 0.0f};
+  std::array<float, 2> stereo{};
+  AudioConversionGuard guard{};
+  SetManagedAudioSimdEnabled(true);
+  const auto result = ConvertAudioBufferToFloatPerChannel(
+      source.data(), 1,
+      {.sample_type = AudioSampleType::Float32,
+       .channels = 8,
+       .standard_8ch = true},
+      2, gains, stereo, guard);
+#if defined(__aarch64__) || defined(_M_ARM64)
+  if (!result.used_simd || !result.differential_guard_passed) {
+    return false;
+  }
+#else
+  if (result.used_simd) {
+    return false;
+  }
+#endif
+  if (!result.any_nonzero || !Near(stereo[0], source[0]) ||
+      !Near(stereo[1], source[1])) {
+    return false;
+  }
+
+  // Non-Std uses physical SL/SR at lanes 4/5; independent semantic gains
+  // must remain attached to the same speakers in both layout variants.
+  const std::array<float, 8> non_std_source{0.0f, 0.0f, 0.0f, 0.0f,
+                                            0.5f, -0.25f, 0.0f, 0.0f};
+  const std::array<float, 8> surround_gains{0.0f, 0.0f, 0.0f, 0.0f,
+                                            0.25f, 0.5f, 0.0f, 0.0f};
+  guard = {};
+  const auto non_std = ConvertAudioBufferToFloatPerChannel(
+      non_std_source.data(), 1,
+      {.sample_type = AudioSampleType::Float32,
+       .channels = 8,
+       .standard_8ch = false},
+      2, surround_gains, stereo, guard);
+  return non_std.any_nonzero && Near(stereo[0], 0.5f * 0.25f * 0.70710678f) &&
+         Near(stereo[1], -0.25f * 0.5f * 0.70710678f);
+}
+
 bool CheckCrossFormatMix() {
   constexpr u32 Frames = 256;
   std::array<s16, Frames * 8> main_surround{};
@@ -163,18 +210,35 @@ int main() {
   if (!CheckImmediateToggle()) {
     return 3;
   }
-  SetManagedAudioSimdEnabled(true);
-  if (!CheckCrossFormatMix()) {
+  if (!CheckPerChannelVolumeBeforeStdDownmix()) {
     return 4;
   }
-  if (!CheckStreamContracts()) {
+  SetManagedAudioSimdEnabled(true);
+  if (!CheckCrossFormatMix()) {
     return 5;
+  }
+  if (!CheckStreamContracts()) {
+    return 6;
   }
   const auto stats = GetAudioOptimizationStats();
   if (stats.regression_guard_passes == 0 || stats.channel_guard_failures != 0 ||
       stats.continuity_failures == 0 || stats.timestamp_order_failures == 0 ||
       stats.scheduler_underruns == 0 || stats.toggle_generation < 3) {
-    return 6;
+    return 7;
   }
+#if defined(__ANDROID__)
+  // Android production runs keep pure conversion timing/counting off unless
+  // the explicit app-private diagnostic marker is present. Functional guard,
+  // continuity and error counters above remain live.
+  if (stats.conversion_calls != 0 || stats.converted_frames != 0 ||
+      stats.simd_frames != 0 || stats.scalar_frames != 0 ||
+      stats.conversion_nanoseconds != 0) {
+    return 8;
+  }
+#else
+  if (stats.conversion_calls == 0 || stats.converted_frames == 0) {
+    return 8;
+  }
+#endif
   return 0;
 }

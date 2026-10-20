@@ -32,6 +32,22 @@ consteval std::array<std::uint8_t, 32> BuildThunkIdentity(
 
 inline constexpr auto FexThunkIdentity =
     BuildThunkIdentity("LSX4/FEX/HLE bridge/2026-07");
+consteval std::array<std::uint8_t, 32> DeriveFexTypedThunkIdentity(
+    std::array<std::uint8_t, 32> identity) {
+
+
+
+    identity[0] ^= 0xa7;
+    identity[11] ^= 0x5d;
+    identity[23] ^= 0xc3;
+    identity[31] ^= 0x6e;
+    return identity;
+}
+inline constexpr auto FexTypedThunkIdentity =
+    DeriveFexTypedThunkIdentity(FexThunkIdentity);
+inline constexpr std::array<std::uint8_t, 32> FexLegacyThunkIdentity{
+    'e', 'x', 'e', 'c', 'u', 't', 'o', 'r', ':', 'p', 's', '4', ':', 'h', 'l', 'e',
+    ':', 'f', 'e', 'x', 'c', 'o', 'r', 'e', ':', 't', 'h', 'u', 'n', 'k', '0', '1'};
 inline constexpr auto TranslationThunkIdentity =
     BuildThunkIdentity("LSX4/dynamic translation/HLE bridge/v1");
 

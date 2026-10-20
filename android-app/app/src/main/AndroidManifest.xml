@@ -1,15 +1,37 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+
     <application
+        android:name="app.lsx4.android.Lsx4Application"
+        android:allowBackup="false"
+        android:allowAudioPlaybackCapture="true"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:theme="@style/AppTheme"
         android:label="@string/app_name"
         android:icon="@drawable/lsx4_launcher_icon"
         android:roundIcon="@drawable/lsx4_launcher_icon"
         android:localeConfig="@xml/locales_config"
         android:appCategory="game"
+        android:isGame="true"
         android:hardwareAccelerated="true"
         android:largeHeap="true"
         android:gwpAsanMode="never"
         android:resizeableActivity="false">
+        <!-- Native allocation churn is invisible from inside the process: the
+             totals say how much is held, never who keeps taking and returning
+             it. heapprofd answers that with call stacks per size class, but it
+             only attaches to a profileable process, and a release build is not
+             one by default. -->
+        <profileable android:shell="true" />
+        <meta-data
+            android:name="android.game_mode_config"
+            android:resource="@xml/game_mode_config" />
         <activity
             android:name="app.lsx4.android.MainActivity"
             android:exported="true"
@@ -25,8 +47,10 @@
             android:name="app.lsx4.android.GameActivity"
             android:enableOnBackInvokedCallback="true"
             android:exported="false"
+            android:excludeFromRecents="true"
             android:launchMode="singleTask"
             android:process=":game"
+            android:taskAffinity="app.lsx4.android.game"
             android:configChanges="keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
             android:showWhenLocked="true"
             android:screenOrientation="landscape"
@@ -37,5 +61,69 @@
             android:exported="false"
             android:configChanges="keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
             android:screenOrientation="portrait" />
+        <activity
+            android:name="app.lsx4.android.OverlayEditorActivity"
+            android:exported="false"
+            android:process=":game"
+            android:configChanges="keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+            android:screenOrientation="landscape" />
+        <activity
+            android:name="app.lsx4.android.VulkanDriverProbeActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:hardwareAccelerated="false"
+            android:process=":driverprobe"
+            android:theme="@style/DriverProbeTheme" />
+        <provider
+            android:name="app.lsx4.android.CaptureFileProvider"
+            android:authorities="${applicationId}.captures"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/capture_file_paths" />
+        </provider>
+        <provider
+            android:name="app.lsx4.android.SettingsProvider"
+            android:authorities="${applicationId}.settings"
+            android:exported="false" />
+        <provider
+            android:name="app.lsx4.android.GameSessionProvider"
+            android:authorities="${applicationId}.game-session"
+            android:exported="false" />
+        <service
+            android:name="app.lsx4.android.GameCaptureService"
+            android:exported="false"
+            android:process=":game"
+            android:foregroundServiceType="mediaProjection" />
+        <receiver
+            android:name="app.lsx4.android.ProofMetricsReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:process=":game">
+            <intent-filter>
+                <action android:name="app.lsx4.android.CAPTURE_PROOF_METRICS" />
+            </intent-filter>
+        </receiver>
+        <receiver
+            android:name="app.lsx4.android.VulkanDriverControlReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="app.lsx4.android.SELECT_IMPORTED_VULKAN_DRIVER" />
+            </intent-filter>
+        </receiver>
+        <activity
+            android:name="app.lsx4.android.MenuSectionActivity"
+            android:exported="false" />
+        <activity
+            android:name="app.lsx4.android.DeviceInfoActivity"
+            android:process=":deviceinfo"
+            android:exported="false" />
+        <activity
+            android:name="app.lsx4.android.CompatibilityReportActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
     </application>
 </manifest>

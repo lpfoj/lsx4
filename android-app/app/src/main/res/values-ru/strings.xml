@@ -1,20 +1,72 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="library_sort_action">Сортировка · удерживайте для поиска</string>
+    <string name="library_sort_manual">Как сейчас (ручной порядок)</string>
+    <string name="library_sort_reverse">Инвертнуть текущий список</string>
+    <string name="library_sort_playable">Playable / Unplayable</string>
+    <string name="library_sort_unplayable">Unplayable / Playable</string>
+    <string name="library_search_hint">Поиск по тайтлу</string>
+    <string name="library_search_hide">Скрыть поиск и сбросить фильтр</string>
+    <string name="library_search_empty">По этому запросу игр не найдено.</string>
+    <string name="library_move_manual_only">Для перемещения выберите ручной порядок и очистите поиск.</string>
     <string name="app_name">LSX4</string><string name="library_scanning">Поиск установленных игр…</string><string name="library_found">Найдено игр: %1$d</string><string name="library_empty_status">Игры не найдены</string><string name="library_empty">Нет установленных игр. Нажмите +, чтобы импортировать извлечённый каталог или PKG.</string>
-    <string name="menu_import_directory">Импортировать каталог</string><string name="menu_import_pkg">Импортировать PKG</string><string name="menu_settings">Настройки</string><string name="menu_add">Добавить игру</string><string name="menu_remove_game">Удалить выбранную игру</string><string name="game_removing">Удаление %1$s…</string><string name="game_removed">%1$s удалена</string><string name="game_remove_failed">Не удалось удалить %1$s</string>
-    <string name="game_selected_for_removal">%1$s выбрана для удаления</string><string name="game_selection_cleared">Выделение %1$s снято</string><string name="game_marked_unsupported">%1$s добавлена в список неподдерживаемых</string><string name="game_marked_supported">%1$s добавлена в список поддерживаемых</string>
-    <string name="game_status_unclassified">Не распределена</string><string name="game_status_unsupported">Не поддерживается</string><string name="game_status_supported">Поддерживается</string>
-    <string name="game_item_accessibility">%1$s, %2$s. %3$s. Удерживайте 2 секунды для выбора на удаление, 4 секунды для отметки как неподдерживаемой или 8 секунд для отметки как поддерживаемой.</string>
+    <string name="menu_import_directory">Импортировать каталог</string><string name="menu_import_pkg">Импортировать PKG</string><string name="menu_settings">Настройки</string><string name="menu_add">Добавить игру</string><string name="menu_remove_game">Удалить выбранную игру</string><string name="game_remove_title">Удалить игру?</string><string name="game_remove_message">Удалить %1$s и её установленные файлы с устройства?</string><string name="game_remove_confirm">Удалить</string><string name="game_removing">Удаление %1$s…</string><string name="game_removed">%1$s удалена</string><string name="game_remove_failed">Не удалось удалить %1$s</string>
+    <string name="game_selected_for_removal">%1$s выбрана для удаления</string><string name="game_selection_cleared">Выделение %1$s снято</string><string name="game_marked_unsupported">%1$s отмечена как неиграбельная</string><string name="game_marked_supported">%1$s отмечена как играбельная</string>
+    <string name="game_move_selected">%1$s выбрана. Перетащите её или нажмите позицию назначения.</string>
+    <string name="game_move_completed">%1$s перемещена</string>
+    <string name="library_hold_hint">Удержание: 2 с — выбрать · 4 с — unplayable · 5 с — playable. Выбранную игру можно перетащить или переместить нажатием.</string>
+    <string name="library_hold_hint_dismiss">Скрыть подсказку по жестам списка</string>
+    <string name="game_hold_countdown">Цель удержания: %1$d с</string>
+    <string name="game_status_unclassified">Не распределена</string><string name="game_status_unsupported">Не играбельна</string><string name="game_status_supported">Играбельна</string>
+    <string name="game_item_accessibility">%1$s, %2$s. %3$s.</string>
+    <string name="game_individual_settings_open">Индивидуальные настройки для %1$s</string>
+    <string name="game_profile_scope_note">Все настройки ниже переопределяют глобальные значения только для игры «%1$s». Неизменённые пункты продолжают наследовать актуальные глобальные значения.</string>
+    <string name="game_profile_reset">Сбросить индивидуальные настройки</string>
+    <string name="game_profile_reset_confirm">Удалить все индивидуальные переопределения для игры «%1$s» и вернуть наследование глобальных настроек?</string>
+    <string name="game_profile_reset_done">Индивидуальные настройки сброшены</string>
+    <string name="game_profile_unnamed_title">Установленная игра</string>
     <string name="metadata_only">Только метаданные · eboot отсутствует</string>
     <string name="settings_title">Настройки</string><string name="settings_subtitle">Изменения сохраняются автоматически</string><string name="section_general">Общие</string><string name="language">Язык приложения</string>
     <string name="category_graphics">Графика</string><string name="category_graphics_summary">GPU, разрешение и патчи</string><string name="category_audio">Аудио</string><string name="category_audio_summary">Вывод звука</string><string name="category_controls">Управление</string><string name="category_controls_summary">Экранное управление</string><string name="category_cache">Кэширование</string><string name="category_cache_summary">Кэш JIT-блоков и Vulkan pipeline</string><string name="category_other">Другое</string><string name="category_other_summary">Отладочный HUD</string>
-    <string name="graphics_gpu">GPU</string><string name="graphics_gpu_summary">Графический API и семейство устройства</string><string name="graphics_patches">Патчи</string><string name="graphics_patches_summary">Графические патчи для каждой игры</string><string name="graphics_resolution">Выходное разрешение</string>
+    <string name="graphics_gpu">GPU</string><string name="graphics_gpu_summary">Графический API и семейство устройства</string><string name="graphics_patches">Патчи</string><string name="graphics_patches_summary">Графические патчи для каждой игры</string><string name="graphics_resolution">Внутреннее разрешение рендера</string>
+    <string name="graphics_scaling">Масштабирование изображения</string>
+    <string name="graphics_scaling_hint">Меняет размещение готового кадра на экране, не меняя внутреннее и выходное разрешение FSR. Применяется при следующем запуске игры.</string>
+    <string name="graphics_fsr_section">Апскейлинг разрешения</string>
+    <string name="graphics_fsr_enabled">Включить апскейлинг разрешения</string>
+    <string name="graphics_upscaler_algorithm">Алгоритм апскейлинга</string>
+    <string name="upscaler_off">Выключен</string>
+    <string name="upscaler_auto">Авто (рекомендуется для GPU)</string>
+    <string name="graphics_upscaled_output_resolution">Выходное разрешение апскейлера</string>
+    <string name="graphics_rcas_enabled">Повышение резкости RCAS</string>
+    <string name="graphics_upscaler_parameters">Параметры алгоритма</string>
+    <string name="graphics_sharp_bilinear_strength">Сила Sharp Bilinear</string>
+    <string name="graphics_bicubic_kernel">Ядро Bicubic</string>
+    <string name="graphics_fsr1_rcas_sharpness">Резкость FSR1 RCAS</string>
+    <string name="graphics_sgsr1_edge_sharpness">Резкость граней SGSR1</string>
+    <string name="graphics_nis_sharpness">Резкость NIS</string>
+    <string name="graphics_sgsr2_temporal_stability">Временная стабильность SGSR2</string>
+    <string name="graphics_arm_asr_sharpening">Повышение резкости Arm ASR</string>
+    <string name="graphics_arm_asr_sharpness">Резкость Arm ASR</string>
+    <string name="graphics_upscaler_auto_parameters">Авто использует официальные значения выбранного для этого GPU алгоритма.</string>
+    <string name="graphics_upscaler_no_parameters">У этого алгоритма нет дополнительных параметров качества.</string>
+    <string name="graphics_fsr_hint">Выходное разрешение — общий конечный размер, а не опция только FSR. Параметры ниже относятся только к выбранному алгоритму. Авто выбирает SGSR1 на Snapdragon/Adreno и FSR1 на остальных GPU. Временные режимы используют нативные motion/depth при наличии и ограниченную реконструкцию иначе. После изменения перезапустите игру.</string>
+    <string name="scaling_current">Текущий режим (по умолчанию)</string>
+    <string name="scaling_fit">Вписать в экран с сохранением пропорций</string>
+    <string name="scaling_fill_crop">Заполнить весь экран с сохранением пропорций (обрезка)</string>
+    <string name="scaling_stretch">Растянуть на весь экран без сохранения пропорций</string>
+    <string name="scaling_integer">Целочисленное масштабирование по центру</string>
+    <string name="scaling_native_1_to_1">Исходный размер 1:1 по центру</string>
+    <string name="scaling_aspect_4_3">Принудительно 4:3, вписать в экран</string>
+    <string name="scaling_aspect_16_9">Принудительно 16:9, вписать в экран</string>
+    <string name="scaling_aspect_16_10">Принудительно 16:10, вписать в экран</string>
+    <string name="scaling_aspect_21_9">Принудительно 21:9, вписать в экран</string>
+    <string name="scaling_aspect_32_9">Принудительно 32:9, вписать в экран</string>
     <string name="gpu_vulkan">Vulkan (Snapdragon, мощные Mali)</string><string name="gpu_opengl">OpenGL (Mali, другие)</string><string name="gpu_opengl_pending">В разработке</string>
     <string name="audio_enable">Включить вывод звука</string><string name="controls_enable">Показывать экранное управление</string><string name="controls_hint">Управление автоматически скрывается при подключении физического геймпада.</string><string name="controls_opacity">Прозрачность управления</string>
     <string name="cache_enable">Постоянный кэш JIT-блоков и Vulkan pipeline</string><string name="cache_hint">Управляет всем постоянным кэшем: декодированными и нативными JIT-блоками, горячими профилями, шейдерами и Vulkan pipeline. Выключение полностью запрещает чтение и запись со следующего запуска игры; существующие файлы остаются до удаления ниже.</string>
-    <string name="cache_games">Кэш по играм</string><string name="cache_scanning">Подсчёт размеров кэша…</string><string name="cache_empty">Кэш по играм ещё не сформирован.</string><string name="cache_unknown_game">Кэш игры %1$s</string><string name="cache_scan_failed">Не удалось прочитать кэш: %1$s</string><string name="cache_size_breakdown">JIT %1$s · Vulkan %2$s</string><string name="cache_delete_action">Очистить кэш игры %1$s</string><string name="cache_delete_title">Очистить кэш игры?</string><string name="cache_delete_message">%1$s использует %2$s кэша JIT и Vulkan. Следующий запуск может занять больше времени.</string><string name="cache_delete_confirm">Очистить</string><string name="cache_deleted">Кэш игры %1$s очищен</string><string name="cache_delete_failed">Не удалось очистить кэш: %1$s</string><string name="cache_delete_game_running">Перед очисткой кэша полностью закройте запущенную игру.</string><string name="cache_setting_failed">Не удалось изменить настройку кэша: %1$s</string><string name="debug_hud">Отладочный HUD</string>
+    <string name="cache_games">Кэш по играм</string><string name="cache_scanning">Подсчёт размеров кэша…</string><string name="cache_empty">Кэш по играм ещё не сформирован.</string><string name="cache_unknown_game">Кэш игры %1$s</string><string name="cache_scan_failed">Не удалось прочитать кэш: %1$s</string><string name="cache_size_breakdown">JIT %1$s · Vulkan %2$s</string><string name="cache_delete_action">Очистить кэш игры %1$s</string><string name="cache_delete_title">Очистить кэш игры?</string><string name="cache_delete_message">%1$s использует %2$s кэша JIT и Vulkan. Следующий запуск может занять больше времени.</string><string name="cache_delete_confirm">Очистить</string><string name="cache_deleted">Кэш игры %1$s очищен</string><string name="cache_delete_failed">Не удалось очистить кэш: %1$s</string><string name="cache_delete_game_running">Перед очисткой кэша полностью закройте запущенную игру.</string><string name="cache_setting_failed">Не удалось изменить настройку кэша: %1$s</string><string name="debug_hud">Отладочный HUD</string><string name="debug_hud_upscaler_info">Информация об апскейлере в HUD</string>
     <string name="test_mode">Тестовый режим</string><string name="test_mode_hint">Включает отладочную диагностику и устанавливает встроенный аудиомодуль NGS2. После изменения перезапустите запущенную игру.</string><string name="test_mode_module_unavailable">В отладочном APK отсутствует libSceNgs2.sprx. Укажите путь к модулю shad4pc при сборке.</string><string name="test_mode_audio_ready">Тестовый режим включён. Аудиомодуль NGS2 готов.</string><string name="test_mode_user_audio_ready">Тестовый режим включён. Используется ранее установленный пользователем аудиомодуль NGS2.</string><string name="test_mode_audio_failed">Не удалось включить тестовый режим: %1$s</string><string name="test_mode_disabled">Тестовый режим выключен. Аудиомодуль NGS2, установленный отладочной сборкой, удалён.</string>
-    <string name="patch_select_game">Игра</string><string name="patch_no_games">Нет игр со встроенными в приложение патчами.</string><string name="patch_dynamic_shadows">Динамические тени</string><string name="patch_ssao">Фоновое затенение (SSAO)</string><string name="patch_motion_blur">Размытие в движении</string><string name="patch_depth_of_field">Глубина резкости</string><string name="patch_enabled">Включено</string><string name="patch_disabled">Отключено для производительности</string>
+    <string name="patch_select_game">Игра</string><string name="patch_no_games">Нет игр со встроенными в приложение патчами.</string><string name="patch_no_game_patches">Для игры «%1$s» нет встроенных в приложение патчей.</string><string name="patch_dynamic_shadows">Динамические тени</string><string name="patch_ssao">Фоновое затенение (SSAO)</string><string name="patch_motion_blur">Размытие в движении</string><string name="patch_depth_of_field">Глубина резкости</string><string name="patch_enabled">Включено</string><string name="patch_disabled">Отключено для производительности</string>
     <string name="back">Назад</string><string name="import_cancelled">Импорт отменён</string><string name="operation_wait">Дождитесь завершения текущей операции</string><string name="import_wait_before_launch">Дождитесь завершения импорта перед запуском игры</string><string name="folder_picker_unavailable">Системный выбор папки недоступен</string><string name="file_picker_unavailable">Системный выбор файла недоступен</string><string name="hud_metrics">метрики</string>
     <string name="import_checking_directory">Проверка извлечённой игры…</string><string name="import_copying_pkg">Копирование PKG…</string><string name="scan_error">Не удалось просканировать библиотеку игр</string><string name="import_already_running">Другая операция импорта ещё выполняется</string><string name="import_error">Ошибка импорта</string>
     <string name="import_directory_success">Импортировано: %1$s (%2$s), файлов: %3$d, %4$s</string><string name="import_pkg_copied">PKG скопирован (%1$s), проверка…</string><string name="import_pkg_registered">PKG зарегистрирован: %1$s. eboot.bin доступен.</string><string name="import_pkg_metadata_only">Метаданные PKG импортированы: %1$s. eboot/PFS из retail PKG пока не извлечены, поэтому запись нельзя запустить.</string><string name="import_copy_progress">Копирование: файлов %1$d, %2$s</string><string name="import_pkg_copy_progress">Копирование PKG: %1$s</string>
@@ -32,6 +84,8 @@
     <string name="surface_detached">Поверхность отключена.</string>
     <string name="surface_detach_failed">Не удалось отключить поверхность: %1$s</string>
     <string name="aarch64_jit">AArch64 JIT</string>
+    <string name="guest_cpu_backend_current">Текущий AArch64 JIT</string>
+    <string name="guest_cpu_backend_fex_experimental">FEX (экспериментальный)</string>
     <string name="controls_gamepad_hint">При подключении поддерживаемого геймпада экранный оверлей автоматически скрывается. Геймпады поддерживаются.</string>
     <string name="resolution_native">Нативное (устройство)</string>
     <string name="resolution_upscale_150">Масштаб 1,5× (2880×1620)</string>
@@ -46,11 +100,6 @@
     <string name="audio_ngs2_error_size">Выбранный модуль слишком большой</string>
     <string name="audio_ngs2_error_name">Выберите модуль прошивки с именем %1$s</string>
     <string name="audio_ngs2_error_format">Выбранный файл не является расшифрованным модулем PS4</string>
-    <string name="game_hold_waiting">Удерживайте: 2 с удалить · 4 с не поддерживается · 8 с поддерживается</string>
-    <string name="game_hold_release_remove">Отпустите: выбрать для удаления</string>
-    <string name="game_hold_release_unsupported">Отпустите: отметить неподдерживаемой</string>
-    <string name="game_hold_release_supported">Отпустите: отметить поддерживаемой</string>
-    <string name="game_hold_elapsed">%1$.1f / 8.0 с · %2$s</string>
     <string name="game_menu_title">Быстрые настройки</string>
     <string name="game_menu_hint">Смахните вправо или нажмите вне панели, чтобы закрыть</string>
     <string name="game_menu_open">Открыть быстрые настройки</string>
@@ -61,6 +110,14 @@
     <string name="game_menu_exit">Выйти к списку игр</string>
     <string name="category_managed_optimizations">Управляемые оптимизации</string>
     <string name="category_managed_optimizations_summary">Опциональные быстрые ARM-пути с риском несовместимости</string>
+    <string name="category_cpu_tuning">Оптимизации CPU</string>
+    <string name="category_cpu_tuning_summary">Профили JIT, памяти, таймингов, планировщика и HLE для каждой игры</string>
+    <string name="cpu_tuning_apply_all_games">Переопределить для всех игр</string>
+    <string name="cpu_tuning_apply_all_games_hint">Применяет этот общий CPU-профиль ко всем установленным играм, кроме выбранных ниже исключений. Глобальные и индивидуальные профили остаются сохранены.</string>
+    <string name="cpu_tuning_exceptions">Исключения: %1$s</string>
+    <string name="cpu_tuning_exceptions_none">ничего не выбрано</string>
+    <string name="cpu_tuning_exceptions_count">выбрано игр: %1$d</string>
+    <string name="cpu_tuning_exceptions_title">Не переопределять для игр</string>
     <string name="optimization_arm_gpu_fast_path">Быстрый ARM GPU-путь</string>
     <string name="optimization_arm_gpu_fast_path_hint">Передаёт константы шейдеров через прямую память GPU и убирает диагностику Funnel из каждого draw и submit. Это может повысить производительность, но на отдельных драйверах возможны графические дефекты или сбои. После изменения перезапустите игру.</string>
     <string name="optimization_coarse_fragment_2x2">Грубое затенение фрагментов 2×2</string>
@@ -74,15 +131,21 @@
     <string name="optimization_disable_vk_robustness">Отключить проверки Vulkan robustness</string>
     <string name="optimization_disable_vk_robustness_hint">Убирает защиту границ GPU-буферов и изображений. Может ускорить игры с тяжёлыми шейдерами, но ошибочный доступ способен повредить графику или вызвать сбой драйвера. После изменения перезапустите игру.</string>
     <string name="optimization_tiered_jit">Многоуровневый JIT</string>
+    <string name="optimization_guest_cpu_backend">CPU-бэкенд гостя</string>
+    <string name="optimization_guest_cpu_backend_hint">Текущий JIT — безопасный вариант по умолчанию. FEX — экспериментальный guest-only бэкенд; изменение применяется после перезапуска игрового процесса. Несовместимая сборка явно сообщает об откате на Current.</string>
     <string name="optimization_tiered_jit_hint">Профилирует горячие переходы гостевого кода, сохраняя текущий JIT как базовый уровень и мгновенный откат. После изменения перезапустите игру.</string>
     <string name="optimization_jit_trace_compilation">Компиляция JIT-трасс</string>
     <string name="optimization_jit_trace_compilation_hint">Компилирует стабильные горячие прямые пути как оптимизированные трассы Tier 2. Требует многоуровневый JIT; небезопасные и изменившиеся пути остаются на базовом JIT. После изменения перезапустите игру.</string>
     <string name="optimization_fast_guest_memory">Быстрая модель памяти гостя</string>
     <string name="optimization_fast_guest_memory_hint">Экспериментально: прямые ARM-чтения и записи используются только для обращений относительно стека, вся остальная память гостя сохраняет строгую модель. По умолчанию отключено, пока нельзя доказать приватность всех переданных адресов стека. После изменения перезапустите игру.</string>
+    <string name="optimization_guest_spin_wait_event">Событийное ожидание гостевых spin-loop</string>
+    <string name="optimization_guest_spin_wait_event_hint">Для доказанных read-only циклов опроса заменяет таймерные паузы уведомлением о записи и ограниченным ожиданием. Точное условие гостя всё равно перепроверяется, а неподдерживаемые циклы сохраняют таймерный fallback. После изменения перезапустите игру.</string>
     <string name="optimization_relaxed_fp_fusion">Слияние скалярных FMA</string>
     <string name="optimization_relaxed_fp_fusion_hint">Заменяет доказанные цепочки MUL+ADD одной ARM64 FMADD. Промежуточное округление удаляется, поэтому строгий x86-режим остаётся вариантом по умолчанию. После изменения перезапустите игру.</string>
     <string name="optimization_android_performance_hint">Подсказки производительности Android (ADPF)</string>
-    <string name="optimization_android_performance_hint_hint">На Android 12 и новее объединяет Game:Main, GpuComm, FMOD и рабочие потоки в кадровую нагрузку и сообщает фактическое время кадра относительно цели 30 FPS. На неподдерживаемых системах безопасно отключается. Режим sustained performance не используется. После изменения перезапустите игру.</string>
+    <string name="optimization_android_performance_hint_hint">На Android 12 и новее задаёт целевой темп 16,7 мс для 60 FPS. Путь PS4 измеряет границу гостевого цикла, а не повторный показ сохранённого кадра, поэтому медленная генерация не маскируется; неподдерживаемые устройства безопасно остаются на базовом пути.</string>
+    <string name="optimization_oem_root_performance">Максимальные частоты CPU/GPU (root)</string>
+    <string name="optimization_oem_root_performance_hint">Опциональный kernel boost по модели GameHub. После явного разрешения superuser включает CPU governor performance и прижимает минимальную частоту Adreno к текущей максимальной, пока игра видима, затем восстанавливает исходные значения. По умолчанию выключено; без root и на неподдерживаемом устройстве ничего не меняет.</string>
     <string name="optimization_host_flagm">JIT-лоуеринг ARM FlagM/FlagM2</string>
     <string name="optimization_host_flagm_hint">Использует компактные ARM-инструкции преобразования флагов только при подтверждённой поддержке CPU и ядром. На остальных устройствах автоматически остаётся базовый путь. После изменения перезапустите игру.</string>
     <string name="optimization_host_sve2">JIT-лоуеринг ARM SVE2</string>
@@ -99,4 +162,53 @@
     <string name="optimization_adaptive_mobile_gpu_hint" formatted="false">Сохраняет выбранное выходное разрешение, меняет эффективное фрагментное разрешение от 100% до 50% только при нагрузке GPU, включает FSR при реальном апскейле и управляет резидентностью текстур по бюджету памяти. После изменения перезапустите игру.</string>
     <string name="optimization_audio_simd">SIMD-аудиомикшер</string>
     <string name="optimization_audio_simd_hint">Использует ARM NEON для конвертации и downmix, ограниченный учёт записей и дешёвую телеметрию underrun без изменения тайминга гостевого аудио. После изменения перезапустите игру.</string>
+    <string name="remote_diagnostics">Удалённая диагностика</string>
+    <string name="remote_diagnostics_hint">Автоматически отправляет ограниченные по размеру логи LSX4 и runtime, сведения об устройстве и следы сбоев на закрытый сервер диагностики llayer.tech. Игры, сохранения, скриншоты, аккаунты и личные файлы не отправляются. Опцию можно отключить в любой момент.</string>
+    <string name="remote_diagnostics_send">Отправить диагностику сейчас</string>
+    <string name="remote_diagnostics_sending">Отправка диагностики…</string>
+    <string name="remote_diagnostics_sent">Диагностика отправлена: %1$s</string>
+    <string name="remote_diagnostics_failed">Ошибка отправки: %1$s</string>
+    <string name="optimization_vulkan_driver_axis">Драйвер Vulkan</string>
+    <string name="optimization_vulkan_driver_qualcomm">Qualcomm (системный, по умолчанию)</string>
+    <string name="optimization_vulkan_driver_bundled_option">Mesa Turnip %1$s (встроенный)</string>
+    <string name="optimization_vulkan_driver_imported_option">Mesa Turnip %1$s · %2$s</string>
+    <string name="optimization_vulkan_driver_axis_unavailable">Недоступно: Turnip требует Android 9+, полный встроенный загрузчик и совместимое устройство KGSL/Adreno. Активен системный драйвер.</string>
+    <string name="optimization_vulkan_driver_import">Импорт Mesa Turnip из архива (ZIP/ADPKG)</string>
+    <string name="optimization_vulkan_driver_importing">Проверка и импорт драйвера Mesa…</string>
+    <string name="optimization_vulkan_driver_probing">Запуск Mesa в одноразовом процессе проверки…</string>
+    <string name="optimization_vulkan_driver_import_success">%1$s импортирован и добавлен в список драйверов Vulkan. Текущий выбор не изменён.</string>
+    <string name="optimization_vulkan_driver_import_failed">Не удалось импортировать драйвер Mesa: %1$s. Предыдущий драйвер сохранён.</string>
+    <string name="optimization_vulkan_driver_selected">Драйвер Vulkan выбран. Перезапустите игру, чтобы применить его.</string>
+    <string name="optimization_vulkan_driver_selection_failed">Не удалось выбрать драйвер Vulkan: %1$s.</string>
+    <string name="optimization_vulkan_driver_active_simple">%1$s — активен</string>
+    <string name="optimization_vulkan_driver_recovered">%1$s — защитное восстановление</string>
+    <string name="optimization_vulkan_driver_fallback">%1$s — фактически Qualcomm/системный; откат: %2$s</string>
+    <string name="optimization_vulkan_driver_restart_pending">%1$s — выбран; нужен перезапуск</string>
+    <string name="optimization_vulkan_driver_recovery">Защитный откат драйвера: %1$s</string>
+    <string name="controls_customize_overlay">Настроить экранное управление</string>
+    <string name="controls_customize_overlay_summary">Перемещение, масштабирование, скрытие и восстановление каждого элемента оверлея.</string>
+    <string name="controls_optional_buttons">Дополнительные кнопки</string>
+    <string name="controls_show_share">Показывать Share</string>
+    <string name="controls_show_ps">Показывать PS</string>
+    <string name="controls_show_touchpad">Показывать сенсорную панель</string>
+    <string name="controls_phone_triggers">Триггеры телефона</string>
+    <string name="controls_phone_trigger_left">Левый триггер телефона</string>
+    <string name="controls_phone_trigger_right">Правый триггер телефона</string>
+    <string name="controls_phone_trigger_hint">Нажмите «Определить», затем физический триггер. Долгое нажатие очищает привязку. Определяются код клавиши и scan-код без привязки к модели телефона.</string>
+    <string name="controls_trigger_detect">Определить триггер</string>
+    <string name="controls_trigger_press_now">Нажмите триггер…</string>
+    <string name="controls_trigger_detected">Определён: %1$s</string>
+    <string name="overlay_editor_select_hint">Выберите элемент</string>
+    <string name="overlay_editor_selected">Выбран: %1$s</string>
+    <string name="overlay_editor_hide">Скрыть</string>
+    <string name="overlay_editor_add">Добавить</string>
+    <string name="overlay_editor_reset">Сбросить</string>
+    <string name="overlay_editor_done">Готово</string>
+    <string name="overlay_editor_none_hidden">Все элементы уже отображаются.</string>
+    <string name="overlay_editor_reset_confirm">Вернуть стандартные позиции, размеры и видимость?</string>
+    <string name="overlay_editor_gesture_hint">Перетаскивание — перемещение · щипок — размер · скрытые элементы возвращаются через «Добавить»</string>
+    <string name="loading_active">Всё в порядке, загружается</string>
+    <string name="loading_waiting">Ожидание игры. Ошибка не подтверждена</string>
+    <string name="loading_failed">Обнаружена ошибка. Можно закрывать</string>
+    <string name="loading_blocks">Блоки: %1$,d</string>
 </resources>

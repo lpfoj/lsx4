@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Opts the emulator into GAME_MODE_PERFORMANCE. The vendor performance HAL
+  raises the CPU/GPU frequency policy for foreground apps in that mode, which
+  the emulator needs because it is CPU bound on the guest main thread.
+  Downscaling and fps override stay disabled: the renderer owns its own
+  resolution and never benefits from a system-imposed frame cap.
+-->
+<game-mode-config
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:supportsBatteryGameMode="false"
+    android:supportsPerformanceGameMode="true"
+    android:allowGameDownscaling="false"
+    android:allowGameFpsOverride="false" />

@@ -1,0 +1,61 @@
+LSX4 FEX FP semantics probe -- Vivo V2546A (A840)
+Date: 2026-08-24
+Device serial: adb-10AG263F1B001HM-2MNzzP._adb-tls-connect._tcp
+Device hwcap:  0x00000000ffffffff
+Device hwcap2: 0x000040003cbb73ef
+
+Inputs
+------
+probe sha256:
+  3466f59f09901b37ea650a3ce37be646e385c0b7db145447c1ecb3e86be670d3
+context bridge sha256 (canonical manifest 2026-08-24 05:00):
+  aa56f6a66949e6bef8728dccd1579b1c43c3db73b17ecd823ffd06d69619c154
+FEXCore sha256 (canonical manifest 2026-08-24 05:00):
+  2e5d97cd9e7dfbf87bb1f558678ba04094fb74085b7d25ff3e6fbc1e732e1d17
+
+x86-64 oracle
+-------------
+FEX_FP_SEMANTICS_X86_ORACLE PASS cases=26 mxcsr=4 stableDigest=baa1d15f1a574b23 fullDigest=337e76c4e6ab9ed8 separate=00000000 fused=337ffffe
+
+Vivo result summaries
+---------------------
+FEX2608_FP_SEMANTICS PASS mode=baseline featureMask=0x0000000000000000 cases=26 mxcsr=4 stableDigest=baa1d15f1a574b23 fullDigest=8534fb1ea944ca23 separate=00000000 fused=337ffffe decay=00008000/00008000/00000000/00000000
+FEX2608_FP_SEMANTICS PASS mode=sve128 featureMask=0x0000000000000020 cases=26 mxcsr=4 stableDigest=baa1d15f1a574b23 fullDigest=8534fb1ea944ca23 separate=00000000 fused=337ffffe decay=00008000/00008000/00000000/00000000
+FEX2608_FP_SEMANTICS PASS mode=afp featureMask=0x0000000000000800 cases=26 mxcsr=4 stableDigest=baa1d15f1a574b23 fullDigest=337e76c4e6ab9ed8 separate=00000000 fused=337ffffe decay=00008000/00000000/00000000/00000000
+FEX2608_FP_SEMANTICS PASS mode=afp-sve128 featureMask=0x0000000000000820 cases=26 mxcsr=4 stableDigest=baa1d15f1a574b23 fullDigest=337e76c4e6ab9ed8 separate=00000000 fused=337ffffe decay=00008000/00000000/00000000/00000000
+
+Feedback details
+----------------
+baseline / sve128:
+  MXCSR=0x00001fc0 DAZ     feedback_decay_8=00008000 feedback_iir_8=00008001
+  MXCSR=0x00009fc0 DAZ+FTZ feedback_decay_8=00000000 feedback_iir_8=00000000
+
+afp / afp-sve128:
+  MXCSR=0x00001fc0 DAZ     feedback_decay_8=00000000 feedback_iir_8=00000000
+  MXCSR=0x00009fc0 DAZ+FTZ feedback_decay_8=00000000 feedback_iir_8=00000000
+
+Interpretation
+--------------
+AFP and AFP+SVE128 exactly match the native x86-64 full digest. Baseline and
+SVE128 intentionally cannot model x86 DAZ without FEAT_AFP/FIZ, which explains
+their different full digest. All modes match the stable digest, keep ordinary
+VMULSS+VADDSS unfused, preserve scalar upper lanes, and pass signed-zero/qNaN
+min/max plus VINSERTPS mask and alias cases.
+
+Static Inside ELF linear sweep
+------------------------------
+decoded slots: 4633521
+vmulss: 56609
+vaddss: 32690
+vsubss: 18977
+vinsertps: 7843
+vdpps: 5671
+vmaxss: 1832
+vminss: 1509
+scalar FMA mnemonics: 0
+immediate MXCSR 0x9fc0 sites: 92
+immediate MXCSR 0x1f80 sites: 14
+
+The linear sweep includes the whole executable PT_LOAD and can include embedded
+data, so the counts are static prevalence evidence rather than reachable dynamic
+counts.

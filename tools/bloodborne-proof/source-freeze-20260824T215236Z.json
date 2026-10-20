@@ -1,0 +1,32 @@
+{
+  "schema": "lsx4-proof-build-source-freeze/v1",
+  "capturedUtc": "2026-08-24T22:10:32.7756228Z",
+  "rootHead": "9f093f4bedae973eb0e68bdf178d3b5a8174640e",
+  "rootTrackedSourceDiffGitBlob": "af372e7b280d3116a9daddc9b38ae66cb8e29bd1",
+  "funnelHead": "0e9a1692abedae418591d6f31c457d8df46f3e4c",
+  "funnelTrackedDiffGitBlob": "0d319299561ee792e57972c740a0530b4c9470fd",
+  "files": [
+    {"path": "android-app/app/src/main/java/app/lsx4/android/MainActivity.java", "sha256": "a0332e5f945200b6c4221c32418acd661b7d0c2ae7582e51fd8f96d01dd35af3"},
+    {"path": "android-app/app/src/main/java/app/lsx4/android/ProofMetricsReceiver.java", "sha256": "6521ddb8c31f2293f55065d4101598a683a7a8543c384602f70000870d8bef05"},
+    {"path": "tools/bloodborne-proof/run_campaign.py", "sha256": "6de109ccc5730a94e49d89421fbd96dc92b696ac716216bcd9b0dc1bc294b2ba"},
+    {"path": "tools/bloodborne-proof/capture_provenance.py", "sha256": "c47e8140b24780ae534f2fc5a1388b1fd8504e1c072b8eda17d5503b1c760e28"},
+    {"path": "tools/bloodborne-proof/generate_expected_state_candidate.py", "sha256": "855f5f0dec9a7bcbba89366e6c34297405c98e5669030a399f176cd17e58e087"},
+    {"path": "tools/bloodborne-proof/proof_contract.py", "sha256": "2027d14fed2a6026c059eb079697a388db6a6bf8a657da6a0655b63fa6dda370"},
+    {"path": "tools/bloodborne-proof/routes/bath_messenger_one_cross.json", "sha256": "bad9933c0cf56d6ca5075063db0d6a422818bedf8765e5f7988e5c8fc67cfbe5"},
+    {"path": "tools/bloodborne-proof/declarations/current_vivo_baseline_declaration.json", "sha256": "9025465428b73ae937d55ad152339930a237ac609da339755a145cf7443dad31"},
+    {"path": "tools/bloodborne-proof/inputs/static-no-input.json", "sha256": "76b18a53cccf8ad78f507945566e81a2ded17784d421b518a4b7eba0f1d6d702"},
+    {"path": "src/executor/native_runtime_api.cpp", "sha256": "a72ff0c2f57b41ce74d7d1776ce5f45d0c654e12087185f8614933595d0e8712"},
+    {"path": "src/executor/fex_backend_loader.cpp", "sha256": "25951605ade62a27a6856913ff263455b9d70e2874d5e5b365dc11b643150728"},
+    {"path": "src/executor/fex_backend_loader.h", "sha256": "c082458ea35085bcebe85694fbf079800b23bba834dcf61d81914b95ea497171"},
+    {"path": "src/executor/fex_proof_metrics_abi_v1.h", "sha256": "9b4afce5a151a6168af813e97735b38472ab7b01c13b4acc2a39013858e99e2b"}
+  ],
+  "buildArtifact": {
+    "path": "android-app/app/build/outputs/apk/debug/app-debug.apk",
+    "sizeBytes": 51577334,
+    "lastWriteUtc": "2026-08-24T22:10:19.9851657Z",
+    "sha256": "0ae4501ef3fcc22234fa96ae1aec8aa6fbcbb1c543139643b8721e29fa4ff74d",
+    "tasks": [":app:assembleDebug", ":app:verifyDebugFexPackaging"],
+    "result": "BUILD SUCCESSFUL"
+  },
+  "note": "Dirty-tree build: HEAD plus tracked diff blob hashes and explicit untracked/critical source SHA-256 values are the identity; neither HEAD alone is claimed as the build source."
+}

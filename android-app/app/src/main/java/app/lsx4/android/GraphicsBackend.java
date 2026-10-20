@@ -1,6 +1,7 @@
 package app.lsx4.android;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -14,10 +15,14 @@ public interface GraphicsBackend {
     void writeLaunchConfiguration(Context context) throws Exception;
 
     static GraphicsBackend selected(Context context) {
-        String id = SettingsActivity.prefs(context).getString(
+        return selected(context, SettingsActivity.prefs(context));
+    }
+
+    static GraphicsBackend selected(Context context, SharedPreferences preferences) {
+        String id = preferences.getString(
                 SettingsActivity.K_GPU_BACKEND, VulkanBackend.ID);
         if (OpenGlBackend.ID.equals(id)) {
-            SettingsActivity.prefs(context).edit()
+            preferences.edit()
                     .putString(SettingsActivity.K_GPU_BACKEND, VulkanBackend.ID)
                     .apply();
         }

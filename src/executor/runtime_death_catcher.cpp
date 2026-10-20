@@ -29,6 +29,8 @@
 #include <exception>
 #include <mutex>
 
+extern "C" int executor_lsx4_android_fault_signal_owner() __attribute__((weak));
+
 namespace {
 
 constexpr const char* kTag = "LSX4Native";
@@ -468,8 +470,7 @@ void InstallSeccompExitTrap() {
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                  static_cast<unsigned int>(offsetof(struct seccomp_data, nr))),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_exit_group, 1, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_exit, 0, 1),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_exit_group, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
@@ -507,8 +508,8 @@ void InstallSeccompExitTrap() {
         LogRuntimeDeath("[EXECUTOR_RUNTIME_DEATH] installed seccomp exit trap via seccomp TSYNC ret_trap=0x%x",
                         SECCOMP_RET_TRAP);
     }
-    LogRuntimeDeath("[EXECUTOR_RUNTIME_DEATH] installed seccomp exit trap arch=0x%x exit=%d exit_group=%d action=RET_TRAP(0x%x) tsync=%d",
-                    AUDIT_ARCH_AARCH64, __NR_exit, __NR_exit_group, SECCOMP_RET_TRAP,
+    LogRuntimeDeath("[EXECUTOR_RUNTIME_DEATH] installed seccomp exit_group trap arch=0x%x exit_group=%d action=RET_TRAP(0x%x) tsync=%d",
+                    AUDIT_ARCH_AARCH64, __NR_exit_group, SECCOMP_RET_TRAP,
                     SeccompExitTrapUseTsync() ? 1 : 0);
     RawLogLine("installed-seccomp-exit-trap", static_cast<uint64_t>(AUDIT_ARCH_AARCH64), "exit",
                static_cast<uint64_t>(__NR_exit), "exit_group",
@@ -674,6 +675,16 @@ void InstallRuntimeDeathCatcher() {
     const bool catch_fault_signals =
         catch_fault_signals_env != nullptr && catch_fault_signals_env[0] != '\0' &&
         strcmp(catch_fault_signals_env, "0") != 0;
+    const bool fault_owner_api_available =
+        executor_lsx4_android_fault_signal_owner != nullptr;
+    const int fault_signal_owner = fault_owner_api_available
+                                       ? executor_lsx4_android_fault_signal_owner()
+                                       : 0;
+    const bool runtime_owns_fault_signals = fault_owner_api_available
+                                               ? fault_signal_owner == 1
+                                               : std::getenv(
+                                                     "EXECUTOR_FEX_OWNS_FAULT_SIGNALS") ==
+                                                     nullptr;
 
     struct sigaction action {};
     action.sa_sigaction = RuntimeDeathSignalHandler;
@@ -683,10 +694,17 @@ void InstallRuntimeDeathCatcher() {
     action.sa_flags |= SA_RESTART;
 #endif
     for (const int signo : kSignals) {
-        if (!catch_fault_signals &&
+        if ((!runtime_owns_fault_signals || !catch_fault_signals) &&
             (signo == SIGSEGV || signo == SIGBUS || signo == SIGILL)) {
-            LogRuntimeDeath("[EXECUTOR_RUNTIME_DEATH] skip fault signal=%d in Android mixed ART/Box64 process",
-                            signo);
+            LogRuntimeDeath(
+                "[EXECUTOR_RUNTIME_DEATH] skip fault signal=%d owner=%s",
+                signo,
+                fault_owner_api_available
+                    ? (fault_signal_owner == 2 ? "fex"
+                                               : (fault_signal_owner == 1
+                                                      ? "current"
+                                                      : "unselected"))
+                    : "legacy");
             continue;
         }
         constexpr int previous_action_count =

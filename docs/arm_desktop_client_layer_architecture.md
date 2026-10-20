@@ -1,5 +1,10 @@
 # ARM Desktop and Android Client Layer Architecture
 
+> [!IMPORTANT]
+> Before any device/FPS/playable measurement, run `scripts/preflight-vivo-performance-test.ps1`;
+> stale Android Studio process-trackers and known profiler loads make the result invalid. See the
+> mandatory [performance-test preflight](PERFORMANCE_TEST_PREFLIGHT.md).
+
 ## Decision
 
 LSX4 has two explicit native ownership layers:

@@ -62,8 +62,19 @@ enum class JitNativeRelocationKind : std::uint8_t {
     IndirectEdgeFanout = 7,
 };
 
+enum class JitNativeRelocationEncoding : std::uint8_t {
+    MovWide16 = 0,
+    Literal64 = 1,
+};
+
+inline constexpr std::uint32_t kJitNativeLiteralRelocationMarker0Base = 0x4c535800u;
+inline constexpr std::uint32_t kJitNativeLiteralRelocationMarker0RegisterMask = 0x1fu;
+inline constexpr std::uint32_t kJitNativeLiteralRelocationMarker0OpcodeMask = 0xffffffe0u;
+inline constexpr std::uint32_t kJitNativeLiteralRelocationMarker1 = 0x4c495436u;
+
 struct JitNativeRelocation {
     JitNativeRelocationKind kind = JitNativeRelocationKind::ModuleRelative;
+    JitNativeRelocationEncoding encoding = JitNativeRelocationEncoding::MovWide16;
     std::uint32_t code_offset = 0;
     std::uint8_t register_index = 0;
     std::uint32_t target_index = 0;

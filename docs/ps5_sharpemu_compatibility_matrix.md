@@ -1,5 +1,10 @@
 # PS5 SharpEmu compatibility ledger
 
+> [!IMPORTANT]
+> Before any device/FPS/playable measurement, run `scripts/preflight-vivo-performance-test.ps1`;
+> stale Android Studio process-trackers and known profiler loads make the result invalid. See the
+> mandatory [performance-test preflight](PERFORMANCE_TEST_PREFLIGHT.md).
+
 This ledger compares the isolated LSX4 PS5 loader/runtime semantics with the
 local SharpEmu reference. It does not claim compatibility with protected
 retail input or a complete PS5 system.

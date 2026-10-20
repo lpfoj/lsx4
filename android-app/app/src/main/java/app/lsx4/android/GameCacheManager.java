@@ -38,10 +38,10 @@ final class GameCacheManager {
             "persistent-jit-cache-setting-v1";
     private static final Pattern TITLE_ID =
             Pattern.compile("[A-Z]{4}[0-9]{5}");
-    // Native PS4 fallback keys are TITLE_<hex>. PS5 keys are the
-    // upper-cased, filesystem-safe game-directory/configured-title text.
-    // Keep the exact spelling for deletion, but reject separators, dot
-    // entries and names which cannot be a single filesystem component.
+
+
+
+
     private static final Pattern CACHE_KEY =
             Pattern.compile("[A-Za-z0-9][A-Za-z0-9_-]{0,254}");
     private static final int MAX_METADATA_BYTES = 1024 * 1024;

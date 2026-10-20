@@ -841,6 +841,46 @@ VectorSemanticResult ExecuteVectorInstruction(
     if (ScalarFloatingBytes(mnemonic) != 0) {
         return ExecuteScalarFloating(instruction, mnemonic, frame, memory);
     }
+    if (mnemonic == X86_MNEMONIC_VTESTPS ||
+        mnemonic == X86_MNEMONIC_VTESTPD) {
+        if (instruction.operand_count != 2) {
+            return Unsupported(instruction);
+        }
+        const auto left = ReadVectorOperand(
+            instruction, instruction.operands[0], frame, memory);
+        const auto right = ReadVectorOperand(
+            instruction, instruction.operands[1], frame, memory);
+        if (!left || !right || left->active_bytes != right->active_bytes) {
+            return Fault(instruction, instruction.address);
+        }
+        const std::size_t lane_bytes =
+            mnemonic == X86_MNEMONIC_VTESTPD ? 8u : 4u;
+        bool intersection_is_zero = true;
+        bool masked_complement_is_zero = true;
+        for (std::size_t offset = 0; offset < left->active_bytes;
+             offset += lane_bytes) {
+            const std::uint64_t lhs = LoadLane(left->bytes.data() + offset,
+                                               lane_bytes);
+            const std::uint64_t rhs = LoadLane(right->bytes.data() + offset,
+                                               lane_bytes);
+            const std::uint64_t sign =
+                std::uint64_t{1} << (lane_bytes * 8u - 1u);
+            intersection_is_zero &= (lhs & rhs & sign) == 0;
+            masked_complement_is_zero &= ((~lhs) & rhs & sign) == 0;
+        }
+        constexpr std::uint64_t status_flags =
+            CarryFlag | ParityFlag | AuxiliaryFlag | ZeroFlag | SignFlag |
+            OverflowFlag;
+        frame.condition_word &= ~status_flags;
+        if (intersection_is_zero) {
+            frame.condition_word |= ZeroFlag;
+        }
+        if (masked_complement_is_zero) {
+            frame.condition_word |= CarryFlag;
+        }
+        return {VectorStop::Continue,
+                instruction.address + instruction.length, 0};
+    }
     if (IsMove(mnemonic)) {
         if (instruction.operand_count != 2) {
             return Unsupported(instruction);

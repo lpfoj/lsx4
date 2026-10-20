@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="capture_screenshot">Screenshot</string>
+    <string name="capture_record">Record video</string>
+    <string name="capture_stop_recording">Stop recording</string>
+    <string name="capture_gallery">Gallery</string>
+    <string name="capture_share">Share</string>
+    <string name="capture_close">Close</string>
+    <string name="capture_cancel">Cancel</string>
+    <string name="capture_continue">Continue</string>
+    <string name="capture_open_panel">Game captures</string>
+    <string name="capture_gallery_loading">Loading captures…</string>
+    <string name="capture_gallery_empty">Screenshots and recordings will appear here. Files stay in LSX4 until you share them.</string>
+    <string name="capture_image_label">Screenshot</string>
+    <string name="capture_video_label">Video</string>
+    <string name="capture_share_unavailable">No app is available to share this file.</string>
+    <string name="capture_screenshot_saved">Screenshot saved to Gallery.</string>
+    <string name="capture_screenshot_failed">Could not capture the game. Wait for a rendered frame and try again.</string>
+    <string name="capture_video_saved">Recording saved to Gallery.</string>
+    <string name="capture_recording_failed">Could not start or finish the recording. Try again and approve the screen-recording request.</string>
+    <string name="capture_storage_failed">Could not save captures. Check the available device storage.</string>
+    <string name="capture_recording">Recording gameplay</string>
+    <string name="capture_recording_starting">Starting recording…</string>
+    <string name="capture_finishing">Saving…</string>
+    <string name="capture_video_only">Video only · no audio</string>
+    <string name="capture_silent_status">● %1$s · silent</string>
+    <string name="capture_audio_explanation">Android records the display, including controls and visible notifications. Recording stops when LSX4 loses focus. Audio permission captures only LSX4 playback, never the microphone.</string>
+    <string name="capture_allow_game_audio">Allow game audio</string>
+    <string name="capture_audio_denied">Game-audio permission was not granted. Continue with video without audio?</string>
+    <string name="capture_audio_requires_android10">Internal game audio requires Android 10 or later. Continue with video without audio?</string>
+    <string name="capture_notification_channel">Game recording</string>
+    <string name="capture_notification_detail">Display recording; only LSX4 playback audio. Tap Stop to save.</string>
+    <string name="game_menu_continue">Continue</string>
+    <string name="game_menu_paused_hint">Game paused. Continue when you are ready.</string>
+    <string name="game_menu_exiting">Closing game…</string>
+    <string name="game_menu_audio_focus">Audio is in use by another app. Try Continue again.</string>
+</resources>

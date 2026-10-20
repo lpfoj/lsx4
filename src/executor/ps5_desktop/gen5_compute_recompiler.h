@@ -128,4 +128,4 @@ bool TryCompileGen5Compute(
     Gen5ComputeProgramInfo* program_info,
     std::string& error);
 
-} // namespace Lsx4::Ps5Desktop
+}

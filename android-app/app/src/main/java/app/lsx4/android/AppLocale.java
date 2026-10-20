@@ -25,7 +25,7 @@ final class AppLocale {
     }
 
     static Context wrap(Context base) {
-        String tag = base.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        String tag = ProcessSafePreferences.get(base)
                 .getString(KEY, "en");
         Locale locale = Locale.forLanguageTag(tag);
         Locale.setDefault(locale);
@@ -36,7 +36,7 @@ final class AppLocale {
     }
 
     static String selectedTag(Context context) {
-        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        return ProcessSafePreferences.get(context)
                 .getString(KEY, "en");
     }
 
@@ -55,7 +55,7 @@ final class AppLocale {
             position = 0;
         }
         String tag = TAGS[position];
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+        ProcessSafePreferences.get(context).edit()
                 .putString(KEY, tag)
                 .commit();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {

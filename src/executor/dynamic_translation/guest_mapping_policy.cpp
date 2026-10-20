@@ -24,4 +24,8 @@ bool IsExecutableGuestAddress(const std::uint64_t address) noexcept {
     return address != 0 && ExecutorJitIsExecutableGuestAddress(address);
 }
 
+bool IsWritableGuestAddress(const std::uint64_t address) noexcept {
+    return address != 0 && ExecutorJitIsWritableGuestAddress(address);
+}
+
 }

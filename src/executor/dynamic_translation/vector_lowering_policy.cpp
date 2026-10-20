@@ -143,6 +143,10 @@ DirectVectorPlan PlanDirectVectorKernel(
     case X86_MNEMONIC_PTEST:
     case X86_MNEMONIC_VPTEST:
         return {DirectVectorKernel::PackedBitTest, width_bits / 8};
+    case X86_MNEMONIC_VTESTPS:
+        return {DirectVectorKernel::PackedSignBitTest, width_bits / 8, 4};
+    case X86_MNEMONIC_VTESTPD:
+        return {DirectVectorKernel::PackedSignBitTest, width_bits / 8, 8};
     case X86_MNEMONIC_MOVSLDUP:
     case X86_MNEMONIC_VMOVSLDUP:
         return {DirectVectorKernel::DuplicateEvenDwords, width_bits / 8};

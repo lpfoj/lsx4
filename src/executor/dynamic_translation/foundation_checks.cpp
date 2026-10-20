@@ -427,7 +427,31 @@ bool CheckVectorSemantics() {
             return false;
         }
     }
-    return offset == fixture.size();
+    if (offset != fixture.size()) {
+        return false;
+    }
+
+
+
+
+    constexpr std::array<std::uint8_t, 5> vtestps{
+        0xc4, 0xe2, 0x79, 0x0e, 0xd2};
+    const std::uint32_t negative_zero = 0x80000000u;
+    std::memcpy(frame.vectors[2].data(), &negative_zero,
+                sizeof(negative_zero));
+    frame.condition_word = CarryFlag | ParityFlag | AuxiliaryFlag | ZeroFlag |
+                           SignFlag | OverflowFlag;
+    Instruction instruction{};
+    if (DecodeInstruction(vtestps, code_base + fixture.size(), instruction) !=
+            DecodeOutcome::Complete ||
+        ExecuteVectorInstruction(instruction, frame, memory).stop !=
+            VectorStop::Continue) {
+        return false;
+    }
+    return (frame.condition_word & CarryFlag) != 0 &&
+           (frame.condition_word & ZeroFlag) == 0 &&
+           (frame.condition_word &
+            (ParityFlag | AuxiliaryFlag | SignFlag | OverflowFlag)) == 0;
 }
 
 bool CheckVectorPacking() {

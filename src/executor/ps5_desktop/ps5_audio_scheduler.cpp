@@ -59,6 +59,7 @@ struct BackendKey {
 struct Ps5AudioBackend {
     BackendKey key{};
     AAudioStream* stream{};
+    std::mutex stream_mutex;
 
     ~Ps5AudioBackend() {
         if (stream != nullptr) {
@@ -76,9 +77,9 @@ struct Ps5AudioBackend {
 
 [[nodiscard]] std::uint32_t RouteGroup(
     const Ps5AudioPortConfig& config) noexcept {
-    // The controller/pad speaker is paced independently. Main, BGM, voice and
-    // personal ports all target Android's shared device output and may be
-    // mixed into one backend write when their cadence matches.
+
+
+
     return config.port_type == 4 ? 4u : 0u;
 }
 
@@ -151,7 +152,7 @@ struct Ps5AudioBackend {
     return backend;
 }
 
-} // namespace
+}
 
 struct Ps5AudioPort {
     std::mutex mutex;
@@ -187,6 +188,38 @@ class Ps5AudioScheduler {
 public:
     ~Ps5AudioScheduler() {
         Stop();
+    }
+
+    void SetPaused(const bool paused) noexcept {
+
+        std::scoped_lock backend_lock{backend_mutex_};
+        if (paused_.load(std::memory_order_acquire) == paused) {
+            return;
+        }
+        if (paused) {
+            std::scoped_lock queue_lock{queue_mutex_};
+            paused_.store(true, std::memory_order_release);
+        }
+        for (const auto& weak : backends_) {
+            if (const auto backend = weak.lock()) {
+                std::scoped_lock stream_lock{backend->stream_mutex};
+                if (backend->stream) {
+                    const auto result = paused ? AAudioStream_requestPause(backend->stream)
+                                               : AAudioStream_requestStart(backend->stream);
+                    if (result != AAUDIO_OK) {
+                        std::fprintf(stderr, "PS5_AUDIO_PAUSE paused=%d error=%s\n",
+                                     paused ? 1 : 0, AAudio_convertResultToText(result));
+                    }
+                }
+            }
+        }
+        if (!paused) {
+            {
+                std::scoped_lock queue_lock{queue_mutex_};
+                paused_.store(false, std::memory_order_release);
+            }
+            queue_cv_.notify_all();
+        }
     }
 
     [[nodiscard]] Ps5AudioPortHandle OpenPort(
@@ -256,6 +289,9 @@ public:
                     return {};
                 }
                 backends_.push_back(backend);
+                if (paused_.load(std::memory_order_acquire)) {
+                    (void)AAudioStream_requestPause(backend->stream);
+                }
             }
         }
 
@@ -477,7 +513,7 @@ private:
         return mixed_ports;
     }
 
-    [[nodiscard]] static std::int32_t OutputBatch(
+    [[nodiscard]] std::int32_t OutputBatch(
         const std::span<BatchItem> batch,
         std::uint64_t& write_finished_ns) {
         if (batch.empty() ||
@@ -487,6 +523,25 @@ private:
             return AAUDIO_ERROR_INVALID_STATE;
         }
         auto& backend = *batch.front().port->backend;
+        std::unique_lock stream_lock{backend.stream_mutex, std::defer_lock};
+        for (;;) {
+            if (paused_.load(std::memory_order_acquire)) {
+                std::unique_lock queue_lock{queue_mutex_};
+                queue_cv_.wait(queue_lock, [this] {
+                    return !paused_.load(std::memory_order_acquire) ||
+                           stopping_.load(std::memory_order_acquire);
+                });
+            }
+            if (stopping_.load(std::memory_order_acquire)) {
+                write_finished_ns = AudioMonotonicNanoseconds();
+                return 0;
+            }
+            stream_lock.lock();
+            if (!paused_.load(std::memory_order_acquire)) {
+                break;
+            }
+            stream_lock.unlock();
+        }
         const auto frames =
             batch.front().port->config.buffer_frames;
         const auto xrun_before = std::max<std::int32_t>(
@@ -548,14 +603,15 @@ private:
                 std::unique_lock queue_lock{queue_mutex_};
                 queue_cv_.wait(
                     queue_lock, stop, [this] {
-                        return !ready_ports_.empty();
+                        return !paused_.load(std::memory_order_acquire) &&
+                               !ready_ports_.empty();
                     });
             }
             if (stop.stop_requested()) {
                 break;
             }
-            // Give concurrent guest audio ports a bounded opportunity to join
-            // this cadence without adding a full audio-period of latency.
+
+
             std::this_thread::sleep_for(BatchCoalescingWindow);
             AcquireBatch(batch);
             if (batch.empty()) {
@@ -654,6 +710,10 @@ private:
                 return;
             }
             worker_.request_stop();
+            {
+                std::scoped_lock queue_lock{queue_mutex_};
+                stopping_.store(true, std::memory_order_release);
+            }
             queue_cv_.notify_all();
             worker = std::move(worker_);
         }
@@ -668,6 +728,8 @@ private:
     std::mutex backend_mutex_;
     std::vector<std::weak_ptr<Ps5AudioBackend>> backends_;
     std::atomic<std::uint64_t> output_batches_{};
+    std::atomic_bool paused_{};
+    std::atomic_bool stopping_{};
 };
 
 Ps5AudioScheduler& AudioScheduler() {
@@ -675,7 +737,11 @@ Ps5AudioScheduler& AudioScheduler() {
     return scheduler;
 }
 
-} // namespace
+}
+
+void SetPs5AudioSessionPaused(const bool paused) noexcept {
+    AudioScheduler().SetPaused(paused);
+}
 
 Ps5AudioPortHandle OpenPs5AudioPort(
     const Ps5AudioPortConfig& config) {
@@ -699,6 +765,8 @@ bool QueuePs5AudioBuffer(
 
 struct Ps5AudioPort {};
 
+void SetPs5AudioSessionPaused(bool) noexcept {}
+
 Ps5AudioPortHandle OpenPs5AudioPort(
     const Ps5AudioPortConfig&) {
     return {};
@@ -717,4 +785,4 @@ bool QueuePs5AudioBuffer(
 
 #endif
 
-} // namespace Lsx4::Ps5Desktop
+}

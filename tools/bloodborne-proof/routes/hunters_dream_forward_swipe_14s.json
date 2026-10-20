@@ -1,0 +1,118 @@
+{
+  "schema": "lsx4-bloodborne-proof-route/v1",
+  "id": "cusa03173-0109-hunters-dream-one-cross-forward-swipe-14s-v2",
+  "title": "Bloodborne",
+  "titleId": "CUSA03173",
+  "titleVersion": "01.09",
+  "package": "app.lsx4.android",
+  "launcherComponent": "app.lsx4.android/.MainActivity",
+  "gameComponent": "app.lsx4.android/.GameActivity",
+  "gameProcess": "app.lsx4.android:game",
+  "proofMetricsReceiver": {
+    "component": "app.lsx4.android/.ProofMetricsReceiver",
+    "action": "app.lsx4.android.CAPTURE_PROOF_METRICS",
+    "tokenExtra": "proof_request_token",
+    "requiredPermission": "android.permission.DUMP",
+    "process": ":game"
+  },
+  "gamePath": "/data/user/0/app.lsx4.android/files/lsx4-home/runtime-fs/user/app/CUSA03173/eboot.bin",
+  "device": {
+    "roSerial": "10AG263F1B001HM",
+    "adbTargetRegex": "^adb-10AG263F1B001HM-[A-Za-z0-9_-]+\\._adb-tls-connect\\._tcp(?: \\([0-9]+\\))?$"
+  },
+  "launch": {
+    "settleBeforeInputSeconds": 50,
+    "postCrossGateTimeoutSeconds": 180,
+    "actions": [
+      {
+        "kind": "cross-hold",
+        "x": 2903,
+        "y": 1231,
+        "holdMilliseconds": 1000,
+        "stateAnchorId": "hunters-dream-world",
+        "stateGateTimeoutSeconds": 180,
+        "stateGatePollSeconds": 5
+      }
+    ]
+  },
+  "visualAnchors": {
+    "hunters-dream-world": {
+      "schema": "lsx4-roi-dhash-scene-anchor/v1",
+      "algorithm": "roi-dhash-1024-box-luma-v1",
+      "captureWidth": 3168,
+      "captureHeight": 1440,
+      "roi": {"x": 350, "y": 300, "width": 2400, "height": 670},
+      "descriptorHex": "ea0e9296e28ed5b3f21ccd326639cd9476336a91e86666d1e96656d4b1ccd69573189695d7339a939e253a543e647ad56cccea6758ccfe6319998e2731199b0767333e574e277e371c67473734cd672e56cd652e4d998d0e1b11ad9a1a33bd8b126bb5c892cf35c98acd3242899d366ecb29bd68c7393ca1c5313ae1c97136e4",
+      "maximumHammingDistance": 96,
+      "sourceEvidenceSha256": "7eb45679cc99127886fd208a3db72abe7612da36daf4070c3ad2220b80e3f7fd"
+    }
+  },
+  "gameplayGate": {
+    "probeSeconds": 3,
+    "requiredConsecutivePasses": 2,
+    "havokThreadPattern": "HavokWorker",
+    "gpuCommThreadPattern": "GpuComm",
+    "minimumHavokPercent": 20.0,
+    "minimumGpuCommPercent": 8.0,
+    "requiredLogRegex": "gameState loading=false gameplay=true",
+    "expectedScene": "Hunter's Dream — current save at the messenger stairs",
+    "sceneAnchorId": "hunters-dream-world",
+    "finalSceneRecheckTimeoutSeconds": 20,
+    "finalSceneRecheckPollSeconds": 2,
+    "drawProbeSeconds": 3,
+    "minimumDrawCallsPerSecond": 6000.0,
+    "forbidAdditionalCross": true
+  },
+  "surface": {
+    "requiredComponent": "SurfaceView[app.lsx4.android/app.lsx4.android.GameActivity](BLAST)",
+    "minimumGeneration": 1
+  },
+  "measurement": {
+    "durationSeconds": 14,
+    "inputArtifact": "tools/bloodborne-proof/inputs/hunters_dream_forward_swipe_14s.json",
+    "input": {
+      "kind": "swipe",
+      "x1": 950,
+      "y1": 1245,
+      "x2": 950,
+      "y2": 1060,
+      "durationMilliseconds": 14000
+    },
+    "movementEvidence": {
+      "schema": "lsx4-roi-dhash-scene-change/v1",
+      "algorithm": "roi-dhash-1024-box-luma-v1",
+      "captureWidth": 3168,
+      "captureHeight": 1440,
+      "roi": {"x": 350, "y": 100, "width": 2300, "height": 1200},
+      "minimumHammingDistance": 12
+    }
+  },
+  "thermal": {
+    "maximumStatus": 2,
+    "maximumSurfaceC": 48.0,
+    "minimumCpuIdlePercent": 60.0,
+    "minimumAvailableMemoryMb": 1024,
+    "minimumBatteryLevelPercent": 20,
+    "minimumCpuPolicyMaxKHz": {"0": 1785600, "6": 1632000},
+    "cooldownPollSeconds": 10,
+    "cooldownTimeoutSeconds": 600,
+    "requireEqualStartStatusAcrossPhases": true,
+    "requireEqualExternalPowerAcrossPhases": true,
+    "requireEqualCpuPolicyLimitsAcrossPhases": true,
+    "requireSurfaceTemperatureForCampaign": true,
+    "maximumPhaseStartSurfaceDeltaC": 2.0
+  },
+  "cachePolicy": {
+    "mode": "preserve-matched-inventory",
+    "allowDeletion": false,
+    "requireProvenanceInventories": [
+      "pipelineCache",
+      "fexCache"
+    ]
+  },
+  "verdictPolicy": {
+    "hudAverageAccepted": false,
+    "requiredFrameSource": "SurfaceFlinger-timestats-exact-BLAST-generation",
+    "productionAndInstrumentedWindowsMayBeCompared": false
+  }
+}

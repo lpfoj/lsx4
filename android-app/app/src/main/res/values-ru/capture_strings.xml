@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="capture_screenshot">Скриншот</string>
+    <string name="capture_record">Запись видео</string>
+    <string name="capture_stop_recording">Остановить запись</string>
+    <string name="capture_gallery">Галерея</string>
+    <string name="capture_share">Поделиться</string>
+    <string name="capture_close">Закрыть</string>
+    <string name="capture_cancel">Отмена</string>
+    <string name="capture_continue">Продолжить</string>
+    <string name="capture_open_panel">Снимки и записи игры</string>
+    <string name="capture_gallery_loading">Загрузка галереи…</string>
+    <string name="capture_gallery_empty">Здесь появятся скриншоты и записи. Файлы остаются в LSX4, пока вы ими не поделитесь.</string>
+    <string name="capture_image_label">Скриншот</string>
+    <string name="capture_video_label">Видео</string>
+    <string name="capture_share_unavailable">Нет приложения для отправки этого файла.</string>
+    <string name="capture_screenshot_saved">Скриншот сохранён в галерею.</string>
+    <string name="capture_screenshot_failed">Не удалось снять игру. Дождитесь кадра и повторите попытку.</string>
+    <string name="capture_video_saved">Запись сохранена в галерею.</string>
+    <string name="capture_recording_failed">Не удалось начать или завершить запись. Повторите попытку и подтвердите системный запрос на запись экрана.</string>
+    <string name="capture_storage_failed">Не удалось сохранить файл. Проверьте свободное место на устройстве.</string>
+    <string name="capture_recording">Запись игры</string>
+    <string name="capture_recording_starting">Запускаем запись…</string>
+    <string name="capture_finishing">Сохранение…</string>
+    <string name="capture_video_only">Только видео · без звука</string>
+    <string name="capture_silent_status">● %1$s · без звука</string>
+    <string name="capture_audio_explanation">Android записывает экран, включая кнопки управления и видимые уведомления. Запись останавливается, когда LSX4 теряет фокус. Разрешение на запись звука используется только для звука LSX4, без микрофона.</string>
+    <string name="capture_allow_game_audio">Разрешить звук игры</string>
+    <string name="capture_audio_denied">Разрешение на звук игры не предоставлено. Продолжить запись видео без звука?</string>
+    <string name="capture_audio_requires_android10">Для внутреннего звука игры нужен Android 10 или новее. Продолжить запись видео без звука?</string>
+    <string name="capture_notification_channel">Запись игры</string>
+    <string name="capture_notification_detail">Запись экрана; из звука — только LSX4. Нажмите «Стоп», чтобы сохранить.</string>
+    <string name="game_menu_continue">Продолжить</string>
+    <string name="game_menu_paused_hint">Игра приостановлена. Продолжите, когда будете готовы.</string>
+    <string name="game_menu_exiting">Закрываем игру…</string>
+    <string name="game_menu_audio_focus">Звук используется другим приложением. Попробуйте снова нажать «Продолжить».</string>
+</resources>
