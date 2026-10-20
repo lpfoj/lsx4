@@ -1,14 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="game_move_selected">已选择 %1$s。拖动它或点击目标位置。</string>
+    <string name="game_move_completed">已移动 %1$s</string>
+    <string name="library_hold_hint">按住：2 秒选择 · 4 秒不可玩 · 5 秒可玩。拖动所选游戏或点击目标位置。</string>
+    <string name="library_hold_hint_dismiss">隐藏列表手势提示</string>
+    <string name="game_hold_countdown">按住目标：%1$d 秒</string>
     <string name="app_name">LSX4</string><string name="library_scanning">正在扫描已安装游戏…</string><string name="library_found">找到游戏：%1$d</string><string name="library_empty_status">未找到游戏</string><string name="library_empty">没有已安装的游戏。点击 + 导入已解压目录或 PKG。</string>
-    <string name="menu_import_directory">导入目录</string><string name="menu_import_pkg">导入 PKG</string><string name="menu_settings">设置</string><string name="menu_add">添加游戏</string><string name="menu_remove_game">删除所选游戏</string><string name="game_removing">正在删除 %1$s…</string><string name="game_removed">已删除 %1$s</string><string name="game_remove_failed">无法删除 %1$s</string>
-    <string name="game_selected_for_removal">已选择删除 %1$s</string><string name="game_selection_cleared">已取消选择 %1$s</string><string name="game_marked_unsupported">已将 %1$s 添加到不受支持游戏</string><string name="game_marked_supported">已将 %1$s 添加到受支持游戏</string>
-    <string name="game_status_unclassified">未分类</string><string name="game_status_unsupported">不受支持</string><string name="game_status_supported">受支持</string>
-    <string name="game_item_accessibility">%1$s，%2$s。%3$s。按住 2 秒可选择删除，按住 4 秒可标记为不受支持，按住 8 秒可标记为受支持。</string>
+    <string name="menu_import_directory">导入目录</string><string name="menu_import_pkg">导入 PKG</string><string name="menu_settings">设置</string><string name="menu_add">添加游戏</string><string name="menu_remove_game">删除所选游戏</string><string name="game_remove_title">删除游戏？</string><string name="game_remove_message">从此设备删除 %1$s 及其已安装文件？</string><string name="game_remove_confirm">删除</string><string name="game_removing">正在删除 %1$s…</string><string name="game_removed">已删除 %1$s</string><string name="game_remove_failed">无法删除 %1$s</string>
+    <string name="game_selected_for_removal">已选择删除 %1$s</string><string name="game_selection_cleared">已取消选择 %1$s</string><string name="game_marked_unsupported">已将 %1$s 标记为不可玩</string><string name="game_marked_supported">已将 %1$s 标记为可玩</string>
+    <string name="game_status_unclassified">未分类</string><string name="game_status_unsupported">不可玩</string><string name="game_status_supported">可玩</string>
+    <string name="game_item_accessibility">%1$s，%2$s。%3$s。</string>
     <string name="metadata_only">仅元数据 · 缺少 eboot</string>
     <string name="settings_title">设置</string><string name="settings_subtitle">更改会自动保存</string><string name="section_general">通用</string><string name="language">应用语言</string>
     <string name="category_graphics">图形</string><string name="category_graphics_summary">GPU、分辨率和补丁</string><string name="category_audio">音频</string><string name="category_audio_summary">音频输出</string><string name="category_controls">控制</string><string name="category_controls_summary">屏幕控制</string><string name="category_cache">缓存</string><string name="category_cache_summary">已编译块缓存</string><string name="category_other">其他</string><string name="category_other_summary">调试 HUD</string>
-    <string name="graphics_gpu">GPU</string><string name="graphics_gpu_summary">图形 API 和设备系列</string><string name="graphics_patches">补丁</string><string name="graphics_patches_summary">每款游戏的图形补丁</string><string name="graphics_resolution">输出分辨率</string>
+    <string name="graphics_gpu">GPU</string><string name="graphics_gpu_summary">图形 API 和设备系列</string><string name="graphics_patches">补丁</string><string name="graphics_patches_summary">每款游戏的图形补丁</string><string name="graphics_resolution">内部渲染分辨率</string><string name="graphics_fsr_output_resolution">升频输出分辨率</string>
     <string name="gpu_vulkan">Vulkan（Snapdragon、较强 Mali）</string><string name="gpu_opengl">OpenGL（Mali、其他）</string><string name="gpu_opengl_pending">开发中</string>
     <string name="audio_enable">启用音频输出</string><string name="controls_enable">显示屏幕控制</string><string name="controls_hint">连接实体手柄时会自动隐藏。</string><string name="controls_opacity">控制透明度</string>
     <string name="cache_enable">持久化已编译块缓存</string><string name="cache_hint">后续启动时复用已编译块。</string><string name="debug_hud">调试 HUD</string>
@@ -31,6 +36,10 @@
     <string name="surface_detached">渲染表面已断开。</string>
     <string name="surface_detach_failed">无法断开渲染表面：%1$s</string>
     <string name="aarch64_jit">AArch64 JIT</string>
+    <string name="guest_cpu_backend_current">当前 AArch64 JIT</string>
+    <string name="guest_cpu_backend_fex_experimental">FEX（实验性）</string>
+    <string name="optimization_guest_cpu_backend">客户机 CPU 后端</string>
+    <string name="optimization_guest_cpu_backend_hint">Current 是安全默认项。FEX 是仅翻译客户机代码的实验性后端，重启游戏进程后生效。不受支持或不兼容的构建会明确报告回退到 Current。</string>
     <string name="controls_gamepad_hint">连接受支持的游戏手柄后，屏幕控制层会自动隐藏。支持游戏手柄。</string>
     <string name="resolution_native">原生（设备）</string>
     <string name="resolution_upscale_150">1.5× 放大（2880×1620）</string>
@@ -45,11 +54,6 @@
     <string name="audio_ngs2_error_size">所选模块过大</string>
     <string name="audio_ngs2_error_name">请选择名为 %1$s 的固件模块</string>
     <string name="audio_ngs2_error_format">所选文件不是已解密的 PS4 模块</string>
-    <string name="game_hold_waiting">按住：2 秒删除 · 4 秒不支持 · 8 秒支持</string>
-    <string name="game_hold_release_remove">现在松开：选择删除</string>
-    <string name="game_hold_release_unsupported">现在松开：标记为不支持</string>
-    <string name="game_hold_release_supported">现在松开：标记为支持</string>
-    <string name="game_hold_elapsed">%1$.1f / 8.0 秒 · %2$s</string>
     <string name="game_menu_title">快捷控制</string>
     <string name="game_menu_hint">向右滑动或点击面板外部即可关闭</string>
     <string name="game_menu_open">打开快捷控制</string>
@@ -66,4 +70,31 @@
     <string name="optimization_coarse_fragment_2x2_hint">每个 2×2 像素组只执行一次片段着色器。它可显著降低像素密集场景的 GPU 负载，但会减少细节并可能破坏部分效果。更改后请重新启动游戏。</string>
     <string name="optimization_disable_vk_robustness">禁用 Vulkan 稳健性检查</string>
     <string name="optimization_disable_vk_robustness_hint">移除 GPU 缓冲区和图像边界保护。它可能加速着色器密集型游戏，但无效访问可能导致图形损坏或驱动崩溃。更改后请重新启动游戏。</string>
+    <string name="controls_customize_overlay">自定义屏幕控制</string>
+    <string name="controls_customize_overlay_summary">移动、缩放、隐藏或恢复每个控制项。</string>
+    <string name="controls_optional_buttons">可选按钮</string>
+    <string name="controls_show_share">显示 Share</string>
+    <string name="controls_show_ps">显示 PS</string>
+    <string name="controls_show_touchpad">显示触控板</string>
+    <string name="controls_phone_triggers">手机肩键</string>
+    <string name="controls_phone_trigger_left">左侧手机肩键</string>
+    <string name="controls_phone_trigger_right">右侧手机肩键</string>
+    <string name="controls_phone_trigger_hint">点按检测，然后按下实体肩键。长按检测可清除映射。检测不依赖具体手机型号。</string>
+    <string name="controls_trigger_detect">检测肩键</string>
+    <string name="controls_trigger_press_now">现在按下肩键…</string>
+    <string name="controls_trigger_detected">已检测：%1$s</string>
+    <string name="overlay_editor_select_hint">选择控制项</string>
+    <string name="overlay_editor_selected">已选择：%1$s</string>
+    <string name="overlay_editor_hide">隐藏</string>
+    <string name="overlay_editor_add">添加</string>
+    <string name="overlay_editor_reset">重置</string>
+    <string name="overlay_editor_done">完成</string>
+    <string name="overlay_editor_none_hidden">所有控制项都已显示。</string>
+    <string name="overlay_editor_reset_confirm">恢复默认位置、大小和可见性吗？</string>
+    <string name="overlay_editor_gesture_hint">拖动以移动 · 双指缩放 · 使用“添加”恢复隐藏的控制项</string>
+    <string name="graphics_upscaled_output_resolution">升频输出分辨率</string>
+    <string name="loading_active">一切正常，正在加载</string>
+    <string name="loading_waiting">正在等待游戏。尚未确认错误</string>
+    <string name="loading_failed">检测到错误，可以关闭游戏</string>
+    <string name="loading_blocks">代码块：%1$,d</string>
 </resources>

@@ -3,19 +3,26 @@
 
 #include "common/config.h"
 #include "common/content_fingerprint.h"
+#include "common/cpu_tuning_policy.h"
 #include "common/elf_info.h"
 #include "common/alignment.h"
 #include "common/path_util.h"
 #include "common/signal_context.h"
 #include "common/singleton.h"
 #include "common/thread.h"
+#include "common/title_scoped_optimization_marker.h"
 #include "core/aerolib/stubs.h"
+#include "core/debug_state.h"
+#include "core/signals.h"
 #include "core/file_format/psf.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/audio/audioout.h"
+#include "core/libraries/ajm/ajm.h"
+#include "core/libraries/fiber/fiber.h"
 #include "core/libraries/gnmdriver/gnmdriver.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/memory.h"
+#include "core/libraries/kernel/process.h"
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/kernel/threads/thread_state.h"
 #include "core/libraries/libc_internal/libc_internal_math.h"
@@ -31,16 +38,30 @@
 #include "core/tls.h"
 #include "executor/dynamic_translation/foundation_checks.h"
 #include "executor/dynamic_translation/hle_thunk_identity.h"
+#include "executor/dynamic_translation/host_isa_profile.h"
 #include "executor/dynamic_translation/live_state_port.h"
 #include "executor/dynamic_translation/process_memory.h"
 #include "executor/dynamic_translation/runtime_gateway.h"
 #include "executor/dynamic_translation/retiring_execution_core.h"
+#include "executor/cpu_tuning.h"
 #include "executor/android_performance_hint.h"
+#include "executor/fex_backend_loader.h"
+#include "executor/fex_fiber_hle_bridge.h"
+#include "executor/fex_hle_frame_lease_abi.h"
+#include "executor/guest_context_snapshot_abi.h"
+#include "executor/guest_cpu_backend.h"
+#include "executor/ps1_classic_runtime.h"
 #include "input/controller.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+#include "video_core/renderer_vulkan/vk_driver_axis.h"
+#endif
+#include "video_core/page_manager.h"
+#include "video_core/runtime_proof_counters.h"
 #if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
 #include "video_core/mobile_gpu_optimization.h"
 #include "video_core/readback_optimization.h"
@@ -61,6 +82,7 @@
 #include <csignal>
 #include <cstdarg>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -70,24 +92,29 @@
 #include <filesystem>
 #include <fcntl.h>
 #include <fstream>
+#include <limits>
 #include <initializer_list>
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <pthread.h>
 #include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <sched.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <thread>
 #include <chrono>
+#include <ctime>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #define SDL_MAIN_HANDLED 1
@@ -101,6 +128,7 @@
 
 namespace Libraries::Kernel {
 extern PthreadAttr PthreadAttrDefault;
+void PS4_SYSV_ABI posix_pthread_exit(void* status);
 s32 PS4_SYSV_ABI posix_pthread_mutex_trylock(PthreadMutexT* mutex);
 s32 PS4_SYSV_ABI posix_pthread_mutex_unlock(PthreadMutexT* mutex);
 }
@@ -110,6 +138,16 @@ extern Frontend::WindowSDL* g_window;
 #ifdef __ANDROID__
 extern "C" bool ExecutorAeroLibGuestPageReaderSelfTest(std::uint64_t address,
                                                         std::size_t size);
+extern "C" int executor_lsx4_android_is_live_dynamic_guest_executable_address(
+    std::uint64_t address) __attribute__((weak));
+extern "C" int executor_jit_get_guest_thread_regs_by_pthread(
+    std::uintptr_t pthread_handle, std::uint64_t* rip, std::uint64_t* rsp,
+    std::uint64_t* rbp, long* tid, char* host_name,
+    std::size_t host_name_size) __attribute__((weak));
+extern "C" int executor_jit_get_guest_thread_regs_by_tid(
+    long host_tid, std::uint64_t* rip, std::uint64_t* rsp,
+    std::uint64_t* rbp, long* tid, char* host_name,
+    std::size_t host_name_size) __attribute__((weak));
 #endif
 
 bool InitializeAndroidTitleInfo(const std::filesystem::path& app0_path,
@@ -118,6 +156,32 @@ bool InitializeAndroidTitleInfo(const std::filesystem::path& app0_path,
 namespace {
 
 using HleMachineWord = std::uint64_t;
+
+class ScopedAndroidGuestPauseRegistration {
+public:
+    ScopedAndroidGuestPauseRegistration() {
+
+
+        DebugState.AddCurrentThreadToGuestList();
+        registered_ = true;
+    }
+
+    ~ScopedAndroidGuestPauseRegistration() {
+        if (registered_) {
+            DebugState.RemoveCurrentThreadFromGuestList();
+        }
+    }
+
+    ScopedAndroidGuestPauseRegistration(const ScopedAndroidGuestPauseRegistration&) = delete;
+    ScopedAndroidGuestPauseRegistration& operator=(const ScopedAndroidGuestPauseRegistration&) =
+        delete;
+
+private:
+    bool registered_{};
+};
+
+bool IsGuestExecutableAddress(std::uint64_t address,
+                              Core::Module** module_out = nullptr);
 
 constexpr unsigned long long HleLogWord(const HleMachineWord value) noexcept {
     return static_cast<unsigned long long>(value);
@@ -131,14 +195,28 @@ constexpr std::uint32_t ExecutorBox64MappedEntryTimeoutMs = 3000;
 constexpr std::uint32_t ExecutorBox64HleBridgeSyscall = 0x5ad00001u;
 constexpr std::uint32_t ExecutorBox64GuestExitSyscall = 0x5ad00002u;
 constexpr std::uint32_t ExecutorBox64MappedEntryFlagInProcess = 1u << 0;
-constexpr std::size_t ExecutorBox64HleTrampolineSize = 512;
-constexpr std::size_t ExecutorBox64HleTrampolineSlabSize = 2 * 1024 * 1024;
-constexpr std::size_t ExecutorBox64HleSafePoolSize = 256 * 1024 * 1024;
-constexpr std::uint32_t ExecutorBox64HleSafeSlotSize = 0x1000;
-constexpr std::uint32_t ExecutorBox64HleSafeSlotRsp = 0x800;
+constexpr std::size_t ExecutorBox64HleTrampolineSize =
+    Lsx4::FexHleLease::StubCodeBytes;
+constexpr std::size_t ExecutorBox64HleTrampolineSlots = 8192;
+constexpr std::size_t ExecutorBox64HleTrampolineSlabSize =
+    ExecutorBox64HleTrampolineSlots * ExecutorBox64HleTrampolineSize;
+constexpr std::size_t ExecutorBox64HleSafePoolSize = Lsx4::FexHleLease::PoolSize;
+constexpr std::uint32_t ExecutorBox64HleSafeSlotSize = Lsx4::FexHleLease::SlotSize;
+constexpr std::uint32_t ExecutorBox64HleSafeSlotRsp = Lsx4::FexHleLease::FrameOffset;
 constexpr std::uint32_t ExecutorBox64HleStackScratchSize = 0x1000;
-constexpr std::size_t ExecutorBox64HleSidebandSlotSize = 96;
+constexpr std::uint32_t ExecutorBox64HleLeasePointerOffset =
+    Lsx4::FexHleLease::GuardPointerOffset;
+constexpr std::size_t ExecutorBox64HleSidebandSlotSize = 160;
 constexpr std::size_t ExecutorBox64HleSidebandSlabSize = 64 * 1024;
+static_assert(ExecutorBox64HleLeasePointerOffset + sizeof(std::uint64_t) <=
+              ExecutorBox64HleSidebandSlotSize);
+static_assert(ExecutorBox64HleTrampolineSize ==
+              Lsx4::FexHleLease::StubCodeBytes);
+static_assert((ExecutorBox64HleTrampolineSize &
+               (ExecutorBox64HleTrampolineSize - 1)) == 0);
+static_assert(ExecutorBox64HleTrampolineSlabSize /
+                  ExecutorBox64HleTrampolineSize ==
+              ExecutorBox64HleTrampolineSlots);
 constexpr std::array<const char*, 14> ExecutorSupportedFirmwareModules = {
     "libSceCesCs.sprx",      "libSceFont.sprx",         "libSceFontFt.sprx",
     "libSceFreeTypeOt.sprx", "libSceJpegDec.sprx",      "libSceJpegEnc.sprx",
@@ -147,10 +225,13 @@ constexpr std::array<const char*, 14> ExecutorSupportedFirmwareModules = {
     "libSceUlt.sprx",        "libSceAudiodec.sprx"};
 
 constexpr const char* ExecutorNativeBuildMarker =
-    "lsx4-android-r233-generic-address-policy";
+    "lsx4-android-r250-packed-word-multiply-neon";
 
 bool ExecutorLightOracleMode() {
-    return std::getenv("EXECUTOR_LIGHT_ORACLE") != nullptr;
+
+
+    static const bool enabled = std::getenv("EXECUTOR_LIGHT_ORACLE") != nullptr;
+    return enabled;
 }
 
 bool ExecutorVerboseMonoMutexLedgerEnabled() {
@@ -190,16 +271,467 @@ struct ExecutorBox64MappedEntryRequest {
     ExecutorBox64MappedSegment segments[ExecutorBox64MappedEntryMaxSegments];
 };
 
-struct ExecutorBox64GuestRegsSnapshot {
-    std::uint64_t regs[16];
-    std::uint64_t rip;
-    std::uint64_t old_ip;
-    std::uint64_t fsbase;
-    std::uint64_t gsbase;
-    int quit;
-    int exit;
-    int error;
+struct ExactHleRangePiece {
+    std::uint64_t address = 0;
+    std::uint64_t size = 0;
+    bool hle = false;
 };
+
+struct ExactHleRangePlan {
+    std::array<ExactHleRangePiece, 3> pieces{};
+    std::uint32_t count = 0;
+};
+
+constexpr ExactHleRangePlan PlanExactHleRange(
+    const std::uint64_t range_begin, const std::uint64_t range_end,
+    const std::uint64_t hle_begin, const std::uint64_t hle_end) noexcept {
+    ExactHleRangePlan plan{};
+    std::array<std::uint64_t, 4> cuts{};
+    std::uint32_t cut_count = 0;
+    cuts[cut_count++] = range_begin;
+    if (hle_begin > range_begin && hle_begin < range_end) {
+        cuts[cut_count++] = hle_begin;
+    }
+    if (hle_end > range_begin && hle_end < range_end) {
+        cuts[cut_count++] = hle_end;
+    }
+    cuts[cut_count++] = range_end;
+
+    for (std::uint32_t index = 1; index < cut_count; ++index) {
+        const std::uint64_t begin = cuts[index - 1];
+        const std::uint64_t end = cuts[index];
+        plan.pieces[plan.count++] = {
+            .address = begin,
+            .size = end - begin,
+            .hle = begin >= hle_begin && end <= hle_end && begin < end,
+        };
+    }
+    return plan;
+}
+
+constexpr bool ExactHleRangePlanCompileTimeGate() noexcept {
+    const auto covering = PlanExactHleRange(0x1000, 0x5000, 0x2000, 0x3000);
+    const auto left_edge = PlanExactHleRange(0x2000, 0x5000, 0x2000, 0x3000);
+    const auto right_edge = PlanExactHleRange(0x1000, 0x3000, 0x2000, 0x3000);
+    const auto exact = PlanExactHleRange(0x2000, 0x3000, 0x2000, 0x3000);
+    const auto inside = PlanExactHleRange(0x2400, 0x2800, 0x2000, 0x3000);
+    const auto disjoint = PlanExactHleRange(0x4000, 0x5000, 0x2000, 0x3000);
+    return covering.count == 3 && covering.pieces[0].address == 0x1000 &&
+           covering.pieces[0].size == 0x1000 && !covering.pieces[0].hle &&
+           covering.pieces[1].address == 0x2000 && covering.pieces[1].size == 0x1000 &&
+           covering.pieces[1].hle && covering.pieces[2].address == 0x3000 &&
+           covering.pieces[2].size == 0x2000 && !covering.pieces[2].hle &&
+           left_edge.count == 2 && left_edge.pieces[0].hle && !left_edge.pieces[1].hle &&
+           right_edge.count == 2 && !right_edge.pieces[0].hle && right_edge.pieces[1].hle &&
+           exact.count == 1 && exact.pieces[0].hle &&
+           inside.count == 1 && inside.pieces[0].hle && disjoint.count == 1 &&
+           !disjoint.pieces[0].hle;
+}
+
+static_assert(ExactHleRangePlanCompileTimeGate(),
+              "HLE executable-range splitting must tag only the exact interval");
+
+constexpr std::uint64_t MixExactHleRangeCookie(std::uint64_t value) noexcept {
+    value ^= value >> 30;
+    value *= UINT64_C(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value *= UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31);
+}
+
+constexpr std::uint64_t StableGlobalExecutableRangeCookie(
+    const std::uint64_t domain, const std::uint64_t address,
+    const std::uint64_t size) noexcept {
+    const auto mixed = MixExactHleRangeCookie(
+        domain ^ std::rotl(address, 17) ^ std::rotl(size, 43));
+    return mixed != 0 ? mixed : domain;
+}
+
+constexpr std::uint64_t StableModuleExecutableRangeCookie(
+    const std::uint64_t address, const std::uint64_t size) noexcept {
+    return StableGlobalExecutableRangeCookie(
+        UINT64_C(0x4d4f44554c455258), address, size);
+}
+
+bool ContainsRangeCookie(const std::vector<std::uint64_t>& cookies,
+                         const std::uint64_t cookie) {
+    return std::find(cookies.begin(), cookies.end(), cookie) != cookies.end();
+}
+
+bool BuildExactHleExecutableRanges(
+    const std::span<const Lsx4FexExecutableRangeV5> input,
+    const std::uint64_t hle_begin, const std::uint64_t hle_size,
+    std::vector<Lsx4FexExecutableRangeV5>& output, std::string& error) {
+    std::vector<Lsx4FexExecutableRangeV5> base_ranges{input.begin(), input.end()};
+    std::vector<std::uint64_t> base_cookies;
+    base_cookies.reserve(base_ranges.size());
+    for (auto& range : base_ranges) {
+        if (range.address == 0 || range.size == 0 ||
+            range.address > UINT64_MAX - range.size ||
+            (range.range_flags & LSX4_FEX_RANGE_EXECUTABLE) == 0) {
+            error = "invalid base executable range for exact HLE split";
+            return false;
+        }
+        if (ContainsRangeCookie(base_cookies, range.range_cookie)) {
+            error = "duplicate base executable-range cookie";
+            return false;
+        }
+        base_cookies.push_back(range.range_cookie);
+        range.range_flags &= ~LSX4_FEX_RANGE_HLE_TRAMPOLINE;
+    }
+    std::sort(base_ranges.begin(), base_ranges.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.address != rhs.address) {
+            return lhs.address < rhs.address;
+        }
+        if (lhs.size != rhs.size) {
+            return lhs.size < rhs.size;
+        }
+        return lhs.range_cookie < rhs.range_cookie;
+    });
+    for (std::size_t index = 1; index < base_ranges.size(); ++index) {
+        const auto& previous = base_ranges[index - 1];
+        if (previous.address + previous.size > base_ranges[index].address) {
+            error = "overlapping base executable ranges prevent exact HLE split";
+            return false;
+        }
+    }
+
+    const bool has_hle = hle_begin != 0 || hle_size != 0;
+    if (has_hle && (hle_begin == 0 || hle_size == 0 || hle_begin > UINT64_MAX - hle_size)) {
+        error = "invalid exact FEX HLE trampoline range";
+        return false;
+    }
+    const std::uint64_t hle_end = has_hle ? hle_begin + hle_size : 0;
+
+    bool hle_intersects_base = false;
+    if (has_hle) {
+        for (const auto& range : base_ranges) {
+            const std::uint64_t range_end = range.address + range.size;
+            if (range_end <= hle_begin || range.address >= hle_end) {
+                continue;
+            }
+            if (hle_intersects_base || hle_begin < range.address || hle_end > range_end) {
+                error = "partially covered FEX HLE trampoline range";
+                return false;
+            }
+            hle_intersects_base = true;
+        }
+    }
+
+    std::vector<Lsx4FexExecutableRangeV5> exact_ranges;
+    exact_ranges.reserve(base_ranges.size() + 3);
+    std::vector<std::uint64_t> assigned_cookies;
+    assigned_cookies.reserve(base_ranges.size() + 3);
+    const std::uint64_t canonical_hle_cookie =
+        has_hle ? hle_begin ^ std::rotl(hle_size, 29) : 0;
+    for (const auto& range : base_ranges) {
+        const std::uint64_t range_end = range.address + range.size;
+        ExactHleRangePlan plan{};
+        if (has_hle && hle_intersects_base) {
+            plan = PlanExactHleRange(range.address, range_end, hle_begin, hle_end);
+        } else {
+            plan.pieces[0] = {range.address, range.size, false};
+            plan.count = 1;
+        }
+        const bool parent_cookie_reserved_for_hle =
+            has_hle && hle_intersects_base &&
+            range.address <= hle_begin && range_end >= hle_end &&
+            range.range_cookie == canonical_hle_cookie;
+        bool parent_cookie_assigned = parent_cookie_reserved_for_hle;
+        for (std::uint32_t piece_index = 0; piece_index < plan.count; ++piece_index) {
+            const auto& piece = plan.pieces[piece_index];
+            std::uint64_t cookie = 0;
+            if (piece.hle) {
+                cookie = canonical_hle_cookie;
+                if (ContainsRangeCookie(base_cookies, cookie) &&
+                    range.range_cookie != cookie) {
+                    error = "exact FEX HLE trampoline cookie collides with base range";
+                    return false;
+                }
+            } else if (!parent_cookie_assigned) {
+                cookie = range.range_cookie;
+                parent_cookie_assigned = true;
+            } else {
+                const std::uint64_t seed =
+                    range.range_cookie ^ std::rotl(piece.address, 13) ^
+                    std::rotl(piece.size, 37) ^
+                    (static_cast<std::uint64_t>(piece_index) << 56) ^
+                    UINT64_C(0x48534c4553504c54);
+                for (std::uint64_t salt = 1;; ++salt) {
+                    cookie = MixExactHleRangeCookie(
+                        seed + salt * UINT64_C(0x9e3779b97f4a7c15));
+                    if (!ContainsRangeCookie(base_cookies, cookie) &&
+                        !ContainsRangeCookie(assigned_cookies, cookie)) {
+                        break;
+                    }
+                }
+            }
+            if (ContainsRangeCookie(assigned_cookies, cookie)) {
+                error = "non-unique exact executable-range cookie";
+                return false;
+            }
+            assigned_cookies.push_back(cookie);
+            exact_ranges.push_back({
+                .address = piece.address,
+                .size = piece.size,
+                .range_cookie = cookie,
+                .protection = range.protection,
+                .range_flags = range.range_flags |
+                               (piece.hle ? LSX4_FEX_RANGE_HLE_TRAMPOLINE : 0u),
+            });
+        }
+    }
+
+    if (has_hle && !hle_intersects_base) {
+        const std::uint64_t cookie = canonical_hle_cookie;
+        if (ContainsRangeCookie(base_cookies, cookie) ||
+            ContainsRangeCookie(assigned_cookies, cookie)) {
+            error = "standalone FEX HLE trampoline cookie collides with executable range";
+            return false;
+        }
+        exact_ranges.push_back({
+            .address = hle_begin,
+            .size = hle_size,
+            .range_cookie = cookie,
+            .protection = PROT_READ | PROT_EXEC,
+            .range_flags = LSX4_FEX_RANGE_EXECUTABLE |
+                           LSX4_FEX_RANGE_HLE_TRAMPOLINE,
+        });
+        assigned_cookies.push_back(cookie);
+        std::sort(exact_ranges.begin(), exact_ranges.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.address < rhs.address;
+        });
+    }
+
+    std::uint64_t exact_hle_cursor = hle_begin;
+    bool saw_exact_hle = false;
+    for (std::size_t index = 0; index < exact_ranges.size(); ++index) {
+        const auto& range = exact_ranges[index];
+        const std::uint64_t range_end = range.address + range.size;
+        if (index != 0) {
+            const auto& previous = exact_ranges[index - 1];
+            if (previous.address + previous.size > range.address) {
+                error = "exact FEX executable ranges overlap";
+                return false;
+            }
+        }
+        if ((range.range_flags & LSX4_FEX_RANGE_HLE_TRAMPOLINE) != 0) {
+            if (!has_hle || range.address != exact_hle_cursor || range.address < hle_begin ||
+                range_end > hle_end) {
+                error = "FEX HLE flag escaped the exact trampoline interval";
+                return false;
+            }
+            saw_exact_hle = true;
+            exact_hle_cursor = range_end;
+        } else if (has_hle && range.address < hle_end && hle_begin < range_end) {
+            error = "exact FEX HLE trampoline interval is not fully tagged";
+            return false;
+        }
+    }
+    if (has_hle && (!saw_exact_hle || exact_hle_cursor != hle_end)) {
+        error = "exact FEX HLE trampoline interval is incomplete";
+        return false;
+    }
+
+    output = std::move(exact_ranges);
+    return true;
+}
+
+struct ExactHleSpan {
+    std::uint64_t address{};
+    std::uint64_t size{};
+};
+
+bool BuildSparseExactHleExecutableRanges(
+    const std::span<const Lsx4FexExecutableRangeV5> input,
+    const std::span<const ExactHleSpan> hle_input,
+    std::vector<Lsx4FexExecutableRangeV5>& output, std::string& error) {
+    std::vector<Lsx4FexExecutableRangeV5> base_ranges{input.begin(), input.end()};
+    std::vector<std::uint64_t> base_cookies;
+    base_cookies.reserve(base_ranges.size());
+    for (auto& range : base_ranges) {
+        if (range.address == 0 || range.size == 0 ||
+            range.address > UINT64_MAX - range.size ||
+            (range.range_flags & LSX4_FEX_RANGE_EXECUTABLE) == 0) {
+            error = "invalid base executable range for sparse HLE overlay";
+            return false;
+        }
+        if (ContainsRangeCookie(base_cookies, range.range_cookie)) {
+            error = "duplicate base executable-range cookie in sparse HLE overlay";
+            return false;
+        }
+        base_cookies.push_back(range.range_cookie);
+        range.range_flags &= ~LSX4_FEX_RANGE_HLE_TRAMPOLINE;
+    }
+    std::sort(base_ranges.begin(), base_ranges.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.address != rhs.address) {
+            return lhs.address < rhs.address;
+        }
+        return lhs.size < rhs.size;
+    });
+    for (std::size_t index = 1; index < base_ranges.size(); ++index) {
+        const auto& previous = base_ranges[index - 1];
+        if (previous.address + previous.size > base_ranges[index].address) {
+            error = "overlapping base executable ranges in sparse HLE overlay";
+            return false;
+        }
+    }
+
+    std::vector<ExactHleSpan> hle_spans{hle_input.begin(), hle_input.end()};
+    std::sort(hle_spans.begin(), hle_spans.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.address != rhs.address) {
+            return lhs.address < rhs.address;
+        }
+        return lhs.size < rhs.size;
+    });
+    for (std::size_t index = 0; index < hle_spans.size(); ++index) {
+        const auto& span = hle_spans[index];
+        if (span.address == 0 || span.size == 0 ||
+            span.address > UINT64_MAX - span.size) {
+            error = "invalid exact span in sparse HLE overlay";
+            return false;
+        }
+        if (index != 0) {
+            const auto& previous = hle_spans[index - 1];
+            if (previous.address + previous.size > span.address) {
+                error = "overlapping exact spans in sparse HLE overlay";
+                return false;
+            }
+        }
+        const auto found = std::upper_bound(
+            base_ranges.begin(), base_ranges.end(), span.address,
+            [](const std::uint64_t address, const Lsx4FexExecutableRangeV5& range) {
+                return address < range.address;
+            });
+        if (found == base_ranges.begin()) {
+            error = "sparse HLE span is outside every executable base range";
+            return false;
+        }
+        const auto& covering = *std::prev(found);
+        if (span.address < covering.address ||
+            span.address + span.size > covering.address + covering.size) {
+            error = "sparse HLE span is only partially covered by an executable range";
+            return false;
+        }
+    }
+
+    std::vector<Lsx4FexExecutableRangeV5> exact_ranges;
+    exact_ranges.reserve(base_ranges.size() + hle_spans.size() * 2);
+    std::unordered_set<std::uint64_t> assigned_cookies;
+    assigned_cookies.reserve(exact_ranges.capacity());
+    std::size_t hle_index = 0;
+    for (const auto& range : base_ranges) {
+        struct Piece {
+            std::uint64_t address;
+            std::uint64_t size;
+            bool hle;
+        };
+        std::vector<Piece> pieces;
+        std::uint64_t cursor = range.address;
+        const std::uint64_t range_end = range.address + range.size;
+        while (hle_index < hle_spans.size() &&
+               hle_spans[hle_index].address < range_end) {
+            const auto& span = hle_spans[hle_index];
+            if (span.address < cursor || span.address + span.size > range_end) {
+                error = "sparse HLE partition escaped its executable parent";
+                return false;
+            }
+            if (cursor < span.address) {
+                pieces.push_back({cursor, span.address - cursor, false});
+            }
+            pieces.push_back({span.address, span.size, true});
+            cursor = span.address + span.size;
+            ++hle_index;
+        }
+        if (cursor < range_end) {
+            pieces.push_back({cursor, range_end - cursor, false});
+        }
+        if (pieces.empty()) {
+            pieces.push_back({range.address, range.size, false});
+        }
+
+        bool parent_cookie_used = false;
+        for (std::size_t piece_index = 0; piece_index < pieces.size(); ++piece_index) {
+            const auto& piece = pieces[piece_index];
+            std::uint64_t cookie = range.range_cookie;
+            if (!parent_cookie_used) {
+                parent_cookie_used = true;
+            } else {
+                const std::uint64_t domain = piece.hle
+                    ? UINT64_C(0x484c455350414e31)
+                    : UINT64_C(0x4558454353504c54);
+                const std::uint64_t seed = range.range_cookie ^ domain ^
+                    std::rotl(piece.address, 19) ^ std::rotl(piece.size, 41);
+                for (std::uint64_t salt = 1;; ++salt) {
+                    cookie = MixExactHleRangeCookie(
+                        seed + salt * UINT64_C(0x9e3779b97f4a7c15));
+                    if (!ContainsRangeCookie(base_cookies, cookie) &&
+                        !assigned_cookies.contains(cookie)) {
+                        break;
+                    }
+                }
+            }
+            if (!assigned_cookies.insert(cookie).second) {
+                error = "non-unique cookie in sparse HLE overlay";
+                return false;
+            }
+            exact_ranges.push_back({
+                .address = piece.address,
+                .size = piece.size,
+                .range_cookie = cookie,
+                .protection = range.protection,
+                .range_flags = range.range_flags |
+                    (piece.hle ? LSX4_FEX_RANGE_HLE_TRAMPOLINE : 0u),
+            });
+        }
+    }
+    if (hle_index != hle_spans.size()) {
+        error = "not every sparse HLE span was partitioned";
+        return false;
+    }
+
+    std::size_t verified_hle = 0;
+    for (const auto& range : exact_ranges) {
+        if ((range.range_flags & LSX4_FEX_RANGE_HLE_TRAMPOLINE) == 0) {
+            continue;
+        }
+        if (verified_hle >= hle_spans.size() ||
+            range.address != hle_spans[verified_hle].address ||
+            range.size != hle_spans[verified_hle].size) {
+            error = "sparse HLE flag escaped its exact manifest span";
+            return false;
+        }
+        ++verified_hle;
+    }
+    if (verified_hle != hle_spans.size()) {
+        error = "sparse HLE manifest is incomplete";
+        return false;
+    }
+
+    output = std::move(exact_ranges);
+    return true;
+}
+
+using ExecutorBox64GuestRegsSnapshot = Lsx4GuestContextLegacyPrefix;
+using ExecutorGuestContextSnapshotV2 = Lsx4GuestContextSnapshotV2;
+
+
+
+
+
+
+
+static_assert(static_cast<std::uint32_t>(LSX4_GUEST_CONTEXT_GPR_VALID) ==
+              static_cast<std::uint32_t>(LSX4_FEX_CONTEXT_GPR_VALID));
+static_assert(static_cast<std::uint32_t>(LSX4_GUEST_CONTEXT_XMM_VALID) ==
+              static_cast<std::uint32_t>(LSX4_FEX_CONTEXT_XMM_VALID));
+static_assert(static_cast<std::uint32_t>(LSX4_GUEST_CONTEXT_FLAGS_VALID) ==
+              static_cast<std::uint32_t>(LSX4_FEX_CONTEXT_FLAGS_VALID));
+static_assert(static_cast<std::uint32_t>(LSX4_GUEST_CONTEXT_TLS_VALID) ==
+              static_cast<std::uint32_t>(LSX4_FEX_CONTEXT_TLS_VALID));
+constexpr std::uint32_t kGuestContextKnownFlags =
+    LSX4_GUEST_CONTEXT_GPR_VALID | LSX4_GUEST_CONTEXT_XMM_VALID |
+    LSX4_GUEST_CONTEXT_FLAGS_VALID | LSX4_GUEST_CONTEXT_TLS_VALID;
 
 extern "C" void executor_lsx4_android_publish_guest_gc_register_roots(
     const void* regs, std::size_t regs_size);
@@ -210,10 +742,229 @@ alignas(64) std::array<ExecutorBox64GuestRegsSnapshot, kJitGcRegisterRootSlots>
 std::array<std::atomic<std::uint32_t>, kJitGcRegisterRootSlots>
     g_jit_gc_register_root_tids{};
 
-std::mutex g_lock;
+#ifdef __ANDROID__
+
+
+
+
+
+class RuntimeStatusMutex final {
+public:
+    void lock() {
+        const sigset_t previous = BlockSleepSignal();
+        try {
+            mutex.lock();
+        } catch (...) {
+            RestoreSignalMask(previous);
+            throw;
+        }
+        previous_signal_mask = previous;
+    }
+
+    bool try_lock() {
+        const sigset_t previous = BlockSleepSignal();
+        try {
+            if (mutex.try_lock()) {
+                previous_signal_mask = previous;
+                return true;
+            }
+        } catch (...) {
+            RestoreSignalMask(previous);
+            throw;
+        }
+        RestoreSignalMask(previous);
+        return false;
+    }
+
+    void unlock() noexcept {
+        const sigset_t previous = previous_signal_mask;
+        mutex.unlock();
+
+
+        RestoreSignalMask(previous);
+    }
+
+private:
+    static sigset_t BlockSleepSignal() {
+        sigset_t requested{};
+        sigset_t previous{};
+        sigemptyset(&requested);
+        sigaddset(&requested, SIGSLEEP);
+        const int error = pthread_sigmask(SIG_BLOCK, &requested, &previous);
+        if (error != 0) {
+            throw std::system_error(error, std::generic_category(), "block runtime pause signal");
+        }
+        return previous;
+    }
+
+    static void RestoreSignalMask(const sigset_t& previous) noexcept {
+        if (pthread_sigmask(SIG_SETMASK, &previous, nullptr) != 0) {
+            std::terminate();
+        }
+    }
+
+    std::mutex mutex;
+    inline static thread_local sigset_t previous_signal_mask{};
+};
+#else
+using RuntimeStatusMutex = std::mutex;
+#endif
+
+RuntimeStatusMutex g_lock;
 std::string g_root;
+std::array<char, 16> g_active_title_id{"unknown"};
 std::string g_status = R"({"state":"created","core":"lsx4-native"})";
-std::atomic<int> g_runtime_guest_backend{1};
+std::mutex g_runtime_lifecycle_lock;
+bool g_runtime_pause_requested{};
+bool g_runtime_pause_effective{};
+std::uint64_t g_runtime_pause_transitions{};
+std::uint64_t g_runtime_resume_transitions{};
+std::uint64_t g_runtime_pause_idempotent{};
+std::uint64_t g_runtime_pause_rejected{};
+int g_runtime_pause_last_result{};
+std::atomic<Executor::GuestCpuBackend> g_runtime_guest_backend{
+    Executor::GuestCpuBackend::Current};
+std::atomic<Executor::GuestCpuBackend> g_requested_guest_backend{
+    Executor::GuestCpuBackend::Current};
+std::atomic<bool> g_guest_cpu_backend_selection_locked{false};
+std::atomic<bool> g_fex_persistent_rip_seed_enabled{false};
+enum class FaultSignalOwner : int {
+    Unselected = 0,
+    Current = 1,
+    Fex = 2,
+
+    FexActivationStaged = 3,
+};
+std::atomic<FaultSignalOwner> g_fault_signal_owner{FaultSignalOwner::Unselected};
+
+
+
+std::atomic<bool> g_fex_hle_signal_safepoints_required{false};
+constexpr int OrbisSigUsr1 = 30;
+
+enum class FexBootstrapLifecyclePhase : std::uint8_t {
+    Inactive = 0,
+    Collecting,
+    Deferred,
+    Draining,
+    Complete,
+    Failed,
+};
+
+struct DeferredFexBootstrapLifecycle {
+    Core::Module* module = nullptr;
+    std::uint64_t args = 0;
+    const void* argp = nullptr;
+    void* param = nullptr;
+};
+
+std::atomic<FexBootstrapLifecyclePhase> g_fex_bootstrap_lifecycle_phase{
+    FexBootstrapLifecyclePhase::Inactive};
+std::mutex g_fex_bootstrap_lifecycle_mutex;
+std::vector<DeferredFexBootstrapLifecycle> g_fex_bootstrap_lifecycles;
+std::mutex g_fex_executable_range_mutation_mutex;
+
+
+
+
+
+std::vector<Lsx4FexExecutableRangeV5> g_fex_dynamic_executable_ranges;
+
+const char* FaultSignalOwnerName(const FaultSignalOwner owner) noexcept {
+    switch (owner) {
+    case FaultSignalOwner::Current:
+        return "current";
+    case FaultSignalOwner::Fex:
+        return "fex";
+    case FaultSignalOwner::FexActivationStaged:
+        return "fex-activation-staged";
+    default:
+        return "unselected";
+    }
+}
+bool g_guest_cpu_backend_supported = true;
+std::string g_guest_cpu_backend_fallback_reason = "none";
+std::string g_guest_cpu_backend_adapter_abi;
+std::string g_guest_cpu_backend_mapped_entry_abi;
+std::string g_guest_cpu_backend_cache_namespace = "current-v5";
+std::uint32_t g_guest_cpu_backend_configure_flags{};
+std::uint64_t g_guest_cpu_backend_provided_capabilities{};
+std::uint64_t g_guest_cpu_backend_required_capabilities{};
+std::uint64_t g_guest_cpu_backend_forbidden_capabilities{};
+std::string g_guest_cpu_backend_strong_memory_model;
+std::string g_guest_cpu_backend_launch_title_id;
+std::string g_guest_cpu_backend_hardware_profile = "unknown";
+std::string g_guest_cpu_backend_driver_family = "system-unknown";
+std::string g_guest_cpu_backend_driver_version;
+std::string g_guest_cpu_backend_optimization_profile = "default";
+std::string g_guest_cpu_backend_inherited_profile = "shared-semantics-v1";
+std::string g_guest_cpu_backend_device_profile = "portable-v1";
+std::string g_guest_cpu_backend_driver_profile = "system-unknown-v1";
+std::string g_guest_cpu_backend_workload_profile = "generic-v1";
+std::string g_guest_cpu_backend_excluded_profiles;
+bool g_guest_cpu_backend_optimization_profile_requested{};
+bool g_guest_cpu_backend_optimization_profile_eligible{};
+
+bool ExecutorBloodborneSnapdragonStrongCpuBundleEligible() noexcept {
+    return g_guest_cpu_backend_launch_title_id == "CUSA03173" &&
+           (g_guest_cpu_backend_hardware_profile == "adreno-750" ||
+            g_guest_cpu_backend_hardware_profile == "adreno-840");
+}
+
+bool ExecutorPreserveBloodborneSnapdragonStrongBundle() noexcept {
+    return ExecutorBloodborneSnapdragonStrongCpuBundleEligible() &&
+           ::access("/data/data/app.lsx4.android/files/lsx4-home/"
+                    "run-preserve-bloodborne-snapdragon-strong-bundle",
+                    F_OK) == 0;
+}
+
+bool ExecutorPreserveBloodborneSnapdragonCpuBundle() noexcept {
+    return ExecutorBloodborneSnapdragonStrongCpuBundleEligible() &&
+           (ExecutorPreserveBloodborneSnapdragonStrongBundle() ||
+            ::access("/data/data/app.lsx4.android/files/lsx4-home/"
+                     "run-preserve-bloodborne-snapdragon-cpu-bundle",
+                     F_OK) == 0);
+}
+
+bool ExecutorBloodborneSnapdragonStrongCpuBundleDefault() noexcept {
+    return ExecutorBloodborneSnapdragonStrongCpuBundleEligible() &&
+           g_guest_cpu_backend_hardware_profile == "adreno-840" &&
+           !ExecutorPreserveBloodborneSnapdragonCpuBundle();
+}
+
+bool ExecutorTitleScopedCpuOptimizationMarkerEnabled(
+    const std::string_view marker) noexcept {
+    if (Common::TitleScopedOptimizationMarkerEnabled(
+            g_guest_cpu_backend_launch_title_id, marker)) {
+        return true;
+    }
+
+
+
+
+
+    if (!ExecutorBloodborneSnapdragonStrongCpuBundleEligible()) {
+        return false;
+    }
+    constexpr std::array<const char*, 2> Roots{
+        "/data/data/app.lsx4.android/files/lsx4-home/",
+        "/data/user/0/app.lsx4.android/files/lsx4-home/",
+    };
+    std::array<char, 512> path{};
+    for (const char* const root : Roots) {
+        const int length = std::snprintf(path.data(), path.size(), "%s%.*s",
+                                         root, static_cast<int>(marker.size()),
+                                         marker.data());
+        if (length > 0 && static_cast<std::size_t>(length) < path.size() &&
+            ::access(path.data(), F_OK) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string g_guest_cpu_backend_status =
+    R"({"schema":"lsx4.guest-cpu-backend.v1","platform":"ps4","requested":"current-aarch64-jit","effective":"current-aarch64-jit","supported":true,"fallbackReason":"none","cacheNamespace":"current-v5","selectionLocked":false})";
 std::atomic<bool> g_jit_launch_entry_requested{false};
 struct JitGuestSignalHandler {
     std::uint64_t handler = 0;
@@ -223,7 +974,9 @@ std::mutex g_jit_signal_lock;
 std::array<JitGuestSignalHandler, 129> g_jit_signal_handlers{};
 std::string g_firmware_status =
     R"({"enabled":false,"reason":"runtime not initialized"})";
-std::array<std::string, 33> g_entry_arg_storage;
+constexpr std::size_t ExecutorEntryArgumentCapacity = 256;
+alignas(16) std::array<std::array<char, ExecutorEntryArgumentCapacity>, 33>
+    g_entry_arg_storage{};
 std::string g_store_launch_query_handoff_title;
 int g_store_launch_query_handoff_count = 0;
 std::string g_last_scan_path;
@@ -244,7 +997,13 @@ std::filesystem::path ExecutorProbeRoot() {
 }
 
 bool RuntimeGuestJitActive() {
-    return g_runtime_guest_backend.load(std::memory_order_acquire) == 1;
+    return g_runtime_guest_backend.load(std::memory_order_acquire) ==
+           Executor::GuestCpuBackend::Current;
+}
+
+bool RuntimeGuestFexActive() {
+    return g_runtime_guest_backend.load(std::memory_order_acquire) ==
+           Executor::GuestCpuBackend::FexExperimental;
 }
 
 #ifdef __ANDROID__
@@ -281,8 +1040,90 @@ extern "C" int executor_lsx4_android_runtime_jit_active() {
     return RuntimeGuestJitActive() ? 1 : 0;
 }
 
+extern "C" int executor_lsx4_android_fault_signal_owner() {
+    const FaultSignalOwner owner = g_fault_signal_owner.load(std::memory_order_acquire);
+    return owner == FaultSignalOwner::FexActivationStaged
+               ? static_cast<int>(FaultSignalOwner::Unselected)
+               : static_cast<int>(owner);
+}
+
+extern "C" int executor_lsx4_android_fex_signal_prepare_authorized() {
+    return g_fault_signal_owner.load(std::memory_order_acquire) ==
+                   FaultSignalOwner::FexActivationStaged
+               ? 1
+               : 0;
+}
+
+extern "C" int executor_lsx4_android_fex_signal_api_active() {
+    const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApiForSignal();
+    return api != nullptr && api->handle_host_signal != nullptr ? 1 : 0;
+}
+
+extern "C" int executor_lsx4_android_fex_handle_host_signal(const int signum,
+                                                            const void* const signal_info,
+                                                            void* const raw_context) {
+    if (g_fault_signal_owner.load(std::memory_order_acquire) != FaultSignalOwner::Fex) {
+        return LSX4_FEX_HOST_SIGNAL_NOT_HANDLED;
+    }
+    const Lsx4FexBackendApiV3* const api =
+        Executor::Fex::ActiveApiForSignal();
+    if (api == nullptr || api->handle_host_signal == nullptr) {
+        return LSX4_FEX_HOST_SIGNAL_NOT_HANDLED;
+    }
+    return api->handle_host_signal(
+        api->backend_context, signum, signal_info, raw_context);
+}
+
+extern "C" int executor_lsx4_android_fex_signal_context_pc_is_generated_code(
+    const void* const raw_context) noexcept {
+    if (g_fault_signal_owner.load(std::memory_order_acquire) != FaultSignalOwner::Fex) {
+        return 0;
+    }
+    const Lsx4FexBackendApiV3* const api =
+        Executor::Fex::ActiveApiForSignal();
+    if (api == nullptr || api->classify_signal_context_pc == nullptr) {
+        return 0;
+    }
+    return api->classify_signal_context_pc(api->backend_context, raw_context) == 1 ? 1 : 0;
+}
+
+extern "C" std::uint64_t
+executor_lsx4_android_fex_signal_context_guest_rip(
+    const void* const raw_context) noexcept {
+    if (g_fault_signal_owner.load(std::memory_order_acquire) !=
+        FaultSignalOwner::Fex) {
+        return 0;
+    }
+    return Executor::Fex::DecodeSignalContextGuestRip(raw_context);
+}
+
+extern "C" int executor_lsx4_android_fex_deferred_write_epoch_arm_current(
+    const std::uint64_t token) noexcept {
+    return Executor::Fex::ArmDeferredWriteEpochCurrent(token);
+}
+
+extern "C" int executor_lsx4_android_fex_deferred_write_epoch_kick_owner(
+    const int owner_tid) noexcept {
+    if (owner_tid <= 0 ||
+        g_fault_signal_owner.load(std::memory_order_acquire) !=
+            FaultSignalOwner::Fex ||
+        !Common::IsSnapdragon8Gen3Host()) {
+        return 0;
+    }
+    const auto& host_isa = Executor::Jit::GetHostIsaProfile();
+    if ((host_isa.os_features &
+         LSX4_FEX_HOST_OS_HARDWARE_TSO_ENABLED) != 0) {
+        return 0;
+    }
+    return Executor::Fex::KickDeferredWriteEpochOwner(owner_tid) ==
+                   LSX4_FEX_STATUS_OK
+               ? 1
+               : 0;
+}
+
 const char* RuntimeGuestBackendName() {
-    return "jit-aarch64-jit";
+    return Executor::GuestCpuBackendName(
+        g_runtime_guest_backend.load(std::memory_order_acquire));
 }
 
 std::uint64_t RunJitMappedFunction(const std::uint64_t guest_rip,
@@ -389,8 +1230,20 @@ struct ExecutorGuestReadableRange {
 };
 std::vector<void*> g_box64_guest_stacks;
 std::vector<ExecutorGuestReadableRange> g_box64_guest_stack_ranges;
+std::vector<ExecutorGuestReadableRange> g_box64_external_guest_stack_ranges;
+std::vector<ExecutorGuestReadableRange> g_box64_external_guest_mutable_ranges;
 std::vector<ExecutorGuestReadableRange> g_box64_guest_gc_sideband_ranges;
 std::vector<ExecutorGuestReadableRange> g_box64_guest_readable_ranges;
+
+struct ExecutorActiveGuestReadLease {
+    std::uint64_t base = 0;
+    std::uint64_t size = 0;
+    std::uint64_t generation = 0;
+};
+
+thread_local ExecutorActiveGuestReadLease g_active_hle_guest_read_lease{};
+thread_local ExecutorActiveGuestReadLease g_jit_registered_guest_range_cache{};
+std::atomic<std::uint64_t> g_box64_guest_readable_generation{1};
 
 constexpr std::uint64_t JitRegisteredPageSize = 4_KB;
 constexpr std::uint64_t JitRegisteredPageMask = JitRegisteredPageSize - 1;
@@ -456,6 +1309,103 @@ bool ExecutorGcGuestRootsEnabled() {
             return true;
         }
         return false;
+    }();
+    return enabled;
+}
+
+bool FexLeafHleBoundaryElisionEnabled() {
+    static const bool enabled = [] {
+        constexpr std::string_view Marker =
+            "run-enable-fex-leaf-hle-boundary-elision";
+        if (ExecutorTitleScopedCpuOptimizationMarkerEnabled(Marker)) {
+            return true;
+        }
+        if (ExecutorPreserveBloodborneSnapdragonCpuBundle()) {
+            return false;
+        }
+
+
+
+        return ExecutorBloodborneSnapdragonStrongCpuBundleDefault();
+    }();
+    return enabled;
+}
+
+bool FexDirectLeafHleDispatchEnabled() {
+    static const bool enabled = [] {
+        const bool sm8650 = Common::IsSnapdragon8Gen3Host();
+        const bool sm8850 = Common::IsSnapdragon8Gen5Host();
+        if (!sm8650 && !sm8850) {
+            return false;
+        }
+        constexpr std::string_view Sm8650EnableMarker =
+            "run-enable-sm8650-fex-direct-leaf-hle";
+        constexpr std::string_view Sm8850EnableMarker =
+            "run-enable-sm8850-fex-direct-leaf-hle";
+        const std::string_view marker =
+            sm8650 ? Sm8650EnableMarker : Sm8850EnableMarker;
+        if (ExecutorTitleScopedCpuOptimizationMarkerEnabled(marker)) {
+#ifdef __ANDROID__
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4Native",
+                "[EXECUTOR_FEX_DIRECT_LEAF_GATE] enabled=1 "
+                "sm8650=%u sm8850=%u title=%s titleScoped=1 "
+                "metadataFailClosed=1",
+                sm8650 ? 1u : 0u, sm8850 ? 1u : 0u,
+                g_guest_cpu_backend_launch_title_id.c_str());
+#endif
+            return true;
+        }
+        return false;
+    }();
+    return enabled;
+}
+
+bool FexDirectScalarFpHleDispatchEnabled() {
+    static const bool enabled = [] {
+        const bool sm8650 = Common::IsSnapdragon8Gen3Host();
+        const bool sm8850 = Common::IsSnapdragon8Gen5Host();
+        if (!sm8650 && !sm8850) {
+            return false;
+        }
+        constexpr std::string_view Sm8650EnableMarker =
+            "run-enable-sm8650-fex-direct-scalar-fp-hle";
+        constexpr std::string_view Sm8850EnableMarker =
+            "run-enable-sm8850-fex-direct-scalar-fp-hle";
+        const std::string_view marker =
+            sm8650 ? Sm8650EnableMarker : Sm8850EnableMarker;
+        if (ExecutorTitleScopedCpuOptimizationMarkerEnabled(marker)) {
+#ifdef __ANDROID__
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4Native",
+                "[EXECUTOR_FEX_DIRECT_SCALAR_FP_GATE] enabled=1 "
+                "sm8650=%u sm8850=%u title=%s titleScoped=1 "
+                "metadataFailClosed=1",
+                sm8650 ? 1u : 0u, sm8850 ? 1u : 0u,
+                g_guest_cpu_backend_launch_title_id.c_str());
+#endif
+            return true;
+        }
+        return false;
+    }();
+    return enabled;
+}
+
+bool FexTypedTimeDirectHleDispatchEnabled() {
+    static const bool enabled = [] {
+        constexpr std::array<const char*, 2> DisableMarkers{
+            "/data/data/app.lsx4.android/files/lsx4-home/"
+            "run-disable-fex-typed-time-direct",
+            "/data/user/0/app.lsx4.android/files/lsx4-home/"
+            "run-disable-fex-typed-time-direct",
+        };
+        for (const char* const path : DisableMarkers) {
+            if (std::FILE* const marker = std::fopen(path, "rb")) {
+                std::fclose(marker);
+                return false;
+            }
+        }
+        return true;
     }();
     return enabled;
 }
@@ -530,6 +1480,16 @@ void* g_box64_initial_stack = nullptr;
 void* g_box64_exit_stub = nullptr;
 void* g_box64_hle_trampoline_slab = nullptr;
 std::size_t g_box64_hle_trampoline_used = 0;
+std::mutex g_box64_hle_slab_mutex;
+std::vector<ExactHleSpan> g_box64_hle_lease_manifest;
+std::uint64_t g_box64_hle_manifest_generation =
+    Lsx4::FexHleLease::InitialManifestGeneration;
+bool g_box64_hle_manifest_sealed = false;
+Lsx4::FexHleLease::CombinedManifestGeneration
+    g_fex_hle_combined_manifest_generation{};
+std::mutex g_fex_hle_combined_manifest_mutex;
+std::size_t g_box64_hle_max_emitted_bytes = 0;
+std::uint64_t g_box64_hle_emission_canary_failures = 0;
 void* g_box64_hle_sideband_slab = nullptr;
 std::size_t g_box64_hle_sideband_used = 0;
 std::size_t g_guest_main_thread_static_tls_size = static_cast<std::size_t>(-1);
@@ -542,6 +1502,314 @@ std::atomic_bool g_box64_guest_entry_active = false;
 std::atomic_int g_box64_guest_entry_depth{0};
 std::atomic_int g_box64_load_exec_handoff_count{0};
 std::atomic_bool g_load_exec_process_worker_active{false};
+std::mutex g_fex_live_thread_identity_mutex;
+std::unordered_map<std::uint64_t, Lsx4FexThreadIdentityV3>
+    g_fex_live_thread_identities;
+std::atomic<std::uint64_t> g_exit8_async_loading_guest_thread{};
+std::atomic<std::uint64_t> g_exit8_async_loading_runnable{};
+std::atomic<std::uint64_t> g_exit8_render_guest_thread{};
+std::atomic<std::uint64_t> g_exit8_render_runnable{};
+
+Lsx4FexThreadIdentityV3 MakeFexThreadIdentity(
+    void* guest_thread = nullptr, std::uintptr_t pthread_handle = 0) {
+    auto* const thread = guest_thread != nullptr
+                             ? static_cast<Libraries::Kernel::Pthread*>(guest_thread)
+                             : Libraries::Kernel::g_curthread;
+    if (pthread_handle == 0 && thread != nullptr) {
+        pthread_handle = static_cast<std::uintptr_t>(
+            thread->native_thr.GetHandle());
+    }
+    return {
+        .struct_size = sizeof(Lsx4FexThreadIdentityV3),
+        .abi_version = LSX4_FEX_BACKEND_ABI_V3,
+        .guest_thread = reinterpret_cast<std::uint64_t>(thread),
+        .pthread_handle = static_cast<std::uint64_t>(pthread_handle),
+        .host_tid = static_cast<std::int64_t>(syscall(SYS_gettid)),
+        .backend_thread = 0,
+    };
+}
+
+void FillBox64RegsFromFexContext(const Lsx4FexGuestContextV3& context,
+                                 ExecutorBox64GuestRegsSnapshot& out) {
+    out = {};
+    std::copy(std::begin(context.gpr), std::end(context.gpr),
+              std::begin(out.regs));
+    out.rip = context.rip;
+    out.old_ip = context.rip;
+    out.fsbase = context.fs_base;
+    out.gsbase = context.gs_base;
+}
+
+void FillExtendedGuestContextFromFexContext(
+    const Lsx4FexGuestContextV3& context, ExecutorGuestContextSnapshotV2& out) {
+    out = {};
+    FillBox64RegsFromFexContext(context, out.legacy);
+    out.struct_size = sizeof(out);
+    out.magic = LSX4_GUEST_CONTEXT_SNAPSHOT_MAGIC;
+    out.version = LSX4_GUEST_CONTEXT_SNAPSHOT_VERSION;
+    out.context_flags = context.context_flags;
+    out.rflags = context.rflags;
+    out.mxcsr = context.mxcsr;
+    for (std::size_t index = 0; index < LSX4_FEX_GUEST_XMM_COUNT; ++index) {
+        out.xmm[index].low = context.xmm[index].low;
+        out.xmm[index].high = context.xmm[index].high;
+    }
+}
+
+void NativeLog(int priority, const char* format, ...);
+
+bool IsMonoPs4ModulePath(const std::filesystem::path& path) {
+    std::string filename = path.filename().string();
+    std::transform(filename.begin(), filename.end(), filename.begin(),
+                   [](const unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return filename == "mono-ps4.sprx" || filename == "mono-ps4.prx";
+}
+
+void RequireFexHleSignalSafepoints(const char* source, const char* detail = nullptr) {
+    bool expected = false;
+    if (g_fex_hle_signal_safepoints_required.compare_exchange_strong(
+            expected, true, std::memory_order_release, std::memory_order_relaxed)) {
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_FEX_HLE_SIGNAL_SAFEPOINT] stage=arm source=%s detail=%s",
+                  source != nullptr ? source : "unknown",
+                  detail != nullptr ? detail : "none");
+    }
+}
+
+void FillFexContextFromBox64Regs(const ExecutorBox64GuestRegsSnapshot& in,
+                                 Lsx4FexGuestContextV3& context) {
+    context = {};
+    context.struct_size = sizeof(context);
+    context.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+    std::copy(std::begin(in.regs), std::end(in.regs),
+              std::begin(context.gpr));
+    context.rip = in.rip;
+    context.fs_base = in.fsbase;
+    context.gs_base = in.gsbase;
+    context.context_flags = LSX4_FEX_CONTEXT_GPR_VALID |
+                            LSX4_FEX_CONTEXT_TLS_VALID;
+    context.guest_thread = reinterpret_cast<std::uint64_t>(
+        Libraries::Kernel::g_curthread);
+}
+
+bool IsExtendedGuestContextSnapshot(const void* data, std::size_t size) {
+    if (data == nullptr || size < sizeof(ExecutorGuestContextSnapshotV2)) {
+        return false;
+    }
+    const auto& extended =
+        *static_cast<const ExecutorGuestContextSnapshotV2*>(data);
+    return extended.struct_size == sizeof(extended) &&
+           extended.magic == LSX4_GUEST_CONTEXT_SNAPSHOT_MAGIC &&
+           extended.version == LSX4_GUEST_CONTEXT_SNAPSHOT_VERSION &&
+           extended.reserved == 0 &&
+           (extended.context_flags & ~kGuestContextKnownFlags) == 0;
+}
+
+void FillFexContextFromExtendedGuestContext(
+    const ExecutorGuestContextSnapshotV2& in, Lsx4FexGuestContextV3& context) {
+    FillFexContextFromBox64Regs(in.legacy, context);
+    context.context_flags = in.context_flags;
+    context.rflags = in.rflags;
+    context.mxcsr = in.mxcsr;
+    for (std::size_t index = 0; index < LSX4_FEX_GUEST_XMM_COUNT; ++index) {
+        context.xmm[index].low = in.xmm[index].low;
+        context.xmm[index].high = in.xmm[index].high;
+    }
+}
+
+bool ValidateFexHleAbiContract(const char* phase) {
+    std::string error;
+    if (Core::AeroLib::ValidateAndroidX64ResolvedHleAbis(&error)) {
+        return true;
+    }
+    NativeLog(ANDROID_LOG_ERROR,
+              "[EXECUTOR_FEX_HLE_ABI_GATE] phase=%s result=reject error=%s",
+              phase != nullptr ? phase : "?", error.c_str());
+    return false;
+}
+
+class ScopedFexCallbackBinding {
+public:
+    explicit ScopedFexCallbackBinding(const Lsx4FexBackendApiV3* const api)
+        : api_{api} {
+        if (api_ == nullptr || api_->get_guest_tls == nullptr ||
+            api_->bind_host_thread == nullptr || api_->set_guest_tls == nullptr ||
+            api_->unbind_host_thread == nullptr) {
+            status_ = LSX4_FEX_STATUS_INVALID_STATE;
+            return;
+        }
+
+        auto* const guest_thread = Libraries::Kernel::g_curthread;
+        if (guest_thread == nullptr || guest_thread->tcb == nullptr) {
+            status_ = LSX4_FEX_STATUS_INVALID_STATE;
+            return;
+        }
+        identity_ = MakeFexThreadIdentity(guest_thread);
+
+
+
+
+
+        Lsx4FexGuestTlsStateV3 current_tls{};
+        current_tls.struct_size = sizeof(current_tls);
+        current_tls.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+        const int probe_status = api_->get_guest_tls(
+            api_->backend_context, &identity_, &current_tls);
+        if (probe_status == LSX4_FEX_STATUS_OK) {
+            status_ = LSX4_FEX_STATUS_OK;
+            return;
+        }
+
+
+
+
+        if (probe_status != LSX4_FEX_STATUS_INVALID_ARGUMENT &&
+            probe_status != LSX4_FEX_STATUS_INVALID_STATE &&
+            probe_status != LSX4_FEX_STATUS_NOT_FOUND) {
+            status_ = probe_status;
+            return;
+        }
+
+        status_ = api_->bind_host_thread(api_->backend_context, &identity_);
+        if (status_ != LSX4_FEX_STATUS_OK) {
+            return;
+        }
+        owns_binding_ = true;
+
+        const auto tcb_base = reinterpret_cast<std::uint64_t>(guest_thread->tcb);
+        Lsx4FexGuestTlsStateV3 tls{};
+        tls.struct_size = sizeof(tls);
+        tls.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+        tls.target = identity_;
+        tls.fs_base = tcb_base;
+        tls.gs_base = tcb_base;
+        tls.tcb_base = tcb_base;
+        status_ = api_->set_guest_tls(api_->backend_context, &tls);
+        if (status_ != LSX4_FEX_STATUS_OK) {
+            const int unbind_status =
+                api_->unbind_host_thread(api_->backend_context);
+            owns_binding_ = false;
+            if (unbind_status != LSX4_FEX_STATUS_OK) {
+                NativeLog(ANDROID_LOG_ERROR,
+                          "[EXECUTOR_FEX_CALLBACK_BINDING] stage=tls-failure-unbind "
+                          "status=%d tlsStatus=%d guest=0x%llx hostTid=%lld",
+                          unbind_status, status_,
+                          static_cast<unsigned long long>(identity_.guest_thread),
+                          static_cast<long long>(identity_.host_tid));
+            }
+        }
+    }
+
+    ScopedFexCallbackBinding(const ScopedFexCallbackBinding&) = delete;
+    ScopedFexCallbackBinding& operator=(const ScopedFexCallbackBinding&) = delete;
+
+    ~ScopedFexCallbackBinding() {
+        if (owns_binding_) {
+            const int status = api_->unbind_host_thread(api_->backend_context);
+            if (status != LSX4_FEX_STATUS_OK) {
+                NativeLog(ANDROID_LOG_ERROR,
+                          "[EXECUTOR_FEX_CALLBACK_BINDING] stage=destructor-unbind "
+                          "status=%d guest=0x%llx hostTid=%lld",
+                          status,
+                          static_cast<unsigned long long>(identity_.guest_thread),
+                          static_cast<long long>(identity_.host_tid));
+            }
+        }
+    }
+
+    [[nodiscard]] int status() const {
+        return status_;
+    }
+
+    int Finish(const int callback_status) {
+        if (!owns_binding_) {
+            return callback_status;
+        }
+        const int unbind_status =
+            api_->unbind_host_thread(api_->backend_context);
+        owns_binding_ = false;
+        if (unbind_status != LSX4_FEX_STATUS_OK) {
+            NativeLog(ANDROID_LOG_ERROR,
+                      "[EXECUTOR_FEX_CALLBACK_BINDING] stage=finish-unbind "
+                      "status=%d callbackStatus=%d guest=0x%llx hostTid=%lld",
+                      unbind_status, callback_status,
+                      static_cast<unsigned long long>(identity_.guest_thread),
+                      static_cast<long long>(identity_.host_tid));
+        }
+        return callback_status == LSX4_FEX_STATUS_OK ? unbind_status
+                                                      : callback_status;
+    }
+
+private:
+    const Lsx4FexBackendApiV3* api_{};
+    Lsx4FexThreadIdentityV3 identity_{};
+    int status_{LSX4_FEX_STATUS_INVALID_STATE};
+    bool owns_binding_{};
+};
+
+int RunFexGuestCallbackN(const std::uint64_t function,
+                         const std::array<std::uint64_t, 6>& arguments,
+                         const std::uint32_t argument_count,
+                         std::uint64_t* const result_out) {
+    if (function == 0 || argument_count > arguments.size()) {
+        return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+    }
+    const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+    if (api == nullptr || api->run_guest_callback == nullptr) {
+        return LSX4_FEX_STATUS_INVALID_STATE;
+    }
+    ScopedFexCallbackBinding binding{api};
+    if (binding.status() != LSX4_FEX_STATUS_OK) {
+        return binding.status();
+    }
+    static std::atomic<std::uint64_t> next_callback_id{1};
+    Lsx4FexGuestCallbackRequestV3 request{};
+    request.struct_size = sizeof(request);
+    request.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+    request.callback_id = next_callback_id.fetch_add(1, std::memory_order_relaxed);
+    request.guest_function = function;
+
+
+
+
+
+
+    request.guest_rsp = 0;
+    std::copy_n(arguments.begin(), argument_count, std::begin(request.gpr));
+    request.return_class[0] = LSX4_FEX_SYSV_INTEGER;
+    request.return_class[1] = LSX4_FEX_SYSV_NO_CLASS;
+    request.return_eightbyte_count = 1;
+
+    Lsx4FexGuestCallbackResultV3 result{};
+    result.struct_size = sizeof(result);
+    result.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+    result.call_id = request.callback_id;
+    int status = api->run_guest_callback(
+        api->backend_context, &request, &result);
+    if (status != LSX4_FEX_STATUS_OK) {
+        return binding.Finish(status);
+    }
+    if (result.status != LSX4_FEX_STATUS_OK ||
+        result.call_id != request.callback_id) {
+        status = result.status != LSX4_FEX_STATUS_OK
+                     ? result.status
+                     : LSX4_FEX_STATUS_ABI_MISMATCH;
+        return binding.Finish(status);
+    }
+    if (result_out != nullptr) {
+        *result_out = result.rax;
+    }
+    return binding.Finish(LSX4_FEX_STATUS_OK);
+}
+
+int RunFexGuestCallback3(const std::uint64_t function,
+                         const std::uint64_t arg0,
+                         const std::uint64_t arg1,
+                         const std::uint64_t arg2,
+                         std::uint64_t* const result_out) {
+    return RunFexGuestCallbackN(function, {arg0, arg1, arg2, 0, 0, 0}, 3,
+                                result_out);
+}
 
 int TryGetCurrentGuestRegsSnapshot(ExecutorBox64GuestRegsSnapshot& out) {
     if (RuntimeGuestJitActive()) {
@@ -553,6 +1821,25 @@ int TryGetCurrentGuestRegsSnapshot(ExecutorBox64GuestRegsSnapshot& out) {
         FillBox64RegsFromJitState(state, out);
         return 0;
     }
+    if (RuntimeGuestFexActive()) {
+        const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+        if (api == nullptr || api->get_guest_context == nullptr) {
+            out = {};
+            return -1;
+        }
+        Lsx4FexGuestContextV3 context{};
+        context.struct_size = sizeof(context);
+        context.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+        const auto identity = MakeFexThreadIdentity();
+        const int status = api->get_guest_context(
+            api->backend_context, &identity, &context);
+        if (status != LSX4_FEX_STATUS_OK) {
+            out = {};
+            return status;
+        }
+        FillBox64RegsFromFexContext(context, out);
+        return 0;
+    }
     if (g_box64_get_current_guest_regs == nullptr) {
         out = {};
         return -1;
@@ -561,7 +1848,8 @@ int TryGetCurrentGuestRegsSnapshot(ExecutorBox64GuestRegsSnapshot& out) {
 }
 
 void PublishCurrentJitGcRegisterRootsAtHleBoundary() {
-    if (!ExecutorGcGuestRootsEnabled() || !RuntimeGuestJitActive()) {
+    if (!ExecutorGcGuestRootsEnabled() ||
+        (!RuntimeGuestJitActive() && !RuntimeGuestFexActive())) {
         return;
     }
 
@@ -685,6 +1973,8 @@ struct MappedEntryBoundaryProbe {
 };
 
 std::vector<HleTargetTelemetry> g_box64_hle_targets;
+std::unordered_map<std::uint64_t, std::uint64_t>
+    g_box64_hle_trampoline_by_native;
 std::string g_box64_embed_info =
     R"({"loaded":false,"reason":"embedded Box64 not loaded"})";
 std::string g_box64_mapped_entry_info =
@@ -971,7 +2261,7 @@ void NativeLog(const int, const char*, ...) {}
 void PreferPerformanceCpusForPrimaryGuest() {
 #if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
     (void)Common::ApplyCurrentThreadAffinity(
-        Common::ThreadAffinityClass::LatencyPerformance);
+        Common::ThreadAffinityClass::PrimaryGuest);
 #endif
 }
 
@@ -1081,6 +2371,178 @@ bool IsSupportedAndroidFixedSurfaceSize(const int width, const int height) {
            (width == 2880 && height == 1620);
 }
 
+struct AndroidRenderResolutionSelection {
+    u32 source_width{};
+    u32 source_height{};
+    u32 output_width{};
+    u32 output_height{};
+};
+
+std::optional<AndroidRenderResolutionSelection> LoadAndroidRenderResolutionSelection(
+    bool* version2_config_seen = nullptr) {
+    if (version2_config_seen != nullptr) {
+        *version2_config_seen = false;
+    }
+    if (g_root.empty()) {
+        return std::nullopt;
+    }
+    const auto config = std::filesystem::path(g_root) / "runtime-config" /
+                        "android-render-resolution.ini";
+    std::ifstream input(config);
+    if (!input) {
+        return std::nullopt;
+    }
+
+    int version = 0;
+    int fsr_enabled = 0;
+    int upscaler_mode = static_cast<int>(Config::UpscalerMode::Fsr1);
+    int sharp_bilinear_strength_milli = Config::getSharpBilinearStrength();
+    int bicubic_kernel = Config::getBicubicKernel();
+    int fsr1_rcas_enabled = Config::getRcasEnabled() ? 1 : 0;
+    int fsr1_rcas_sharpness_milli =
+        std::clamp(1000 - Config::getRcasAttenuation() / 2, 0, 1000);
+    int sgsr1_edge_sharpness_milli = Config::getSgsr1EdgeSharpness();
+    int nis_sharpness_milli = Config::getNisSharpness();
+    int sgsr2_temporal_stability_milli = Config::getSgsr2TemporalStability();
+    int arm_asr_sharpening = Config::getArmAsrSharpening() ? 1 : 0;
+    int arm_asr_sharpness_milli = Config::getArmAsrSharpness();
+    AndroidRenderResolutionSelection selection{};
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto separator = line.find('=');
+        if (separator == std::string::npos) {
+            continue;
+        }
+        const std::string key = line.substr(0, separator);
+        char* end = nullptr;
+        const unsigned long value = std::strtoul(line.c_str() + separator + 1, &end, 10);
+        if (end == line.c_str() + separator + 1) {
+            continue;
+        }
+        if (key == "version") {
+            version = static_cast<int>(value);
+        } else if (key == "fsr_enabled") {
+            fsr_enabled = static_cast<int>(value);
+        } else if (key == "upscaler_mode") {
+            upscaler_mode = static_cast<int>(value);
+        } else if (key == "source_width") {
+            selection.source_width = static_cast<u32>(value);
+        } else if (key == "source_height") {
+            selection.source_height = static_cast<u32>(value);
+        } else if (key == "output_width") {
+            selection.output_width = static_cast<u32>(value);
+        } else if (key == "output_height") {
+            selection.output_height = static_cast<u32>(value);
+        } else if (key == "sharp_bilinear_strength_milli") {
+            sharp_bilinear_strength_milli = static_cast<int>(value);
+        } else if (key == "bicubic_kernel") {
+            bicubic_kernel = static_cast<int>(value);
+        } else if (key == "fsr1_rcas_enabled") {
+            fsr1_rcas_enabled = static_cast<int>(value);
+        } else if (key == "fsr1_rcas_sharpness_milli") {
+            fsr1_rcas_sharpness_milli = static_cast<int>(value);
+        } else if (key == "sgsr1_edge_sharpness_milli") {
+            sgsr1_edge_sharpness_milli = static_cast<int>(value);
+        } else if (key == "nis_sharpness_milli") {
+            nis_sharpness_milli = static_cast<int>(value);
+        } else if (key == "sgsr2_temporal_stability_milli") {
+            sgsr2_temporal_stability_milli = static_cast<int>(value);
+        } else if (key == "arm_asr_sharpening") {
+            arm_asr_sharpening = static_cast<int>(value);
+        } else if (key == "arm_asr_sharpness_milli") {
+            arm_asr_sharpness_milli = static_cast<int>(value);
+        }
+    }
+    if (version2_config_seen != nullptr) {
+        *version2_config_seen = version == 2 || version == 3 || version == 4;
+    }
+    if (version == 2) {
+
+        upscaler_mode = static_cast<int>(Config::UpscalerMode::Fsr1);
+    }
+    if ((version == 2 || version == 3 || version == 4) &&
+        Config::IsValidUpscalerMode(upscaler_mode)) {
+        Config::setUpscalerMode(
+            fsr_enabled == 1 ? static_cast<Config::UpscalerMode>(upscaler_mode)
+                             : Config::UpscalerMode::Off,
+            true);
+    }
+    if (version == 4) {
+        Config::setSharpBilinearStrength(sharp_bilinear_strength_milli, true);
+        Config::setBicubicKernel(bicubic_kernel, true);
+        Config::setRcasEnabled(fsr1_rcas_enabled == 1, true);
+        Config::setRcasAttenuation(
+            2 * (1000 - std::clamp(fsr1_rcas_sharpness_milli, 0, 1000)), true);
+        Config::setSgsr1EdgeSharpness(sgsr1_edge_sharpness_milli, true);
+        Config::setNisSharpness(nis_sharpness_milli, true);
+        Config::setSgsr2TemporalStability(sgsr2_temporal_stability_milli, true);
+        Config::setArmAsrSharpening(arm_asr_sharpening == 1, true);
+        Config::setArmAsrSharpness(arm_asr_sharpness_milli, true);
+    }
+    const bool dynamic_native_output =
+        selection.output_width == 0 && selection.output_height == 0;
+    if ((version != 2 && version != 3 && version != 4) || fsr_enabled != 1 ||
+        upscaler_mode == static_cast<int>(Config::UpscalerMode::Off) ||
+        !IsSupportedAndroidFixedSurfaceSize(selection.source_width,
+                                            selection.source_height) ||
+        (!dynamic_native_output &&
+         !IsSupportedAndroidFixedSurfaceSize(selection.output_width,
+                                             selection.output_height))) {
+        return std::nullopt;
+    }
+    const std::uint64_t source_pixels =
+        static_cast<std::uint64_t>(selection.source_width) * selection.source_height;
+    const std::uint64_t output_pixels = dynamic_native_output
+        ? std::numeric_limits<std::uint64_t>::max()
+        : static_cast<std::uint64_t>(selection.output_width) * selection.output_height;
+    if (source_pixels >= output_pixels) {
+        return std::nullopt;
+    }
+    return selection;
+}
+
+std::pair<u32, u32> AndroidInternalResolutionForUpscaler(
+    const u32 output_width, const u32 output_height,
+    bool* explicit_selection = nullptr) {
+    if (explicit_selection != nullptr) {
+        *explicit_selection = false;
+    }
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    bool version2_config_seen = false;
+    const auto selection =
+        LoadAndroidRenderResolutionSelection(&version2_config_seen);
+    if (VideoCore::IsManagedMobileFsrEnabled()) {
+        if (selection) {
+            const bool dynamic_native_output =
+                selection->output_width == 0 && selection->output_height == 0;
+            if (dynamic_native_output ||
+                (selection->output_width == output_width &&
+                 selection->output_height == output_height)) {
+                if (explicit_selection != nullptr) {
+                    *explicit_selection = true;
+                }
+                return {selection->source_width, selection->source_height};
+            }
+        }
+        if (version2_config_seen) {
+            return {output_width, output_height};
+        }
+
+
+        if (output_width == 2880 && output_height == 1620) {
+            return {1920, 1080};
+        }
+        if (output_width == 1920 && output_height == 1080) {
+            return {1280, 720};
+        }
+        if (output_width == 1280 && output_height == 720) {
+            return {960, 544};
+        }
+    }
+#endif
+    return {output_width, output_height};
+}
+
 void ApplyAndroidFixedSurfaceToGameConfig(std::string_view title_id) {
     if (!g_surface_attached || g_native_window == nullptr || g_surface_width <= 0 ||
         g_surface_height <= 0) {
@@ -1092,7 +2554,14 @@ void ApplyAndroidFixedSurfaceToGameConfig(std::string_view title_id) {
         return;
     }
 
-    if (!IsSupportedAndroidFixedSurfaceSize(g_surface_width, g_surface_height)) {
+    const u32 output_width = static_cast<u32>(g_surface_width);
+    const u32 output_height = static_cast<u32>(g_surface_height);
+    bool explicit_selection = false;
+    const auto [internal_width, internal_height] =
+        AndroidInternalResolutionForUpscaler(output_width, output_height,
+                                             &explicit_selection);
+    if (!IsSupportedAndroidFixedSurfaceSize(g_surface_width, g_surface_height) &&
+        !explicit_selection) {
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_ANDROID_INTERNAL_RESOLUTION] status=skipped "
                   "reason=not_a_supported_fixed_size title=%.*s width=%d height=%d",
@@ -1100,14 +2569,21 @@ void ApplyAndroidFixedSurfaceToGameConfig(std::string_view title_id) {
                   g_surface_height);
         return;
     }
-
-    Config::setInternalScreenWidth(static_cast<u32>(g_surface_width), true);
-    Config::setInternalScreenHeight(static_cast<u32>(g_surface_height), true);
+    Config::setInternalScreenWidth(internal_width, true);
+    Config::setInternalScreenHeight(internal_height, true);
     NativeLog(ANDROID_LOG_INFO,
               "[EXECUTOR_ANDROID_INTERNAL_RESOLUTION] status=applied title=%.*s "
-              "width=%u height=%u source=android_fixed_surface",
+              "outputWidth=%u outputHeight=%u internalWidth=%u internalHeight=%u "
+              "upscaling=%d source=%s",
               static_cast<int>(title_id.size()), title_id.data(),
-              Config::getInternalScreenWidth(), Config::getInternalScreenHeight());
+              output_width, output_height, Config::getInternalScreenWidth(),
+              Config::getInternalScreenHeight(),
+              internal_width != output_width || internal_height != output_height ? 1 : 0,
+              explicit_selection
+                  ? "android_upscaler_explicit_pair"
+                  : internal_width != output_width || internal_height != output_height
+                  ? "android_upscaler_legacy_quality_step"
+                  : "android_fixed_surface");
 }
 #endif
 
@@ -1117,6 +2593,10 @@ void LoadAndroidGameSpecificConfig(std::string_view title_id) {
                   "[EXECUTOR_CONFIG_BRIDGE] phase=game status=skipped reason=empty_title");
         return;
     }
+    const std::size_t title_length =
+        std::min(title_id.size(), g_active_title_id.size() - 1);
+    std::memcpy(g_active_title_id.data(), title_id.data(), title_length);
+    g_active_title_id[title_length] = '\0';
     const auto config = Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) /
                         (std::string(title_id) + ".toml");
     std::error_code error;
@@ -1124,6 +2604,32 @@ void LoadAndroidGameSpecificConfig(std::string_view title_id) {
     Config::load(config, true);
 #ifdef __ANDROID__
     ApplyAndroidFixedSurfaceToGameConfig(title_id);
+
+    const char* live_quiet = std::getenv("EXECUTOR_LIVE_QUIET");
+    const bool live_quiet_enabled =
+        live_quiet != nullptr && live_quiet[0] != '\0' && std::strcmp(live_quiet, "0") != 0;
+    if (live_quiet_enabled) {
+        const auto gameplay_logging_marker =
+            std::filesystem::path(g_root) / "run-enable-gameplay-logging";
+        std::error_code marker_error;
+        const bool gameplay_logging_opt_in =
+            std::filesystem::is_regular_file(gameplay_logging_marker, marker_error) &&
+            !marker_error;
+        if (!gameplay_logging_opt_in) {
+
+
+
+
+
+            Config::setLoggingEnabled(false, true);
+        }
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_GAMEPLAY_LOGGING] liveQuiet=1 commonLogging=%d "
+                  "source=%s marker=%s",
+                  Config::getLoggingEnabled() ? 1 : 0,
+                  gameplay_logging_opt_in ? "explicit-opt-in" : "production-quiet",
+                  gameplay_logging_marker.string().c_str());
+    }
 #endif
     NativeLog(ANDROID_LOG_INFO,
               "[EXECUTOR_CONFIG_BRIDGE] phase=game status=%s title=%.*s config=%s "
@@ -1174,18 +2680,20 @@ extern "C" bool executor_lsx4_android_should_suppress_guest_thread(void* start_r
                                                                        const char* name) {
     (void)arg;
     const bool mapped_backend_active =
-        RuntimeGuestJitActive() || g_box64_guest_entry_active.load(std::memory_order_acquire);
+        RuntimeGuestJitActive() || RuntimeGuestFexActive() ||
+        g_box64_guest_entry_active.load(std::memory_order_acquire);
     if (!mapped_backend_active || start_routine == nullptr) {
         return false;
     }
     const auto start_address = reinterpret_cast<std::uint64_t>(start_routine);
-    auto* linker = Common::Singleton<Core::Linker>::Instance();
-    const bool is_guest_entry = linker != nullptr && linker->FindByAddress(start_address) != nullptr;
+    const bool is_guest_entry = IsGuestExecutableAddress(start_address);
     if (!is_guest_entry) {
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_HOST_THREAD_ROUTE] native start=%p name=%s jit=%d; "
+                  "[EXECUTOR_HOST_THREAD_ROUTE] native start=%p name=%s jit=%d fex=%d; "
                   "bypassing guest x86 dispatcher",
-                  start_routine, name ? name : "<unnamed>", RuntimeGuestJitActive() ? 1 : 0);
+                  start_routine, name ? name : "<unnamed>",
+                  RuntimeGuestJitActive() ? 1 : 0,
+                  RuntimeGuestFexActive() ? 1 : 0);
     }
     return is_guest_entry;
 }
@@ -1200,9 +2708,16 @@ extern "C" void executor_lsx4_android_note_suppressed_guest_thread(void* thread,
 }
 
 extern "C" bool executor_lsx4_android_should_suppress_guest_once(void* once_control,
-                                                                     void* init_routine) {
+                                                                      void* init_routine) {
     (void)once_control;
     (void)init_routine;
+
+
+
+
+    if (RuntimeGuestJitActive() || RuntimeGuestFexActive()) {
+        return false;
+    }
     return g_box64_guest_entry_active.load(std::memory_order_acquire) &&
            g_box64_run_mapped_function == nullptr;
 }
@@ -1748,7 +3263,7 @@ bool IsCurrentMappedEntryReadableAddressLocked(const std::uint64_t address) {
     if (FindGuestModuleByAddress(address) != nullptr) {
         return true;
     }
-    auto* memory = Core::Memory::Instance();
+    auto* memory = Core::Memory::TryInstance();
     return memory != nullptr && memory->IsValidMapping(address, 1);
 }
 
@@ -1925,7 +3440,7 @@ std::string ClassifyGuestAddressLocked(const std::uint64_t address) {
             }
         }
     }
-    auto* memory = Core::Memory::Instance();
+    auto* memory = Core::Memory::TryInstance();
     if (memory != nullptr && memory->IsValidMapping(address, 1)) {
         return "core_memory";
     }
@@ -1979,12 +3494,35 @@ bool IsJitRegisteredGuestRange(const std::uint64_t address, const std::size_t si
                                g_box64_boundary_probe.stack_size)) {
         return true;
     }
+    const std::uint64_t generation =
+        g_box64_guest_readable_generation.load(std::memory_order_acquire);
+    const ExecutorActiveGuestReadLease cached =
+        g_jit_registered_guest_range_cache;
+    if (cached.generation == generation &&
+        JitRangeContained(address, size, cached.base, cached.size)) {
+        return true;
+    }
     std::lock_guard stack_lock(g_box64_guest_stack_lock);
-    return std::any_of(g_box64_guest_readable_ranges.begin(),
-                       g_box64_guest_readable_ranges.end(),
-                       [&](const ExecutorGuestReadableRange& range) {
-                           return JitRangeContained(address, size, range.base, range.size);
-                       });
+    const auto match = std::find_if(
+        g_box64_guest_readable_ranges.begin(),
+        g_box64_guest_readable_ranges.end(),
+        [&](const ExecutorGuestReadableRange& range) {
+            return JitRangeContained(address, size, range.base, range.size);
+        });
+    if (match == g_box64_guest_readable_ranges.end()) {
+        return false;
+    }
+
+
+
+
+
+    g_jit_registered_guest_range_cache = {
+        .base = match->base,
+        .size = match->size,
+        .generation = generation,
+    };
+    return true;
 }
 
 bool IsJitOrdinaryGuestRange(const std::uint64_t address, const std::size_t size) {
@@ -1996,7 +3534,7 @@ bool IsJitOrdinaryGuestRange(const std::uint64_t address, const std::size_t size
     if (Lsx4::Translation::IsProcessImageMemory(address, size)) {
         return false;
     }
-    auto* memory = Core::Memory::Instance();
+    auto* memory = Core::Memory::TryInstance();
     if (memory == nullptr) {
         return false;
     }
@@ -2063,6 +3601,92 @@ bool IsJitSourceRangeWithoutProcMaps(const std::uint64_t address, const std::siz
            IsJitGuestRangeWithoutProcMaps(address, size);
 }
 
+bool TryReadActiveHleGuestStackLease(const std::uint64_t address,
+                                     void* const destination,
+                                     const std::size_t size) {
+    const ExecutorActiveGuestReadLease lease = g_active_hle_guest_read_lease;
+    if (destination == nullptr || lease.generation == 0 ||
+        lease.generation !=
+            g_box64_guest_readable_generation.load(std::memory_order_acquire) ||
+        !JitRangeContained(address, size, lease.base, lease.size)) {
+        return false;
+    }
+    std::memmove(destination, reinterpret_cast<const void*>(address), size);
+    return true;
+}
+
+bool IsActiveHleGuestReadLeaseRange(const std::uint64_t address,
+                                    const std::size_t size) {
+    const ExecutorActiveGuestReadLease lease = g_active_hle_guest_read_lease;
+    if (address == 0 || size == 0 || lease.generation == 0 ||
+        lease.generation !=
+            g_box64_guest_readable_generation.load(std::memory_order_acquire)) {
+        return false;
+    }
+    return JitRangeContained(address, size, lease.base, lease.size);
+}
+
+bool TryResolveExternalHleFrameSlot(const std::uint64_t stack_pointer,
+                                    std::uint64_t& slot_base) {
+    slot_base = 0;
+    if (stack_pointer == 0) {
+        return false;
+    }
+    std::lock_guard range_lock(g_box64_guest_stack_lock);
+    const auto pool = std::ranges::find_if(
+        g_box64_external_guest_mutable_ranges,
+        [&](const ExecutorGuestReadableRange& candidate) {
+            return candidate.size == Lsx4::FexHleLease::PoolSize &&
+                   (candidate.base & (Lsx4::FexHleLease::SlotSize - 1)) == 0 &&
+                   JitRangeContained(stack_pointer, sizeof(std::uint64_t),
+                                     candidate.base, candidate.size);
+        });
+    if (pool == g_box64_external_guest_mutable_ranges.end()) {
+        return false;
+    }
+    const std::uint64_t offset = stack_pointer - pool->base;
+    slot_base = pool->base +
+                (offset & ~std::uint64_t{Lsx4::FexHleLease::SlotSize - 1});
+    return JitRangeContained(slot_base, Lsx4::FexHleLease::SlotSize,
+                             pool->base, pool->size);
+}
+
+bool IsExternalGuestMutableRangeLocked(const std::uint64_t address,
+                                       const std::size_t size) {
+    if (address == 0 || size == 0) {
+        return false;
+    }
+    const auto range = std::ranges::find_if(
+        g_box64_external_guest_mutable_ranges,
+        [&](const ExecutorGuestReadableRange& candidate) {
+            return JitRangeContained(address, size, candidate.base,
+                                     candidate.size);
+        });
+    return range != g_box64_external_guest_mutable_ranges.end();
+}
+
+bool IsExternalGuestMutableRange(const std::uint64_t address,
+                                 const std::size_t size) {
+    std::lock_guard range_lock(g_box64_guest_stack_lock);
+    return IsExternalGuestMutableRangeLocked(address, size);
+}
+
+bool TryReadExternalGuestMutableRange(const std::uint64_t address,
+                                      void* const destination,
+                                      const std::size_t size) {
+    if (destination == nullptr ||
+        !IsExternalGuestMutableRange(address, size)) {
+        return false;
+    }
+
+
+
+
+
+    std::memmove(destination, reinterpret_cast<const void*>(address), size);
+    return true;
+}
+
 extern "C" bool ExecutorJitIsReadableGuestRange(const std::uint64_t address,
                                                        const std::size_t size) {
     if (address == 0 || size == 0) {
@@ -2073,7 +3697,12 @@ extern "C" bool ExecutorJitIsReadableGuestRange(const std::uint64_t address,
         static_cast<std::uint64_t>(size - 1) > ~std::uint64_t{0} - host_address) {
         return false;
     }
-    return IsJitSourceRangeWithoutProcMaps(host_address, size);
+
+
+
+    return IsJitSourceRangeWithoutProcMaps(host_address, size) ||
+           IsActiveHleGuestReadLeaseRange(host_address, size) ||
+           IsExternalGuestMutableRange(host_address, size);
 }
 
 extern "C" bool ExecutorJitReadGuestBytes(const std::uint64_t address, void* dst,
@@ -2084,8 +3713,30 @@ extern "C" bool ExecutorJitReadGuestBytes(const std::uint64_t address, void* dst
     const std::uint64_t host_address = JitCanonicalHostPointer(address);
     const std::uint64_t host_destination =
         JitCanonicalHostPointer(reinterpret_cast<std::uint64_t>(dst));
-    return Lsx4::Translation::ReadProcessGuestMemoryWithFaultDispatch(
-        host_address, reinterpret_cast<void*>(host_destination), size);
+    if (host_address == 0 ||
+        static_cast<std::uint64_t>(size - 1) > ~std::uint64_t{0} - host_address) {
+        return false;
+    }
+    auto* memory = Core::Memory::TryInstance();
+    if (memory != nullptr && memory->IsReadableMapping(host_address, size)) {
+
+
+        return Lsx4::Translation::ReadProcessGuestMemoryWithFaultDispatch(
+            host_address, reinterpret_cast<void*>(host_destination), size);
+    }
+    if (TryReadActiveHleGuestStackLease(
+            host_address, reinterpret_cast<void*>(host_destination), size)) {
+        return true;
+    }
+    if (TryReadExternalGuestMutableRange(
+            host_address, reinterpret_cast<void*>(host_destination), size)) {
+        return true;
+    }
+    if (IsJitRegisteredGuestRange(host_address, size)) {
+        return Lsx4::Translation::ReadProcessGuestMemory(
+            host_address, reinterpret_cast<void*>(host_destination), size);
+    }
+    return false;
 }
 
 extern "C" bool ExecutorJitReadGuestBytesStable(const std::uint64_t address, void* dst,
@@ -2096,8 +3747,27 @@ extern "C" bool ExecutorJitReadGuestBytesStable(const std::uint64_t address, voi
     const std::uint64_t host_address = JitCanonicalHostPointer(address);
     const std::uint64_t host_destination =
         JitCanonicalHostPointer(reinterpret_cast<std::uint64_t>(dst));
-    return IsJitGuestRangeWithoutProcMaps(host_address, size) &&
-           Lsx4::Translation::ReadProcessGuestMemoryWithFaultDispatch(
+    if (TryReadActiveHleGuestStackLease(
+            host_address, reinterpret_cast<void*>(host_destination), size)) {
+        return true;
+    }
+    if (TryReadExternalGuestMutableRange(
+            host_address, reinterpret_cast<void*>(host_destination), size)) {
+        return true;
+    }
+    auto* memory = Core::Memory::TryInstance();
+    if (memory != nullptr && memory->IsReadableMapping(host_address, size)) {
+
+
+
+
+
+        std::memmove(reinterpret_cast<void*>(host_destination),
+                     reinterpret_cast<const void*>(host_address), size);
+        return true;
+    }
+    return IsJitRegisteredGuestRange(host_address, size) &&
+           Lsx4::Translation::ReadProcessGuestMemory(
                host_address, reinterpret_cast<void*>(host_destination), size);
 }
 
@@ -2109,8 +3779,21 @@ extern "C" bool ExecutorJitWriteGuestBytes(const std::uint64_t address, const vo
     const std::uint64_t host_address = JitCanonicalHostPointer(address);
     const std::uint64_t host_source =
         JitCanonicalHostPointer(reinterpret_cast<std::uint64_t>(src));
-    return Lsx4::Translation::WriteProcessGuestMemoryWithFaultDispatch(
-        host_address, reinterpret_cast<const void*>(host_source), size);
+    if (host_address == 0 ||
+        static_cast<std::uint64_t>(size - 1) > ~std::uint64_t{0} - host_address) {
+        return false;
+    }
+    auto* memory = Core::Memory::TryInstance();
+    if (memory != nullptr && memory->IsWritableMapping(host_address, size)) {
+
+        return Lsx4::Translation::WriteProcessGuestMemoryWithFaultDispatch(
+            host_address, reinterpret_cast<const void*>(host_source), size);
+    }
+    if (IsJitRegisteredGuestRange(host_address, size)) {
+        return Lsx4::Translation::WriteProcessGuestMemory(
+            host_address, reinterpret_cast<const void*>(host_source), size);
+    }
+    return false;
 }
 
 bool GuestReadQwordDirectMspaceLocked(const std::uint64_t address, std::uint64_t& out) {
@@ -2148,7 +3831,7 @@ bool GuestWriteQwordBestEffortLocked(const std::uint64_t address, const std::uin
         return true;
     }
 #endif
-    auto* memory = Core::Memory::Instance();
+    auto* memory = Core::Memory::TryInstance();
     if (address == 0 || memory == nullptr || !memory->IsValidMapping(address, sizeof(value))) {
         return false;
     }
@@ -2233,6 +3916,9 @@ void RegisterBox64GuestReadableRange(const void* base, const std::size_t size,
         }
     }
     PublishJitRegisteredFullPages(address, size);
+    if (added) {
+        g_box64_guest_readable_generation.fetch_add(1, std::memory_order_release);
+    }
     static std::atomic_uint32_t readable_range_log_count{0};
     if (added && readable_range_log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
         NativeLog(ANDROID_LOG_INFO,
@@ -2267,6 +3953,60 @@ void RegisterBox64GuestStackRange(const void* base, const std::size_t size,
         MarkBox64GuestGcRootsDirty();
     }
     RegisterBox64GuestReadableRange(base, size, label ? label : "guest_stack");
+}
+
+void RegisterBox64ExternalGuestStackRange(const void* base,
+                                          const std::size_t size,
+                                          const char* label) {
+    RegisterBox64GuestStackRange(base, size, label);
+    const auto address = reinterpret_cast<std::uint64_t>(base);
+    if (address == 0 || size == 0) {
+        return;
+    }
+    std::lock_guard stack_lock(g_box64_guest_stack_lock);
+    const auto exists = std::any_of(
+        g_box64_external_guest_stack_ranges.begin(),
+        g_box64_external_guest_stack_ranges.end(),
+        [&](const ExecutorGuestReadableRange& range) {
+            return range.base == address && range.size == size;
+        });
+    if (!exists) {
+        g_box64_external_guest_stack_ranges.push_back(
+            ExecutorGuestReadableRange{address, static_cast<std::uint64_t>(size),
+                                       label ? label : "external_guest_stack"});
+    }
+}
+
+void RegisterBox64ExternalGuestMutableRange(const void* base,
+                                            const std::size_t size,
+                                            const char* label) {
+    const auto address = reinterpret_cast<std::uint64_t>(base);
+    if (address == 0 || size == 0 ||
+        address > std::numeric_limits<std::uint64_t>::max() - size) {
+        return;
+    }
+    bool added = false;
+    {
+        std::lock_guard range_lock(g_box64_guest_stack_lock);
+        const auto exists = std::any_of(
+            g_box64_external_guest_mutable_ranges.begin(),
+            g_box64_external_guest_mutable_ranges.end(),
+            [&](const ExecutorGuestReadableRange& range) {
+                return range.base == address && range.size == size;
+            });
+        if (!exists) {
+            g_box64_external_guest_mutable_ranges.push_back(
+                ExecutorGuestReadableRange{
+                    address, static_cast<std::uint64_t>(size),
+                    label ? label : "external_guest_mutable"});
+            added = true;
+        }
+    }
+    if (added) {
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_GUEST_MUTABLE_RANGE] base=%p size=0x%zx label=%s",
+                  base, size, label ? label : "external_guest_mutable");
+    }
 }
 
 void RegisterBox64GuestGcSidebandRange(const void* base, const std::size_t size,
@@ -2620,7 +4360,10 @@ bool ExecutorMappedEntryHleHistoryEnabled() {
             return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
         };
         return flag("EXECUTOR_TRACE_MAPPED_ENTRY_HLE_HISTORY") ||
-               flag("EXECUTOR_VERBOSE_HLE_BOUNDARY_RESULT");
+               flag("EXECUTOR_VERBOSE_HLE_BOUNDARY_RESULT") ||
+               (!g_root.empty() && std::filesystem::exists(
+                   std::filesystem::path(g_root) / "translator" /
+                   "trace-mapped-entry-hle"));
     }();
     return enabled;
 }
@@ -3053,7 +4796,7 @@ void RecordMappedEntryHleBoundary(const char* name, const char* symbol_name,
     g_box64_boundary_probe.last_hle_return_offset = module_offset;
 
     static std::atomic_int log_budget{32};
-    const bool trace_hle = std::getenv("EXECUTOR_TRACE_LIVE_HLE") != nullptr;
+    static const bool trace_hle = std::getenv("EXECUTOR_TRACE_LIVE_HLE") != nullptr;
     if ((trace_hle || first) &&
         log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
         NativeLog(ANDROID_LOG_INFO,
@@ -3135,7 +4878,7 @@ void RecordMappedEntryHleResult(const char* name, const char* symbol_name,
             has("sceSystemService") || has("sceSaveData") || has("Fios") || has("File");
         static std::atomic_int light_boundary_budget{384};
         static std::atomic_int verbose_boundary_budget{12000};
-        const bool verbose =
+        static const bool verbose =
             std::getenv("EXECUTOR_TRACE_LIVE_HLE") != nullptr ||
             std::getenv("EXECUTOR_TRACE_LIVE_WIDE") != nullptr ||
             std::getenv("EXECUTOR_VERBOSE_HLE_BOUNDARY_RESULT") != nullptr;
@@ -3204,7 +4947,9 @@ void RecordMappedEntryHleResult(const char* name, const char* symbol_name,
                                 (high32 == 0 || high32 == 0xFFFFFFFFull);
         if (error_like) {
             const bool expected_libc_compare_result = IsLibcCompareHleTarget(name, symbol_name);
-            if (expected_libc_compare_result && std::getenv("EXECUTOR_TRACE_LIBC_COMPARE_ERRORS") == nullptr) {
+            static const bool trace_libc_compare_errors =
+                std::getenv("EXECUTOR_TRACE_LIBC_COMPARE_ERRORS") != nullptr;
+            if (expected_libc_compare_result && !trace_libc_compare_errors) {
                 return;
             }
             const std::string_view n = name ? name : "";
@@ -3217,13 +4962,16 @@ void RecordMappedEntryHleResult(const char* name, const char* symbol_name,
                 low32 == 0x80020010ull &&
                 (has("pthread_mutex_trylock") || has("posix_pthread_mutex_trylock") ||
                  has("upoVrzMHFeE"));
-            if (!expected_trylock_busy ||
-                std::getenv("EXECUTOR_VERBOSE_HLE_TRYLOCK_BUSY") != nullptr) {
+            static const bool verbose_trylock_busy =
+                std::getenv("EXECUTOR_VERBOSE_HLE_TRYLOCK_BUSY") != nullptr;
+            if (!expected_trylock_busy || verbose_trylock_busy) {
                 g_conformance.hle_error_count.fetch_add(1, std::memory_order_relaxed);
                 static std::atomic_int hle_error_budget{6000};
                 static std::atomic_int hle_error_light_budget{24};
+                static const bool verbose_hle_err =
+                    std::getenv("EXECUTOR_VERBOSE_HLE_ERR") != nullptr;
                 const bool quiet_light_hle_errors =
-                    ExecutorLightOracleMode() && std::getenv("EXECUTOR_VERBOSE_HLE_ERR") == nullptr;
+                    ExecutorLightOracleMode() && !verbose_hle_err;
                 const int hle_error_budget_before =
                     quiet_light_hle_errors
                         ? hle_error_light_budget.fetch_sub(1, std::memory_order_relaxed)
@@ -3265,7 +5013,8 @@ void RecordMappedEntryHleResult(const char* name, const char* symbol_name,
         }
     }
 
-    if (std::getenv("EXECUTOR_TRACE_MONO_HLE") != nullptr && module != nullptr &&
+    static const bool trace_mono_hle = std::getenv("EXECUTOR_TRACE_MONO_HLE") != nullptr;
+    if (trace_mono_hle && module != nullptr &&
         module->file.string().find("mono-ps4") != std::string::npos) {
         static std::atomic_int mono_hle_result_budget{12000};
         if (mono_hle_result_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
@@ -3407,7 +5156,9 @@ bool IsPs4StoreModule(const Core::Module& module) {
 
 extern "C" bool executor_lsx4_android_should_relax_guest_mutex(void* mutex) {
     const auto address = reinterpret_cast<std::uint64_t>(mutex);
-    if (std::getenv("EXECUTOR_TOLERATE_LOW_GUEST_MUTEX") != nullptr && address < 0x10000) {
+    static const bool tolerate_low_guest_mutex =
+        std::getenv("EXECUTOR_TOLERATE_LOW_GUEST_MUTEX") != nullptr;
+    if (tolerate_low_guest_mutex && address < 0x10000) {
         static std::atomic_int log_budget{64};
         if (log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
             NativeLog(ANDROID_LOG_INFO,
@@ -3438,49 +5189,69 @@ extern "C" bool executor_lsx4_android_should_relax_guest_mutex(void* mutex) {
     return true;
 }
 
-extern "C" bool executor_lsx4_android_should_fail_guest_thread_create(void* start_routine,
-                                                                         void* arg,
-                                                                         const char* name) {
-    if (name && std::strcmp(name, "UnityWorker") == 0) {
-        const char* limit_env = std::getenv("EXECUTOR_LIVE_UNITY_WORKER_LIMIT");
-        if (limit_env && limit_env[0] != '\0') {
-            char* end = nullptr;
-            const long limit = std::strtol(limit_env, &end, 10);
-            if (end != limit_env && limit >= 0 && limit < 64) {
-                static std::atomic_int unity_worker_create_count{0};
-                const int index =
-                    unity_worker_create_count.fetch_add(1, std::memory_order_acq_rel);
-                if (index >= limit) {
-                    NativeLog(ANDROID_LOG_WARN,
-                              "[EXECUTOR_LIVE_UNITY_WORKER_LIMIT] action=fail_create "
-                              "index=%d limit=%ld start=%p arg=%p",
-                              index, limit, start_routine, arg);
-                    return true;
-                }
-                NativeLog(ANDROID_LOG_INFO,
-                          "[EXECUTOR_LIVE_UNITY_WORKER_LIMIT] action=allow index=%d "
-                          "limit=%ld start=%p arg=%p",
-                          index, limit, start_routine, arg);
-            }
-        }
+namespace {
+struct GuestWorkerAdmissionState {
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::unordered_set<void*> active;
+};
+
+GuestWorkerAdmissionState& GuestWorkerAdmissions() {
+    static GuestWorkerAdmissionState state;
+    return state;
+}
+
+bool IsCpuLimitedGuestWorkerName(const char* name) {
+    if (name == nullptr || *name == '\0') {
+        return false;
+    }
+    std::string normalized{name};
+    std::ranges::transform(normalized, normalized.begin(),
+                           [](const unsigned char ch) {
+                               return static_cast<char>(std::tolower(ch));
+                           });
+    const bool worker = normalized.find("worker") != std::string::npos ||
+                        normalized.find("jobthread") != std::string::npos ||
+                        normalized.find("job thread") != std::string::npos;
+    if (!worker) {
+        return false;
     }
 
+
+
+
+
+
+
+
+
+
+    const bool graphics_service = normalized.starts_with("unitygfx") ||
+                                  normalized.find("gfxdeviceworker") !=
+                                      std::string::npos;
+    const bool enlighten_service =
+        normalized.find("enlightenworker") != std::string::npos;
+    return !graphics_service && !enlighten_service;
+}
+}
+
+extern "C" bool executor_lsx4_android_should_fail_guest_thread_create(
+    void* start_routine, void* arg, const char* name) {
     const auto start = reinterpret_cast<std::uint64_t>(start_routine);
     auto* module = FindGuestModuleByAddress(start);
-    if (!module || !IsPs4StoreModule(*module)) {
-        return false;
+    if (module && IsPs4StoreModule(*module) &&
+        GuestModuleOffset(*module, start) == 0x1ba9c0) {
+        NativeLog(
+            ANDROID_LOG_INFO,
+            "[EXECUTOR_PTHREAD_CREATE] forcing pthread_create failure for PS4 Store "
+            "SQLite worker start=%p offset=0x1ba9c0 arg=%p name=%s bytes=%s; "
+            "SQLite will run xTask synchronously",
+            start_routine, arg, name ? name : "<unnamed>",
+            GuestBytesHex(start, 16).c_str());
+        return true;
     }
 
-    const auto offset = GuestModuleOffset(*module, start);
-    if (offset != 0x1ba9c0) {
-        return false;
-    }
-
-    NativeLog(ANDROID_LOG_INFO,
-              "[EXECUTOR_PTHREAD_CREATE] forcing pthread_create failure for PS4 Store SQLite worker start=%p offset=0x%llx arg=%p name=%s bytes=%s; SQLite will run xTask synchronously",
-              start_routine, static_cast<unsigned long long>(offset), arg,
-              name ? name : "<unnamed>", GuestBytesHex(start, 16).c_str());
-    return true;
+    return false;
 }
 
 static bool RepairUnityPreloadControlBlockForPcContract(std::uint64_t arg_base,
@@ -3500,7 +5271,9 @@ extern "C" void executor_lsx4_android_note_guest_thread_create(void* thread,
                                                                   const char* name) {
     static std::atomic<std::uint32_t> thread_create_trace_count{0};
     const bool trace_thread_create =
-        thread_create_trace_count.fetch_add(1, std::memory_order_relaxed) < 4;
+        thread_create_trace_count.fetch_add(1, std::memory_order_relaxed) < 4 ||
+        std::getenv("EXECUTOR_TRACE_FEX_GAME_MAIN_LATE") != nullptr ||
+        std::getenv("EXECUTOR_TRACE_EXIT8_TASKGRAPH_BOUNDARY") != nullptr;
     const auto start = reinterpret_cast<std::uint64_t>(start_routine);
     auto* module = FindGuestModuleByAddress(start);
     if (module) {
@@ -3511,6 +5284,114 @@ extern "C" void executor_lsx4_android_note_guest_thread_create(void* thread,
                       thread, start_routine, static_cast<unsigned long long>(offset), arg,
                       name ? name : "<unnamed>", module->file.string().c_str(),
                       GuestBytesHex(start, 16).c_str());
+        }
+        if (trace_thread_create && offset == 0x2a330 && arg != nullptr) {
+            const auto object = reinterpret_cast<std::uint64_t>(arg);
+            std::uint64_t vtable = 0;
+            std::uint64_t run_method = 0;
+            std::uint64_t exit_method = 0;
+            std::uint64_t runnable = 0;
+            std::uint64_t completion = 0;
+            std::uint64_t runnable_vtable = 0;
+            std::uint64_t completion_vtable = 0;
+            std::uint64_t runnable_init = 0;
+            std::uint64_t runnable_run = 0;
+            std::uint64_t runnable_exit = 0;
+            std::uint64_t completion_notify = 0;
+            std::uint64_t thread_name_storage = 0;
+            const bool have_vtable =
+                GuestReadQwordBestEffortLocked(object, vtable);
+            const bool have_run =
+                have_vtable &&
+                GuestReadQwordBestEffortLocked(vtable + 0x90, run_method);
+            const bool have_exit =
+                have_vtable &&
+                GuestReadQwordBestEffortLocked(vtable + 0x98, exit_method);
+            const bool have_runnable =
+                GuestReadQwordBestEffortLocked(object + 0x18, runnable);
+            const bool have_completion =
+                GuestReadQwordBestEffortLocked(object + 0x20, completion);
+            const bool have_runnable_vtable =
+                have_runnable && runnable != 0 &&
+                GuestReadQwordBestEffortLocked(runnable, runnable_vtable);
+            const bool have_completion_vtable =
+                have_completion && completion != 0 &&
+                GuestReadQwordBestEffortLocked(completion, completion_vtable);
+            (void)(have_runnable_vtable &&
+                   GuestReadQwordBestEffortLocked(runnable_vtable, runnable_init));
+            (void)(have_runnable_vtable &&
+                   GuestReadQwordBestEffortLocked(runnable_vtable + 0x08, runnable_run));
+            (void)(have_runnable_vtable &&
+                   GuestReadQwordBestEffortLocked(runnable_vtable + 0x18, runnable_exit));
+            (void)(have_completion_vtable &&
+                   GuestReadQwordBestEffortLocked(completion_vtable + 0x10,
+                                                  completion_notify));
+            (void)GuestReadQwordBestEffortLocked(object + 0x08,
+                                                 thread_name_storage);
+            auto* const run_module =
+                have_run ? FindGuestModuleByAddress(run_method) : nullptr;
+            auto* const exit_module =
+                have_exit ? FindGuestModuleByAddress(exit_method) : nullptr;
+            auto* const runnable_run_module =
+                runnable_run != 0 ? FindGuestModuleByAddress(runnable_run) : nullptr;
+            const auto runnable_run_offset =
+                runnable_run_module != nullptr
+                    ? GuestModuleOffset(*runnable_run_module, runnable_run)
+                    : 0;
+            if (runnable_run_offset == 0x2c9fc0) {
+                g_exit8_async_loading_guest_thread.store(
+                    reinterpret_cast<std::uint64_t>(thread),
+                    std::memory_order_release);
+                g_exit8_async_loading_runnable.store(runnable,
+                                                     std::memory_order_release);
+            }
+            if (runnable_run_offset == 0x962b20) {
+                g_exit8_render_guest_thread.store(
+                    reinterpret_cast<std::uint64_t>(thread),
+                    std::memory_order_release);
+                g_exit8_render_runnable.store(runnable,
+                                              std::memory_order_release);
+            }
+            NativeLog(
+                ANDROID_LOG_INFO,
+                "[EXECUTOR_UE_THREAD_OBJECT] thread=%p name=%s object=%p "
+                "qwords=%s vtable=0x%llx run=0x%llx runOffset=0x%llx "
+                "runModule=%s exit=0x%llx exitOffset=0x%llx exitModule=%s "
+                "runnable=0x%llx runnableQwords=%s runnableVtable=0x%llx "
+                "runnableInit=0x%llx runnableRun=0x%llx runnableExit=0x%llx "
+                "completion=0x%llx completionQwords=%s completionVtable=0x%llx "
+                "completionNotify=0x%llx threadNameStorage=0x%llx "
+                "threadNameBytes=%s asyncLoading=%d",
+                thread, name ? name : "<unnamed>", arg,
+                GuestQwordsHexBestEffortLocked(object, 8).c_str(),
+                static_cast<unsigned long long>(vtable),
+                static_cast<unsigned long long>(run_method),
+                static_cast<unsigned long long>(
+                    run_module ? GuestModuleOffset(*run_module, run_method) : 0),
+                run_module ? run_module->file.string().c_str() : "<unknown>",
+                static_cast<unsigned long long>(exit_method),
+                static_cast<unsigned long long>(
+                    exit_module ? GuestModuleOffset(*exit_module, exit_method) : 0),
+                exit_module ? exit_module->file.string().c_str() : "<unknown>",
+                static_cast<unsigned long long>(runnable),
+                have_runnable && runnable != 0
+                    ? GuestQwordsHexBestEffortLocked(runnable, 8).c_str()
+                    : "<unavailable>",
+                static_cast<unsigned long long>(runnable_vtable),
+                static_cast<unsigned long long>(runnable_init),
+                static_cast<unsigned long long>(runnable_run),
+                static_cast<unsigned long long>(runnable_exit),
+                static_cast<unsigned long long>(completion),
+                have_completion && completion != 0
+                    ? GuestQwordsHexBestEffortLocked(completion, 8).c_str()
+                    : "<unavailable>",
+                static_cast<unsigned long long>(completion_vtable),
+                static_cast<unsigned long long>(completion_notify),
+                static_cast<unsigned long long>(thread_name_storage),
+                thread_name_storage != 0
+                    ? GuestBytesHex(thread_name_storage, 64).c_str()
+                    : "<unavailable>",
+                runnable_run_offset == 0x2c9fc0 ? 1 : 0);
         }
         if (offset == 0x51c20) {
             const auto arg_base = reinterpret_cast<std::uint64_t>(arg);
@@ -4007,11 +5888,21 @@ std::uint64_t GuestStackArg(const std::uint64_t guest_rsp, const std::size_t ind
     if (guest_rsp == 0) {
         return 0;
     }
+    constexpr std::uint64_t kWordSize = sizeof(std::uint64_t);
+    if (index == std::numeric_limits<std::size_t>::max()) {
+        return 0;
+    }
+    const auto word_index = static_cast<std::uint64_t>(index) + 1;
+    if (word_index > std::numeric_limits<std::uint64_t>::max() / kWordSize) {
+        return 0;
+    }
+    const std::uint64_t offset = word_index * kWordSize;
+    if (offset > std::numeric_limits<std::uint64_t>::max() - guest_rsp) {
+        return 0;
+    }
     std::uint64_t value = 0;
-    const auto* slot =
-        reinterpret_cast<const void*>(guest_rsp + sizeof(std::uint64_t) * (index + 1));
-    std::memcpy(&value, slot, sizeof(value));
-    return value;
+    const std::uint64_t slot = guest_rsp + offset;
+    return ExecutorJitReadGuestBytes(slot, &value, sizeof(value)) ? value : 0;
 }
 
 std::uint64_t GuestReturnAddress(const std::uint64_t guest_rsp) {
@@ -4019,8 +5910,7 @@ std::uint64_t GuestReturnAddress(const std::uint64_t guest_rsp) {
         return 0;
     }
     std::uint64_t value = 0;
-    std::memcpy(&value, reinterpret_cast<const void*>(guest_rsp), sizeof(value));
-    return value;
+    return ExecutorJitReadGuestBytes(guest_rsp, &value, sizeof(value)) ? value : 0;
 }
 
 static bool ExecutorConformanceBadPtrIsLow(std::uint64_t ptr) {
@@ -4548,7 +6438,7 @@ void RecordLibcCompareBadPtr(const char* name, const char* symbol_name,
         return;
     }
 
-    auto* memory = Core::Memory::Instance();
+    auto* memory = Core::Memory::TryInstance();
     const auto mapped_or_memory_readable = [&](std::uint64_t address) {
         return IsCurrentMappedEntryReadableAddressLocked(address) ||
                (memory != nullptr && memory->IsValidMapping(address, 1));
@@ -4723,11 +6613,14 @@ void RecordLiveHleCallsite(const char* name, const char* symbol_name,
         (symbol_name && (std::strstr(symbol_name, "sceGnm") ||
                          std::strstr(symbol_name, "sceAgc")));
     const bool sampled = seq < 12000 || (seq != 0 && (seq & (seq - 1)) == 0);
-    if (ExecutorLightOracleMode() && !gate_critical &&
-        std::getenv("EXECUTOR_VERBOSE_HLE_CALLSITE") == nullptr) {
+
+
+    static const bool verbose_hle_callsite =
+        std::getenv("EXECUTOR_VERBOSE_HLE_CALLSITE") != nullptr;
+    if (ExecutorLightOracleMode() && !gate_critical && !verbose_hle_callsite) {
         return;
     }
-    const bool verbose_hle = std::getenv("EXECUTOR_VERBOSE_HLE_CALLSITE") != nullptr;
+    const bool verbose_hle = verbose_hle_callsite;
     if ((gate_critical && (verbose_hle || seq < 12000)) || sampled) {
         NativeLog(
             ANDROID_LOG_INFO,
@@ -4769,6 +6662,7 @@ std::atomic<std::uint64_t> g_live_hle_flight_seq{0};
 struct ExecutorCurrentHleContext {
     std::uint64_t guest_rsp = 0;
     std::uint64_t guest_return = 0;
+    bool guest_return_resolved = false;
     std::array<std::uint64_t, 8> floating_arguments{};
     const char* name = nullptr;
     const char* symbol = nullptr;
@@ -4785,7 +6679,13 @@ struct ScopedExecutorCurrentHleContext {
         : previous(g_executor_current_hle_context) {
         g_executor_current_hle_context = {
             .guest_rsp = guest_rsp,
-            .guest_return = GuestReturnAddress(guest_rsp),
+
+
+
+
+
+            .guest_return = 0,
+            .guest_return_resolved = false,
             .floating_arguments = floating_arguments,
             .name = name,
             .symbol = symbol,
@@ -5048,6 +6948,11 @@ extern "C" int executor_live_get_current_hle_call_site(std::uint64_t* guest_retu
                                                        std::size_t module_size) {
     if (g_executor_current_hle_context.guest_rsp != 0) {
         if (guest_return != nullptr) {
+            if (!g_executor_current_hle_context.guest_return_resolved) {
+                g_executor_current_hle_context.guest_return = GuestReturnAddress(
+                    g_executor_current_hle_context.guest_rsp);
+                g_executor_current_hle_context.guest_return_resolved = true;
+            }
             *guest_return = g_executor_current_hle_context.guest_return;
         }
         if (return_off != nullptr) {
@@ -5222,9 +7127,50 @@ extern "C" void executor_live_log_fiber_transition(
 extern "C" void executor_live_dump_current_hle_context(const char* reason,
                                                        const std::uint64_t focus) {
     const auto tid = static_cast<std::uint32_t>(syscall(SYS_gettid));
+    const char* const dump_reason = reason && reason[0] ? reason : "<unknown>";
+    const auto append_durable_dump = [&](const auto& writer) {
+        static std::mutex dump_mutex;
+        std::lock_guard dump_lock{dump_mutex};
+        if (std::FILE* trace = std::fopen(
+                "/data/data/app.lsx4.android/files/lsx4-home/diagnostic-hle-abort.txt", "a");
+            trace != nullptr) {
+            writer(trace);
+            std::fflush(trace);
+            std::fclose(trace);
+        }
+    };
     ExecutorLiveHleFlightEntry entry{};
     bool found = false;
-    {
+
+
+
+
+
+    if (g_executor_current_hle_context.guest_rsp != 0) {
+        entry.tid = tid;
+        entry.rsp = g_executor_current_hle_context.guest_rsp;
+        entry.guest_return = GuestReturnAddress(entry.rsp);
+        pthread_getname_np(pthread_self(), entry.thread, sizeof(entry.thread));
+        std::snprintf(
+            entry.name, sizeof(entry.name), "%s",
+            g_executor_current_hle_context.name
+                ? g_executor_current_hle_context.name
+                : "<current-hle-boundary>");
+        std::snprintf(
+            entry.symbol, sizeof(entry.symbol), "%s",
+            g_executor_current_hle_context.symbol
+                ? g_executor_current_hle_context.symbol
+                : "<current-hle-boundary>");
+        if (Core::Module* module = FindGuestModuleByAddress(entry.guest_return)) {
+            entry.return_off = GuestModuleOffset(*module, entry.guest_return);
+            const auto module_base = ExecutorBasenameForFlight(module->file.string());
+            std::snprintf(entry.module, sizeof(entry.module), "%s", module_base.c_str());
+        } else {
+            std::snprintf(entry.module, sizeof(entry.module), "%s", "<unknown>");
+        }
+        found = true;
+    }
+    if (!found) {
         std::lock_guard lock(g_live_hle_flight_lock);
         if (const auto it = g_live_hle_inflight.find(tid); it != g_live_hle_inflight.end()) {
             entry = it->second;
@@ -5249,8 +7195,12 @@ extern "C" void executor_live_dump_current_hle_context(const char* reason,
     if (!found) {
         NativeLog(ANDROID_LOG_WARN,
                   "[EXECUTOR_HLE_CONTEXT_DUMP] reason=%s found=0 tid=%u focus=%p",
-                  reason && reason[0] ? reason : "<unknown>", tid,
+                  dump_reason, tid,
                   reinterpret_cast<void*>(focus));
+        append_durable_dump([&](std::FILE* trace) {
+            std::fprintf(trace, "reason=%s found=0 tid=%u focus=0x%llx\n", dump_reason,
+                         tid, static_cast<unsigned long long>(focus));
+        });
         return;
     }
 
@@ -5274,7 +7224,7 @@ extern "C" void executor_live_dump_current_hle_context(const char* reason,
               "name=%s symbol=%s native=%p ret=%p off=0x%llx module=%s "
               "args=%p,%p,%p,%p,%p,%p rsp=%p focus=%p "
               "stack=%s retCtx=%s focusCtx=%s",
-              reason && reason[0] ? reason : "<unknown>",
+              dump_reason,
               static_cast<unsigned long long>(entry.seq), entry.tid,
               entry.thread[0] ? entry.thread : "<unnamed>", entry.name, entry.symbol,
               reinterpret_cast<void*>(entry.native_function),
@@ -5288,6 +7238,31 @@ extern "C" void executor_live_dump_current_hle_context(const char* reason,
               reinterpret_cast<void*>(entry.args[4]), reinterpret_cast<void*>(entry.args[5]),
               reinterpret_cast<void*>(entry.rsp), reinterpret_cast<void*>(focus),
               stack_bytes.c_str(), ret_context_bytes.c_str(), focus_bytes.c_str());
+    append_durable_dump([&](std::FILE* trace) {
+        std::fprintf(
+            trace,
+            "reason=%s found=1 seq=%llu tid=%u thread=\"%s\" name=\"%s\" symbol=\"%s\" "
+            "native=0x%llx ret=0x%llx off=0x%llx module=\"%s\" "
+            "args=0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx rsp=0x%llx "
+            "focus=0x%llx\nstack=%s\nretCtx=%s\nfocusCtx=%s\n",
+            dump_reason, static_cast<unsigned long long>(entry.seq), entry.tid,
+            entry.thread[0] ? entry.thread : "<unnamed>", entry.name, entry.symbol,
+            static_cast<unsigned long long>(entry.native_function),
+            static_cast<unsigned long long>(entry.guest_return),
+            ret_module ? static_cast<unsigned long long>(
+                             GuestModuleOffset(*ret_module, entry.guest_return))
+                       : 0ull,
+            ret_module ? ret_module->file.string().c_str() : "<unknown>",
+            static_cast<unsigned long long>(entry.args[0]),
+            static_cast<unsigned long long>(entry.args[1]),
+            static_cast<unsigned long long>(entry.args[2]),
+            static_cast<unsigned long long>(entry.args[3]),
+            static_cast<unsigned long long>(entry.args[4]),
+            static_cast<unsigned long long>(entry.args[5]),
+            static_cast<unsigned long long>(entry.rsp),
+            static_cast<unsigned long long>(focus), stack_bytes.c_str(),
+            ret_context_bytes.c_str(), focus_bytes.c_str());
+    });
 }
 
 bool IsAbortHleTarget(const char* name, const char* symbol_name) {
@@ -5763,6 +7738,108 @@ struct ScopedExecutorHleGuestThreadBind {
     }
 };
 
+struct ExecutorHleBoundaryPrelude {
+    ExecutorHleBoundaryPrelude() {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        PublishCurrentJitGcRegisterRootsAtHleBoundary();
+    }
+};
+
+struct ScopedExecutorHleGuestReadLease {
+    ExecutorActiveGuestReadLease previous = g_active_hle_guest_read_lease;
+
+    ScopedExecutorHleGuestReadLease(const std::uint64_t guest_rsp,
+                                    const std::uint64_t guest_thread) {
+        const std::uint64_t stack_pointer = JitCanonicalHostPointer(guest_rsp);
+        const std::uint64_t generation =
+            g_box64_guest_readable_generation.load(std::memory_order_acquire);
+        if (generation == 0) {
+            return;
+        }
+
+        auto* const thread = reinterpret_cast<Libraries::Kernel::Pthread*>(guest_thread);
+        if (thread != nullptr && thread->attr.stackaddr_attr != nullptr &&
+            thread->attr.stacksize_attr != 0) {
+            const std::uint64_t base = JitCanonicalHostPointer(
+                reinterpret_cast<std::uint64_t>(thread->attr.stackaddr_attr));
+            const std::uint64_t size = thread->attr.stacksize_attr;
+            const std::uint64_t page_base = stack_pointer & ~JitRegisteredPageMask;
+            if (JitRangeContained(stack_pointer, sizeof(std::uint64_t), base, size) &&
+                JitRangeContained(page_base, JitRegisteredPageSize, base, size) &&
+                IsJitRegisteredPageCached(stack_pointer, sizeof(std::uint64_t))) {
+                g_active_hle_guest_read_lease = {
+                    .base = page_base,
+                    .size = JitRegisteredPageSize,
+                    .generation = generation,
+                };
+                return;
+            }
+        }
+
+
+
+
+        std::uint64_t slot_base = 0;
+        if (!TryResolveExternalHleFrameSlot(stack_pointer, slot_base)) {
+            return;
+        }
+        g_active_hle_guest_read_lease = {
+            .base = slot_base,
+            .size = Lsx4::FexHleLease::SlotSize,
+            .generation = generation,
+        };
+    }
+
+    ~ScopedExecutorHleGuestReadLease() {
+        g_active_hle_guest_read_lease = previous;
+    }
+};
+
+struct ScopedExecutorHleBoundary {
+    ExecutorHleBoundaryPrelude prelude;
+    ScopedExecutorHleGuestReadLease guest_read_lease;
+    ScopedExecutorCurrentHleContext current_context;
+    ScopedExecutorHleGuestThreadBind guest_thread_bind;
+    bool release_pending = true;
+
+    ScopedExecutorHleBoundary(
+        const std::uint64_t guest_rsp, const char* name, const char* symbol,
+        const std::array<std::uint64_t, 8>& floating_arguments,
+        const std::uint64_t guest_thread)
+        : guest_read_lease(guest_rsp, guest_thread),
+          current_context(guest_rsp, name, symbol, floating_arguments),
+          guest_thread_bind(guest_thread, name, symbol) {}
+
+    void Release() {
+        if (!release_pending) {
+            return;
+        }
+        std::atomic_thread_fence(std::memory_order_release);
+        release_pending = false;
+    }
+
+    ~ScopedExecutorHleBoundary() {
+        Release();
+    }
+};
+
+struct ScopedExecutorLeafHleBoundary {
+    ExecutorHleBoundaryPrelude prelude;
+    bool release_pending = true;
+
+    void Release() {
+        if (!release_pending) {
+            return;
+        }
+        std::atomic_thread_fence(std::memory_order_release);
+        release_pending = false;
+    }
+
+    ~ScopedExecutorLeafHleBoundary() {
+        Release();
+    }
+};
+
 enum class ExecutorHleFpAbi : std::uint8_t {
     None = 0,
     UnaryF32,
@@ -5866,6 +7943,8 @@ struct ExecutorHleTargetMetadata {
     bool stack_chk_target = false;
     bool bad_alloc_target = false;
     bool pthread_target = false;
+    bool fex_guest_thread_exit_target = false;
+    bool fex_context_replacing_fiber_target = false;
     bool pthread_create_target = false;
     bool pthread_trylock_target = false;
     bool pthread_cond_timedwait_target = false;
@@ -5894,6 +7973,7 @@ struct ExecutorHleTargetMetadata {
     bool gnm_draw_indirect_multi = false;
     bool gnm_submit_and_flip = false;
     bool gnm_submit_and_flip_for_workload = false;
+    bool exact_typed_time_target = false;
     bool jit_leaf_direct_safe = false;
     bool jit_runtime_direct_safe = false;
 };
@@ -5933,6 +8013,42 @@ ExecutorHleTargetMetadata BuildExecutorHleTargetMetadata(const std::uint64_t nat
         IsPthreadCondTimedWaitHleTarget(name, symbol_name);
     metadata.pthread_target = IsPthreadHleTarget(name, symbol_name) ||
                               metadata.pthread_cond_timedwait_target;
+
+
+
+
+
+
+
+
+
+    const auto pthread_exit_wrapper = reinterpret_cast<std::uint64_t>(
+        HOST_CALL(Libraries::Kernel::posix_pthread_exit));
+    metadata.fex_guest_thread_exit_target =
+        native_function == pthread_exit_wrapper ||
+        HleNameMatchesAnyNid(name, {"FJrT5LuUBAU", "3kg7rT0NQIs"}) ||
+        SymbolNameContains(symbol_name, "posix_pthread_exit");
+#ifdef __ANDROID__
+    const auto fiber_run_impl_wrapper = reinterpret_cast<std::uint64_t>(
+        HOST_CALL(Libraries::Fiber::TraceFiberRunImpl));
+    const auto fiber_switch_impl_wrapper = reinterpret_cast<std::uint64_t>(
+        HOST_CALL(Libraries::Fiber::TraceFiberSwitchImpl));
+#else
+    const auto fiber_run_impl_wrapper = reinterpret_cast<std::uint64_t>(
+        HOST_CALL(Libraries::Fiber::sceFiberRunImpl));
+    const auto fiber_switch_impl_wrapper = reinterpret_cast<std::uint64_t>(
+        HOST_CALL(Libraries::Fiber::sceFiberSwitchImpl));
+#endif
+    metadata.fex_context_replacing_fiber_target =
+        native_function == reinterpret_cast<std::uint64_t>(
+                               HOST_CALL(Libraries::Fiber::sceFiberRun)) ||
+        native_function == reinterpret_cast<std::uint64_t>(
+                               HOST_CALL(Libraries::Fiber::sceFiberSwitch)) ||
+        native_function == reinterpret_cast<std::uint64_t>(
+                               HOST_CALL(Libraries::Fiber::sceFiberReturnToThread)) ||
+        native_function == fiber_run_impl_wrapper ||
+        native_function == fiber_switch_impl_wrapper ||
+        Executor::Fex::IsContextReplacingFiberNid(metadata.name);
     metadata.pthread_create_target = IsPthreadCreateHleTarget(name, symbol_name);
     metadata.pthread_trylock_target =
         IsExpectedPthreadTrylockBusy(name, symbol_name, 0x80020010ULL);
@@ -5943,9 +8059,16 @@ ExecutorHleTargetMetadata BuildExecutorHleTargetMetadata(const std::uint64_t nat
     metadata.live_trace_target = IsLiveTraceHleTarget(name, symbol_name);
     metadata.light_oracle_hle_flight_target =
         ExecutorLightOracleKeepsHleFlightTarget(name, symbol_name);
+
+
+
+
+    const std::string_view hle_name = name ? name : "";
     metadata.audio_out_target =
-        HleNameMatches(name, "sceAudioOutOutput", "QOQtbeDqsT4") ||
-        SymbolNameContains(symbol_name, "sceAudioOutOutput");
+        hle_name.find("sceAudioOut") != std::string_view::npos ||
+        hle_name.find("sceAudio3d") != std::string_view::npos ||
+        SymbolNameContains(symbol_name, "sceAudioOut") ||
+        SymbolNameContains(symbol_name, "sceAudio3d");
     metadata.fp_abi = ClassifyLibcMathHleAbi(native_function, name);
     if (HleNameMatches(name, "sceFiberInitialize", "hVYD7Ou2pCQ") ||
         SymbolNameContains(symbol_name, "sceFiberInitializeE")) {
@@ -5982,6 +8105,12 @@ ExecutorHleTargetMetadata BuildExecutorHleTargetMetadata(const std::uint64_t nat
         HleNameMatches(name, "sceGnmSubmitAndFlipCommandBuffers", "xbxNatawohc");
     metadata.gnm_submit_and_flip_for_workload = HleNameMatches(
         name, "sceGnmSubmitAndFlipCommandBuffersForWorkload", "Ga6r7H6Y0RI");
+
+
+
+    metadata.exact_typed_time_target =
+        HleNameMatches(name, "sceKernelGettimeofday", "ejekcaNQNq0") ||
+        HleNameMatches(name, "posix_gettimeofday", "n88vx3C5nW8");
     metadata.jit_leaf_direct_safe =
         HleNameMatches(name, "sceGnmSetPsShader", "bQVd5YzCal0") ||
         HleNameMatches(name, "sceGnmSetPsShader350", "5uFKckiJYRM") ||
@@ -6140,6 +8269,529 @@ void AuditHleGuestPointerResult(const ExecutorHleTargetMetadata& metadata,
               return_module ? return_module->file.string().c_str() : "<unknown>");
 }
 
+struct HleGenericCoverageSlot {
+    std::uint64_t target{};
+    std::uint64_t calls{};
+};
+
+struct HleGenericCoverageThreadState {
+    std::uint64_t all_calls{};
+    std::uint64_t generic_calls{};
+    std::uint64_t frame_epoch{};
+    std::uint64_t frame_generic_calls{};
+    std::uint64_t max_generic_calls_per_frame{};
+    std::array<HleGenericCoverageSlot, 64> targets{};
+};
+
+struct HleGenericCoverageGlobalState {
+    std::mutex mutex;
+    std::uint64_t all_calls{};
+    std::uint64_t generic_calls{};
+    std::uint64_t max_generic_calls_per_frame{};
+    std::unordered_map<std::uint64_t, std::uint64_t> target_calls;
+};
+
+thread_local HleGenericCoverageThreadState g_hle_generic_coverage_thread{};
+HleGenericCoverageGlobalState g_hle_generic_coverage_global{};
+
+bool HleGenericCoverageEnabled() {
+    static const bool enabled =
+        ExecutorEnvFlag("EXECUTOR_TRACE_HLE_GENERIC_COVERAGE");
+    return enabled;
+}
+
+void FlushHleGenericCoverage() {
+    auto& local = g_hle_generic_coverage_thread;
+    if (local.all_calls == 0) {
+        return;
+    }
+    if (local.frame_generic_calls > local.max_generic_calls_per_frame) {
+        local.max_generic_calls_per_frame = local.frame_generic_calls;
+    }
+
+    std::array<std::pair<std::uint64_t, std::uint64_t>, 3> thread_top{};
+    std::size_t thread_unique_targets = 0;
+    for (const auto& slot : local.targets) {
+        if (slot.target == 0 || slot.calls == 0) {
+            continue;
+        }
+        ++thread_unique_targets;
+        for (std::size_t index = 0; index != thread_top.size(); ++index) {
+            if (slot.calls > thread_top[index].second) {
+                for (std::size_t move = thread_top.size() - 1; move > index; --move) {
+                    thread_top[move] = thread_top[move - 1];
+                }
+                thread_top[index] = {slot.target, slot.calls};
+                break;
+            }
+        }
+    }
+
+    std::uint64_t global_all = 0;
+    std::uint64_t global_generic = 0;
+    std::uint64_t global_max_frame = 0;
+    std::size_t global_unique_targets = 0;
+    {
+        std::lock_guard lock(g_hle_generic_coverage_global.mutex);
+        auto& global = g_hle_generic_coverage_global;
+        global.all_calls += local.all_calls;
+        global.generic_calls += local.generic_calls;
+        global.max_generic_calls_per_frame =
+            std::max(global.max_generic_calls_per_frame,
+                     local.max_generic_calls_per_frame);
+        for (const auto& slot : local.targets) {
+            if (slot.target != 0 && slot.calls != 0) {
+                global.target_calls[slot.target] += slot.calls;
+            }
+        }
+        global_all = global.all_calls;
+        global_generic = global.generic_calls;
+        global_max_frame = global.max_generic_calls_per_frame;
+        global_unique_targets = global.target_calls.size();
+    }
+
+    char thread_name[32]{"unknown"};
+#ifdef __ANDROID__
+    (void)pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
+#endif
+    std::ostringstream top_text;
+    for (std::size_t index = 0; index != thread_top.size(); ++index) {
+        if (thread_top[index].first == 0) {
+            continue;
+        }
+        const auto& metadata = GetExecutorHleTargetMetadata(thread_top[index].first);
+        if (index != 0) {
+            top_text << ';';
+        }
+        top_text << "0x" << std::hex << thread_top[index].first << std::dec << ':'
+                 << thread_top[index].second << ':'
+                 << (metadata.name.empty() ? "unknown" : metadata.name);
+    }
+    const double thread_percent = local.all_calls != 0
+                                      ? (100.0 * static_cast<double>(local.generic_calls) /
+                                         static_cast<double>(local.all_calls))
+                                      : 0.0;
+    const double global_percent = global_all != 0
+                                      ? (100.0 * static_cast<double>(global_generic) /
+                                         static_cast<double>(global_all))
+                                      : 0.0;
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_HLE_GENERIC_COVERAGE] title=%s thread=%s "
+              "threadAll=%llu threadGeneric=%llu threadPercent=%.3f "
+              "threadUniqueTargetsApprox=%zu threadMaxGenericPerFrame=%llu "
+              "frameEpoch=%llu threadTopApprox=%s globalAll=%llu "
+              "globalGeneric=%llu globalPercent=%.3f globalUniqueTargetsApprox=%zu "
+              "globalMaxGenericPerFrame=%llu",
+              g_active_title_id.data(), thread_name,
+              static_cast<unsigned long long>(local.all_calls),
+              static_cast<unsigned long long>(local.generic_calls), thread_percent,
+              thread_unique_targets,
+              static_cast<unsigned long long>(local.max_generic_calls_per_frame),
+              static_cast<unsigned long long>(local.frame_epoch),
+              top_text.str().c_str(),
+              static_cast<unsigned long long>(global_all),
+              static_cast<unsigned long long>(global_generic), global_percent,
+              global_unique_targets,
+              static_cast<unsigned long long>(global_max_frame));
+
+    local = {};
+}
+
+inline void RecordHleCoverageCall() {
+    if (HleGenericCoverageEnabled()) {
+        auto& local = g_hle_generic_coverage_thread;
+        ++local.all_calls;
+        if ((local.all_calls & UINT64_C(0xffff)) == 0) {
+            FlushHleGenericCoverage();
+        }
+    }
+}
+
+inline void RecordHleGenericFallback(const std::uint64_t target) {
+    if (!HleGenericCoverageEnabled()) {
+        return;
+    }
+    auto& local = g_hle_generic_coverage_thread;
+    ++local.generic_calls;
+    const std::uint64_t frame_epoch =
+        Vulkan::ExecutorVkGpuTimelineCurrentFrameEpoch();
+    if (local.frame_epoch != frame_epoch) {
+        local.max_generic_calls_per_frame =
+            std::max(local.max_generic_calls_per_frame,
+                     local.frame_generic_calls);
+        local.frame_epoch = frame_epoch;
+        local.frame_generic_calls = 0;
+    }
+    ++local.frame_generic_calls;
+
+    const std::size_t index = static_cast<std::size_t>(
+        ((target >> 4) ^ (target >> 17)) & (local.targets.size() - 1));
+    auto& slot = local.targets[index];
+    if (slot.target == target || slot.calls == 0) {
+        slot.target = target;
+        ++slot.calls;
+    } else if (--slot.calls == 0) {
+        slot.target = target;
+        slot.calls = 1;
+    }
+    if ((local.generic_calls & UINT64_C(0x3fff)) == 0) {
+        FlushHleGenericCoverage();
+    }
+}
+
+enum FexHleThunkAdmissionRisk : std::uint32_t {
+    FexHleThunkRiskNone = 0,
+    FexHleThunkRiskPthread = 1U << 0,
+    FexHleThunkRiskSemaphore = 1U << 1,
+    FexHleThunkRiskNonLocal = 1U << 2,
+    FexHleThunkRiskDeviceOrBlocking = 1U << 3,
+    FexHleThunkRiskPointerArgument = 1U << 4,
+    FexHleThunkRiskSpecialAbi = 1U << 5,
+    FexHleThunkRiskPointerResult = 1U << 6,
+    FexHleThunkRiskUnknownTarget = 1U << 7,
+};
+
+struct FexHleThunkAdmissionSlot {
+    std::uint64_t target{};
+    std::uint64_t descriptor_id{};
+    std::uint64_t calls{};
+    std::uint64_t integer_register_shape_calls{};
+    std::uint64_t source_audit_candidate_calls{};
+    std::uint32_t risk_mask{};
+    bool legacy_leaf{};
+};
+
+struct FexHleThunkAdmissionThreadState {
+    static constexpr std::size_t TargetSlots = 512;
+
+    std::uint64_t calls{};
+    std::uint64_t integer_register_shape_calls{};
+    std::uint64_t source_audit_candidate_calls{};
+    std::uint64_t first_call_id{};
+    std::uint64_t last_call_id{};
+    std::uint64_t call_id_regressions{};
+    std::uint64_t target_overflow_calls{};
+    std::chrono::steady_clock::time_point started{};
+    std::array<FexHleThunkAdmissionSlot, TargetSlots> targets{};
+};
+
+struct FexHleThunkAdmissionGlobalTarget {
+    std::uint64_t calls{};
+    std::uint64_t integer_register_shape_calls{};
+    std::uint64_t source_audit_candidate_calls{};
+    std::uint64_t descriptor_id{};
+    std::uint32_t risk_mask{};
+    bool legacy_leaf{};
+    std::string name;
+};
+
+struct FexHleThunkAdmissionGlobalState {
+    std::mutex mutex;
+    std::uint64_t calls{};
+    std::uint64_t integer_register_shape_calls{};
+    std::uint64_t source_audit_candidate_calls{};
+    std::uint64_t min_call_id{};
+    std::uint64_t max_call_id{};
+    std::uint64_t call_id_regressions{};
+    std::uint64_t target_overflow_calls{};
+    std::uint64_t next_log_calls{UINT64_C(1) << 23};
+    std::chrono::steady_clock::time_point started{};
+    std::unordered_map<std::uint64_t, FexHleThunkAdmissionGlobalTarget> targets;
+};
+
+bool FexHleThunkAdmissionEnabled() {
+    static const bool enabled =
+        ExecutorEnvFlag("EXECUTOR_DIAG_FEX_HLE_THUNK_ADMISSION");
+    return enabled;
+}
+
+bool IsFexHleIntegerRegisterShape(
+    const Core::AeroLib::AndroidX64HleAbiDescriptor& descriptor) noexcept {
+    using Core::AeroLib::AndroidX64SysVClass;
+    const auto no_class = static_cast<std::uint8_t>(AndroidX64SysVClass::NoClass);
+    const auto integer = static_cast<std::uint8_t>(AndroidX64SysVClass::Integer);
+    if (!descriptor.supported || descriptor.argument_count > descriptor.arguments.size() ||
+        descriptor.stack_argument_bytes != 0 || descriptor.sse_argument_count != 0 ||
+        descriptor.sret_flags != 0 || descriptor.call_flags != 0 ||
+        descriptor.return_eightbyte_count > 1) {
+        return false;
+    }
+    if (descriptor.return_eightbyte_count == 0) {
+        if (descriptor.return_class[0] != no_class || descriptor.return_class[1] != no_class) {
+            return false;
+        }
+    } else if (descriptor.return_class[0] != integer ||
+               descriptor.return_class[1] != no_class) {
+        return false;
+    }
+    for (std::uint32_t index = 0; index < descriptor.argument_count; ++index) {
+        const auto& argument = descriptor.arguments[index];
+        if (argument.eightbyte_count == 0 || argument.eightbyte_count > 2) {
+            return false;
+        }
+        for (std::uint8_t word = 0; word < argument.eightbyte_count; ++word) {
+            if (argument.classes[word] != integer) {
+                return false;
+            }
+        }
+        for (std::uint8_t word = argument.eightbyte_count;
+             word < argument.classes.size(); ++word) {
+            if (argument.classes[word] != no_class) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+std::uint32_t FexHleThunkAdmissionRiskMask(
+    const Core::AeroLib::AndroidX64HleAbiDescriptor& descriptor,
+    const ExecutorHleTargetMetadata& metadata) noexcept {
+    std::uint32_t risk = FexHleThunkRiskNone;
+    if (metadata.pthread_target) {
+        risk |= FexHleThunkRiskPthread;
+    }
+    if (metadata.blocking_sem_wait_target || metadata.posix_sem_site_op != nullptr) {
+        risk |= FexHleThunkRiskSemaphore;
+    }
+    if (metadata.fex_guest_thread_exit_target ||
+        metadata.fex_context_replacing_fiber_target ||
+        (descriptor.call_flags & Core::AeroLib::AndroidX64CallNoReturn) != 0) {
+        risk |= FexHleThunkRiskNonLocal;
+    }
+    if (metadata.system_service_load_exec_target || metadata.audio_out_target ||
+        metadata.gnm_submit_and_flip || metadata.gnm_submit_and_flip_for_workload ||
+        metadata.gnm_draw_index_indirect || metadata.gnm_draw_index_indirect_count_multi ||
+        metadata.gnm_draw_index_indirect_multi || metadata.gnm_draw_indirect ||
+        metadata.gnm_draw_indirect_multi) {
+        risk |= FexHleThunkRiskDeviceOrBlocking;
+    }
+    const char* const name = metadata.name.c_str();
+    const char* const symbol_name = metadata.symbol_name.c_str();
+
+
+
+
+
+    const bool known_pointer_semantics =
+        HleNameMatches(name, "sceKernelGettimeofday", "ejekcaNQNq0") ||
+        HleNameMatches(name, "posix_gettimeofday", "n88vx3C5nW8") ||
+        HleNameMatches(name, "memcpy", "Q3VBxCXhUHs") ||
+        HleNameMatches(name, "memmove", "+P6FRGH4LfA") ||
+        HleNameMatches(name, "memset", "8zTFvBIAIN8") ||
+        HleNameMatches(name, "strlen", "j4ViWNHEgww") ||
+        HleNameMatches(name, "strcmp", "Ovb2dSJOAuE") ||
+        HleNameMatches(name, "strncmp", "aesyjrHVWy4") ||
+        HleNameMatches(name, "memcmp", "DfivPArhucg") ||
+        SymbolNameContains(symbol_name, "sceKernelGettimeofday") ||
+        SymbolNameContains(symbol_name, "posix_gettimeofday") ||
+        SymbolNameContains(symbol_name, "ExecutorLibcMemcpy") ||
+        SymbolNameContains(symbol_name, "ExecutorLibcMemmove") ||
+        SymbolNameContains(symbol_name, "ExecutorLibcMemset") ||
+        SymbolNameContains(symbol_name, "ExecutorLibcStrlen") ||
+        SymbolNameContains(symbol_name, "ExecutorLibcStrcmp") ||
+        SymbolNameContains(symbol_name, "ExecutorLibcStrncmp") ||
+        SymbolNameContains(symbol_name, "ExecutorLibcMemcmp");
+    if (known_pointer_semantics ||
+        (descriptor.signature != nullptr &&
+         std::count(descriptor.signature,
+                    descriptor.signature + std::strlen(descriptor.signature), '*') > 1)) {
+        risk |= FexHleThunkRiskPointerArgument;
+    }
+    if (metadata.fp_abi != ExecutorHleFpAbi::None ||
+        metadata.stack_abi != ExecutorHleStackAbi::None ||
+        (descriptor.call_flags & Core::AeroLib::AndroidX64CallVariadic) != 0) {
+        risk |= FexHleThunkRiskSpecialAbi;
+    }
+    if (metadata.pointer_result_family != ExecutorHlePointerResultFamily::None) {
+        risk |= FexHleThunkRiskPointerResult;
+    }
+
+
+
+    if (!metadata.executable ||
+        (metadata.name.empty() && metadata.symbol_name.empty())) {
+        risk |= FexHleThunkRiskUnknownTarget;
+    }
+    return risk;
+}
+
+void FlushFexHleThunkAdmission(FexHleThunkAdmissionThreadState& local) {
+    if (local.calls == 0) {
+        return;
+    }
+    static FexHleThunkAdmissionGlobalState global;
+    std::string report;
+    {
+        std::lock_guard lock(global.mutex);
+        if (global.targets.empty()) {
+            global.targets.reserve(512);
+        }
+        global.calls += local.calls;
+        global.integer_register_shape_calls += local.integer_register_shape_calls;
+        global.source_audit_candidate_calls += local.source_audit_candidate_calls;
+        global.call_id_regressions += local.call_id_regressions;
+        global.target_overflow_calls += local.target_overflow_calls;
+        if (local.first_call_id != 0 &&
+            (global.min_call_id == 0 || local.first_call_id < global.min_call_id)) {
+            global.min_call_id = local.first_call_id;
+        }
+        global.max_call_id = std::max(global.max_call_id, local.last_call_id);
+        if (global.started.time_since_epoch().count() == 0 || local.started < global.started) {
+            global.started = local.started;
+        }
+        for (const auto& slot : local.targets) {
+            if (slot.target == 0 || slot.calls == 0) {
+                continue;
+            }
+            auto& target = global.targets[slot.target];
+            target.calls += slot.calls;
+            target.integer_register_shape_calls += slot.integer_register_shape_calls;
+            target.source_audit_candidate_calls += slot.source_audit_candidate_calls;
+            target.descriptor_id = slot.descriptor_id;
+            target.risk_mask |= slot.risk_mask;
+            target.legacy_leaf = target.legacy_leaf || slot.legacy_leaf;
+            if (target.name.empty()) {
+                const auto& metadata = GetExecutorHleTargetMetadata(slot.target);
+                target.name = !metadata.name.empty()
+                    ? metadata.name
+                    : (!metadata.symbol_name.empty() ? metadata.symbol_name : "unknown");
+            }
+        }
+        if (global.calls >= global.next_log_calls) {
+            constexpr std::uint64_t LogStride = UINT64_C(1) << 23;
+            global.next_log_calls =
+                ((global.calls / LogStride) + 1) * LogStride;
+            std::vector<std::pair<std::uint64_t,
+                                  const FexHleThunkAdmissionGlobalTarget*>> top;
+            top.reserve(global.targets.size());
+            for (const auto& [native_function, target] : global.targets) {
+                top.emplace_back(native_function, &target);
+            }
+            const std::size_t top_count = std::min<std::size_t>(top.size(), 10);
+            std::partial_sort(
+                top.begin(), top.begin() + top_count, top.end(),
+                [](const auto& left, const auto& right) {
+                    return left.second->calls > right.second->calls;
+                });
+            std::ostringstream top_text;
+            for (std::size_t index = 0; index < top_count; ++index) {
+                if (index != 0) {
+                    top_text << ';';
+                }
+                const auto& [native_function, target] = top[index];
+                top_text << (index + 1) << ":0x" << std::hex << native_function
+                         << std::dec << ':' << target->calls << ':'
+                         << target->integer_register_shape_calls << ':'
+                         << target->source_audit_candidate_calls << ":risk0x"
+                         << std::hex << target->risk_mask << std::dec << ":leaf"
+                         << (target->legacy_leaf ? 1 : 0) << ':' << target->name;
+            }
+            const std::uint64_t call_id_span =
+                global.min_call_id != 0 && global.max_call_id >= global.min_call_id
+                ? global.max_call_id - global.min_call_id + 1
+                : 0;
+            const double committed_percent = call_id_span != 0
+                ? 100.0 * static_cast<double>(global.calls) /
+                      static_cast<double>(call_id_span)
+                : 0.0;
+            const auto elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - global.started).count();
+            const double boundary_rate = elapsed > 0.0
+                ? static_cast<double>(call_id_span) / elapsed
+                : 0.0;
+            const double shape_percent = global.calls != 0
+                ? 100.0 * static_cast<double>(global.integer_register_shape_calls) /
+                      static_cast<double>(global.calls)
+                : 0.0;
+            const double audit_percent = global.calls != 0
+                ? 100.0 * static_cast<double>(global.source_audit_candidate_calls) /
+                      static_cast<double>(global.calls)
+                : 0.0;
+            std::ostringstream summary;
+            summary << "[EXECUTOR_FEX_HLE_THUNK_ADMISSION] title="
+                    << g_active_title_id.data() << " committed=" << global.calls
+                    << " callIdMin=" << global.min_call_id
+                    << " callIdMax=" << global.max_call_id
+                    << " callIdSpan=" << call_id_span
+                    << " committedPercent=" << committed_percent
+                    << " boundaryRate=" << boundary_rate
+                    << " integerRegisterShape="
+                    << global.integer_register_shape_calls
+                    << " integerRegisterShapePercent=" << shape_percent
+                    << " sourceAuditCandidates="
+                    << global.source_audit_candidate_calls
+                    << " sourceAuditCandidatePercent=" << audit_percent
+                    << " targetOverflowCalls=" << global.target_overflow_calls
+                    << " callIdRegressions=" << global.call_id_regressions
+                    << " exactCommittedTargets="
+                    << (global.target_overflow_calls == 0 ? 1 : 0)
+                    << " topFormat=rank:native:calls:shape:audit:risk:legacyLeaf:name"
+                    << " top=" << top_text.str();
+            report = summary.str();
+        }
+    }
+    local = {};
+    if (!report.empty()) {
+        NativeLog(ANDROID_LOG_INFO, "%s", report.c_str());
+    }
+}
+
+void RecordFexHleThunkAdmission(
+    const Lsx4FexHleCallFrameV3& call,
+    const Core::AeroLib::AndroidX64HleAbiDescriptor& descriptor,
+    const ExecutorHleTargetMetadata& metadata) {
+    if (!FexHleThunkAdmissionEnabled()) {
+        return;
+    }
+    static thread_local FexHleThunkAdmissionThreadState local{};
+    if (local.calls == 0) {
+        local.started = std::chrono::steady_clock::now();
+        local.first_call_id = call.call_id;
+    } else if (call.call_id <= local.last_call_id) {
+        ++local.call_id_regressions;
+    }
+    local.last_call_id = call.call_id;
+    ++local.calls;
+    const bool integer_register_shape = IsFexHleIntegerRegisterShape(descriptor);
+    const std::uint32_t risk_mask =
+        FexHleThunkAdmissionRiskMask(descriptor, metadata);
+    const bool source_audit_candidate =
+        integer_register_shape && risk_mask == FexHleThunkRiskNone;
+    local.integer_register_shape_calls += integer_register_shape ? 1 : 0;
+    local.source_audit_candidate_calls += source_audit_candidate ? 1 : 0;
+
+    constexpr std::uint64_t GoldenRatio = UINT64_C(0x9e3779b97f4a7c15);
+    const std::size_t first_slot = static_cast<std::size_t>(
+        ((call.native_function ^ (call.native_function >> 33U)) * GoldenRatio) >>
+        (64U - 9U));
+    FexHleThunkAdmissionSlot* target_slot = nullptr;
+    for (std::size_t probe = 0; probe < local.targets.size(); ++probe) {
+        auto& slot = local.targets[(first_slot + probe) & (local.targets.size() - 1)];
+        if (slot.target == call.native_function || slot.target == 0) {
+            target_slot = &slot;
+            break;
+        }
+    }
+    if (target_slot == nullptr) {
+        ++local.target_overflow_calls;
+    } else {
+        if (target_slot->target == 0) {
+            target_slot->target = call.native_function;
+            target_slot->descriptor_id = descriptor.descriptor_id;
+            target_slot->risk_mask = risk_mask;
+            target_slot->legacy_leaf = metadata.jit_leaf_direct_safe;
+        }
+        ++target_slot->calls;
+        target_slot->integer_register_shape_calls += integer_register_shape ? 1 : 0;
+        target_slot->source_audit_candidate_calls += source_audit_candidate ? 1 : 0;
+        target_slot->risk_mask |= risk_mask;
+    }
+    if ((local.calls & UINT64_C(0xfff)) == 0) {
+        FlushFexHleThunkAdmission(local);
+    }
+}
+
 static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
     const char* bridge_source, const std::uint64_t native_function, const std::uint64_t arg0,
     const std::uint64_t arg1, const std::uint64_t arg2, const std::uint64_t arg3,
@@ -6148,8 +8800,10 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
     const std::uint64_t xmm3, const std::uint64_t xmm4, const std::uint64_t xmm5,
     const std::uint64_t xmm6, const std::uint64_t xmm7) {
     (void)bridge_source;
-    std::atomic_thread_fence(std::memory_order_acquire);
+    RecordHleCoverageCall();
     const auto& target_metadata = GetExecutorHleTargetMetadata(native_function);
+    const auto replacement_mode =
+        Executor::CpuTuning::Frozen().function_replacements;
     const bool known_target = target_metadata.known_target;
     const char* name = target_metadata.name.c_str();
     const char* symbol_name = target_metadata.symbol_name.c_str();
@@ -6168,8 +8822,10 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
         ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_SYNC"),
     };
 
-    if (target_metadata.executable && target_metadata.jit_leaf_direct_safe &&
+    if (replacement_mode != Executor::CpuTuning::Aggressiveness::Off &&
+        target_metadata.executable && target_metadata.jit_leaf_direct_safe &&
         target_metadata.fp_abi == ExecutorHleFpAbi::None) {
+        std::atomic_thread_fence(std::memory_order_acquire);
         if (ExecutorGcGuestRootsEnabled()) {
             PublishCurrentJitGcRegisterRootsAtHleBoundary();
         }
@@ -6181,7 +8837,8 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
         std::atomic_thread_fence(std::memory_order_release);
         return result;
     }
-    if (target_metadata.executable && target_metadata.jit_runtime_direct_safe &&
+    if (replacement_mode != Executor::CpuTuning::Aggressiveness::Off &&
+        target_metadata.executable && target_metadata.jit_runtime_direct_safe &&
         target_metadata.fp_abi == ExecutorHleFpAbi::None &&
         RuntimeGuestJitActive() && Libraries::Kernel::g_curthread == nullptr &&
         g_box64_current_guest_thread != nullptr) {
@@ -6191,9 +8848,11 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
                 reinterpret_cast<Libraries::Kernel::Pthread*>(guest_thread);
         }
     }
-    if (target_metadata.executable && target_metadata.jit_runtime_direct_safe &&
+    if (replacement_mode != Executor::CpuTuning::Aggressiveness::Off &&
+        target_metadata.executable && target_metadata.jit_runtime_direct_safe &&
         target_metadata.fp_abi == ExecutorHleFpAbi::None &&
         RuntimeGuestJitActive() && Libraries::Kernel::g_curthread != nullptr) {
+        std::atomic_thread_fence(std::memory_order_acquire);
         if (ExecutorGcGuestRootsEnabled()) {
             PublishCurrentJitGcRegisterRootsAtHleBoundary();
         }
@@ -6208,12 +8867,11 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
         return result;
     }
 
-    PublishCurrentJitGcRegisterRootsAtHleBoundary();
-    ScopedExecutorCurrentHleContext current_hle_context(
-        guest_rsp, name, symbol_name, {xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7});
     const std::uint64_t hle_guest_thread =
         g_box64_current_guest_thread ? g_box64_current_guest_thread() : 0;
-    ScopedExecutorHleGuestThreadBind guest_thread_bind(hle_guest_thread, name, symbol_name);
+    ScopedExecutorHleBoundary hle_boundary(
+        guest_rsp, name, symbol_name,
+        {xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7}, hle_guest_thread);
     ExecutorLiveHleFlightRecord("call", name, symbol_name, native_function, 0, arg0, arg1, arg2,
                                 arg3, arg4, arg5, guest_rsp,
                                 target_metadata.light_oracle_hle_flight_target ? 1 : 0);
@@ -6339,7 +8997,7 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
         ++log_count;
     }
     const auto record_hle_return = [&](const std::uint64_t result) {
-        std::atomic_thread_fence(std::memory_order_release);
+        hle_boundary.Release();
         AuditHleGuestPointerResult(target_metadata, native_function, result, guest_rsp);
         if (target_metadata.pthread_target) {
             RecordTargetMonoMutexHleSite("ret", name, symbol_name, native_function, result, arg0,
@@ -6829,6 +9487,7 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
                                           std::uint64_t, std::uint64_t, std::uint64_t,
                                           std::uint64_t, std::uint64_t);
     auto* fn = reinterpret_cast<NativeHleFn>(native_function);
+    RecordHleGenericFallback(native_function);
     static const bool trace_audioout_enabled =
         std::getenv("EXECUTOR_TRACE_AUDIOOUT_REGS") != nullptr;
     const bool trace_audioout = target_metadata.audio_out_target && trace_audioout_enabled;
@@ -6856,6 +9515,22 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
     }
     const std::uint64_t result = fn(arg0, arg1, arg2, arg3, arg4, arg5, guest_rsp, 0);
     AuditHleGuestPointerResult(target_metadata, native_function, result, guest_rsp);
+    if (target_metadata.audio_out_target &&
+        static_cast<std::int32_t>(result) < 0) {
+        static std::atomic_int audio_error_budget{64};
+        if (audio_error_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+            NativeLog(ANDROID_LOG_ERROR,
+                      "[EXECUTOR_AUDIO_HLE_ERROR] name=%s symbol=%s result=0x%08x "
+                      "args=%p,%p,%p,%p,%p,%p rsp=%p",
+                      name && name[0] ? name : "<unknown>",
+                      symbol_name && symbol_name[0] ? symbol_name : "<unknown>",
+                      static_cast<std::uint32_t>(result),
+                      reinterpret_cast<void*>(arg0), reinterpret_cast<void*>(arg1),
+                      reinterpret_cast<void*>(arg2), reinterpret_cast<void*>(arg3),
+                      reinterpret_cast<void*>(arg4), reinterpret_cast<void*>(arg5),
+                      reinterpret_cast<void*>(guest_rsp));
+        }
+    }
     if (trace_audioout) {
         ExecutorBox64GuestRegsSnapshot audioout_regs_after{};
         int audioout_regs_after_rc = -1;
@@ -6956,16 +9631,17 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
                     guest_return >= 64 ? guest_return - 64 : guest_return;
                 return_context = GuestBytesHexCheckedLocked(context, 160);
             }
+            Core::Module* const return_module =
+                FindGuestModuleByAddress(guest_return);
             NativeLog(ANDROID_LOG_INFO,
                       "[EXECUTOR_HLE_ERROR_STACK] name=%s symbol=%s result=%p ret=%p "
                       "returnOff=0x%llx args=%p,%p,%p,%p,%p,%p rsp=%p stack=%s retCtx=%s",
                       name && name[0] ? name : "<unknown>",
                       symbol_name && symbol_name[0] ? symbol_name : "<unknown>",
                       reinterpret_cast<void*>(result), reinterpret_cast<void*>(guest_return),
-                      FindGuestModuleByAddress(guest_return)
+                      return_module
                           ? static_cast<unsigned long long>(
-                                GuestModuleOffset(*FindGuestModuleByAddress(guest_return),
-                                                  guest_return))
+                                GuestModuleOffset(*return_module, guest_return))
                           : 0ull,
                       reinterpret_cast<void*>(arg0), reinterpret_cast<void*>(arg1),
                       reinterpret_cast<void*>(arg2), reinterpret_cast<void*>(arg3),
@@ -7049,6 +9725,2080 @@ extern "C" std::uint64_t ExecutorJitHleBridgeCallback(const std::uint64_t native
                                              xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7);
 }
 
+extern "C" int executor_jit_hle_fp_result_kind(std::uint64_t native_function);
+
+void ExecutorFexHostLog(void*, const std::int32_t priority,
+                        const char* component, const char* message) {
+    NativeLog(priority, "[EXECUTOR_FEX_%s] %s",
+              component != nullptr ? component : "runtime",
+              message != nullptr ? message : "<empty>");
+}
+
+extern "C" int executor_live_mono_fex_hle_dispatch_enter(void* guest_thread)
+    __attribute__((weak));
+extern "C" int executor_live_mono_fex_hle_dispatch_leave(void* guest_thread)
+    __attribute__((weak));
+
+thread_local std::uint32_t g_fex_hle_dispatch_depth{};
+
+class ScopedFexHleDispatchDepth {
+public:
+    explicit ScopedFexHleDispatchDepth(
+        Libraries::Kernel::Pthread* const current_guest_thread) noexcept
+        : depth(&g_fex_hle_dispatch_depth),
+          entered(Lsx4::FexHleLease::TryEnterDepth(*depth)) {
+        if (!g_fex_hle_signal_safepoints_required.load(std::memory_order_acquire)) {
+            return;
+        }
+        const bool committed_fex =
+            entered && RuntimeGuestFexActive() &&
+            g_fault_signal_owner.load(std::memory_order_acquire) == FaultSignalOwner::Fex &&
+            Executor::Fex::ActiveApiForSignal() != nullptr;
+        if (committed_fex && current_guest_thread != nullptr &&
+            executor_live_mono_fex_hle_dispatch_enter != nullptr &&
+            executor_live_mono_fex_hle_dispatch_enter(current_guest_thread) > 0) {
+            published_guest_thread = current_guest_thread;
+        }
+    }
+
+    ~ScopedFexHleDispatchDepth() {
+        if (entered) {
+            if (published_guest_thread != nullptr &&
+                executor_live_mono_fex_hle_dispatch_leave != nullptr) {
+                const int leave_rc =
+                    executor_live_mono_fex_hle_dispatch_leave(published_guest_thread);
+                if (leave_rc < 0) {
+                    NativeLog(ANDROID_LOG_ERROR,
+                              "[EXECUTOR_FEX_HLE_SIGNAL_SAFEPOINT] stage=leave "
+                              "result=state-mismatch guest=%p tlsDepth=%u",
+                              static_cast<void*>(published_guest_thread),
+                              *depth);
+                }
+            }
+            Lsx4::FexHleLease::LeaveDepth(*depth);
+        }
+    }
+
+    explicit operator bool() const noexcept {
+        return entered;
+    }
+
+private:
+    std::uint32_t* const depth;
+    bool entered{};
+    Libraries::Kernel::Pthread* published_guest_thread{};
+};
+
+class ScopedFexBulkLeaseAbort {
+public:
+    ScopedFexBulkLeaseAbort() noexcept
+        : captured_epoch(
+              VideoCore::PageManager::CaptureCurrentFexBulkLeaseEpoch()) {}
+
+    ~ScopedFexBulkLeaseAbort() {
+        VideoCore::PageManager::AbortCurrentFexBulkLeaseAfter(captured_epoch);
+    }
+
+private:
+    u64 captured_epoch{};
+};
+
+extern "C" int32_t ExecutorFexDispatchHle(
+    void*, const Lsx4FexHleCallFrameV3* call,
+    Lsx4FexHleResultFrameV3* result) {
+    static_assert(static_cast<u8>(Core::AeroLib::AndroidX64SysVClass::NoClass) ==
+                  LSX4_FEX_SYSV_NO_CLASS);
+    static_assert(static_cast<u8>(Core::AeroLib::AndroidX64SysVClass::Integer) ==
+                  LSX4_FEX_SYSV_INTEGER);
+    static_assert(static_cast<u8>(Core::AeroLib::AndroidX64SysVClass::Sse) ==
+                  LSX4_FEX_SYSV_SSE);
+    static_assert(static_cast<u8>(Core::AeroLib::AndroidX64SysVClass::SseUp) ==
+                  LSX4_FEX_SYSV_SSEUP);
+    static_assert(static_cast<u8>(Core::AeroLib::AndroidX64SysVClass::X87) ==
+                  LSX4_FEX_SYSV_X87);
+    static_assert(static_cast<u8>(Core::AeroLib::AndroidX64SysVClass::X87Up) ==
+                  LSX4_FEX_SYSV_X87UP);
+    static_assert(static_cast<u8>(Core::AeroLib::AndroidX64SysVClass::ComplexX87) ==
+                  LSX4_FEX_SYSV_COMPLEX_X87);
+    static_assert(static_cast<u8>(Core::AeroLib::AndroidX64SysVClass::Memory) ==
+                  LSX4_FEX_SYSV_MEMORY);
+    static_assert(Core::AeroLib::AndroidX64CallVariadic == LSX4_FEX_CALL_VARIADIC);
+    static_assert(Core::AeroLib::AndroidX64CallNoReturn == LSX4_FEX_CALL_NORETURN);
+    if (result == nullptr ||
+        result->struct_size < sizeof(Lsx4FexHleResultFrameV3) ||
+        result->abi_version != LSX4_FEX_BACKEND_ABI_V3) {
+        return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+    }
+
+    const auto result_capacity = result->struct_size;
+    const auto call_id = call != nullptr ? call->call_id : 0;
+    std::memset(result, 0, sizeof(*result));
+    result->struct_size = result_capacity;
+    result->abi_version = LSX4_FEX_BACKEND_ABI_V3;
+    result->call_id = call_id;
+
+    if (call == nullptr ||
+        call->struct_size < sizeof(Lsx4FexHleCallFrameV3) ||
+        call->abi_version != LSX4_FEX_BACKEND_ABI_V3 ||
+        call->native_function == 0 || call->guest_rsp == 0 ||
+        (call->call_flags & ~(LSX4_FEX_CALL_VARIADIC | LSX4_FEX_CALL_NORETURN)) != 0 ||
+        call->sysv_sse_arg_count > LSX4_FEX_HLE_XMM_ARGUMENT_COUNT ||
+        (call->sysv_sse_arg_count != 0 &&
+         call->sysv_sse_arg_count != (call->input_rax & UINT64_C(0xff)))) {
+        result->status = LSX4_FEX_STATUS_INVALID_ARGUMENT;
+        return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+    }
+
+    Libraries::Kernel::Pthread* const current_guest_thread =
+        Libraries::Kernel::g_curthread;
+    const ScopedFexHleDispatchDepth dispatch_depth(current_guest_thread);
+    if (!dispatch_depth) {
+        result->status = LSX4_FEX_STATUS_INVALID_STATE;
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_HLE_DEPTH_REJECT] native=0x%llx limit=%u",
+                  static_cast<unsigned long long>(call->native_function),
+                  Lsx4::FexHleLease::MaxNestedLeases);
+        return LSX4_FEX_STATUS_INVALID_STATE;
+    }
+
+    Core::AeroLib::AndroidX64HleRawCall raw_call{};
+    raw_call.native_function = call->native_function;
+    raw_call.guest_rip = call->guest_rip;
+    raw_call.guest_rsp = call->guest_rsp;
+    raw_call.input_rax = call->input_rax;
+    raw_call.call_flags = call->call_flags;
+    raw_call.sysv_sse_arg_count = call->sysv_sse_arg_count;
+    for (std::size_t index = 0; index < raw_call.gpr.size(); ++index) {
+        raw_call.gpr[index] = call->gpr[index];
+    }
+    for (std::size_t index = 0; index < raw_call.xmm.size(); ++index) {
+        raw_call.xmm[index].low = call->xmm[index].low;
+        raw_call.xmm[index].high = call->xmm[index].high;
+    }
+
+    Core::AeroLib::AndroidX64HleAbiDescriptor descriptor{};
+    if (!Core::AeroLib::ResolveAndroidX64HleAbiDescriptor(
+            call->native_function, &descriptor)) {
+        result->status = LSX4_FEX_STATUS_NOT_FOUND;
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_HLE_ABI_MISSING] native=0x%llx rip=0x%llx",
+                  static_cast<unsigned long long>(call->native_function),
+                  static_cast<unsigned long long>(call->guest_rip));
+        return LSX4_FEX_STATUS_NOT_FOUND;
+    }
+    const bool descriptor_uses_sret = descriptor.sret_flags != 0;
+    const bool descriptor_is_variadic =
+        (descriptor.call_flags & LSX4_FEX_CALL_VARIADIC) != 0;
+    const std::uint32_t input_al_sse_count =
+        static_cast<std::uint32_t>(call->input_rax & UINT64_C(0xff));
+    const bool call_supplies_sret = call->sret_flags != 0 || call->sret_address != 0 ||
+                                    call->sret_size != 0;
+    const bool invalid_sret_flags =
+        (call->sret_flags & ~(LSX4_FEX_SRET_PRESENT |
+                              LSX4_FEX_SRET_RAX_RETURNS_ADDRESS |
+                              LSX4_FEX_SRET_HOST_WROTE_MEMORY)) != 0 ||
+        (call->sret_flags & LSX4_FEX_SRET_HOST_WROTE_MEMORY) != 0;
+    const bool sret_mismatch = descriptor_uses_sret
+        ? (call->gpr[0] == 0 || invalid_sret_flags ||
+           (call->sret_flags != 0 &&
+            (call->sret_flags & LSX4_FEX_SRET_PRESENT) == 0) ||
+           (call->sret_address != 0 && call->sret_address != call->gpr[0]) ||
+           (call->sret_size != 0 && call->sret_size != descriptor.return_size))
+        : call_supplies_sret;
+    const bool descriptor_mismatch =
+        (call->abi_descriptor_id != 0 &&
+         call->abi_descriptor_id != descriptor.descriptor_id) ||
+        (call->call_flags != 0 && call->call_flags != descriptor.call_flags) ||
+        (descriptor_is_variadic &&
+         input_al_sse_count > LSX4_FEX_HLE_XMM_ARGUMENT_COUNT) ||
+        (call->sysv_sse_arg_count != 0 &&
+         !descriptor_is_variadic) ||
+        (call->return_eightbyte_count != 0 &&
+         call->return_eightbyte_count != descriptor.return_eightbyte_count) ||
+        sret_mismatch ||
+        (call->return_class[0] != 0 &&
+         call->return_class[0] != descriptor.return_class[0]) ||
+        (call->return_class[1] != 0 &&
+         call->return_class[1] != descriptor.return_class[1]);
+    if (descriptor_mismatch) {
+        result->status = LSX4_FEX_STATUS_INVALID_ARGUMENT;
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_HLE_ABI_MISMATCH] native=0x%llx supplied=0x%llx "
+                  "resolved=0x%llx",
+                  static_cast<unsigned long long>(call->native_function),
+                  static_cast<unsigned long long>(call->abi_descriptor_id),
+                  static_cast<unsigned long long>(descriptor.descriptor_id));
+        return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+    }
+
+
+
+
+    raw_call.call_flags = call->call_flags != 0 ? call->call_flags
+                                                : descriptor.call_flags;
+    raw_call.sysv_sse_arg_count = descriptor_is_variadic
+        ? (call->sysv_sse_arg_count != 0 ? call->sysv_sse_arg_count
+                                         : input_al_sse_count)
+        : 0;
+
+    Core::AeroLib::AndroidX64HleRawResult typed_result{};
+    bool staged_guest_thread_exit = false;
+    const ScopedFexBulkLeaseAbort bulk_lease_abort;
+    const ExecutorHleTargetMetadata* target_metadata = nullptr;
+    std::optional<Executor::Fex::ScopedFiberHleContextBridge> fiber_context_bridge;
+#ifdef __ANDROID__
+    bool trace_gnm_submit_contract = false;
+    std::uint64_t trace_gnm_submit_ordinal = 0;
+    std::chrono::steady_clock::time_point trace_gnm_submit_started{};
+    bool trace_game_main_late_sample = false;
+    std::uint64_t trace_game_main_late_ordinal = 0;
+    std::uint64_t trace_game_main_late_elapsed_ms = 0;
+    bool trace_exit8_async_io_call = false;
+    bool trace_exit8_async_io_wait = false;
+    std::uint64_t trace_exit8_async_io_ordinal = 0;
+    std::chrono::steady_clock::time_point trace_exit8_async_io_started{};
+    bool trace_exit8_render_hle_call = false;
+    std::uint64_t trace_exit8_render_hle_ordinal = 0;
+    bool trace_exit8_taskgraph_tls_get = false;
+    std::uint64_t trace_exit8_taskgraph_tls_key = 0;
+    std::uint64_t trace_exit8_taskgraph_tls_fs_base = 0;
+    std::uint64_t trace_exit8_taskgraph_tls_fs_thread = 0;
+    std::uint64_t trace_exit8_taskgraph_tls_fs_context = 0;
+    std::uint64_t trace_exit8_taskgraph_tls_fs_depth = 0;
+    std::uint64_t trace_exit8_taskgraph_tls_scheduler = 0;
+    std::uint64_t trace_exit8_taskgraph_tls_named_array = 0;
+    const void* trace_exit8_taskgraph_tls_slot = nullptr;
+    int trace_exit8_taskgraph_tls_slot_seq = 0;
+#endif
+    try {
+        target_metadata = &GetExecutorHleTargetMetadata(call->native_function);
+        RecordFexHleThunkAdmission(*call, descriptor, *target_metadata);
+#ifdef __ANDROID__
+        static const bool trace_exit8_taskgraph_boundary =
+            ExecutorEnvFlag("EXECUTOR_TRACE_EXIT8_TASKGRAPH_BOUNDARY");
+        if (trace_exit8_taskgraph_boundary && current_guest_thread != nullptr) {
+            auto* const call_module =
+                FindGuestModuleByAddress(call->guest_rip);
+            const auto call_offset =
+                call_module != nullptr
+                    ? GuestModuleOffset(*call_module, call->guest_rip)
+                    : 0;
+
+
+
+            trace_exit8_taskgraph_tls_get = call_offset == 0x2c994;
+            if (trace_exit8_taskgraph_tls_get) {
+                trace_exit8_taskgraph_tls_key = call->gpr[0];
+                Lsx4FexGuestContextV3 tls_context{};
+                tls_context.struct_size = sizeof(tls_context);
+                tls_context.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+                const auto* const tls_api = Executor::Fex::ActiveApi();
+                const auto tls_identity = MakeFexThreadIdentity();
+                if (tls_api != nullptr &&
+                    tls_api->get_guest_context != nullptr &&
+                    tls_api->get_guest_context(tls_api->backend_context,
+                                               &tls_identity,
+                                               &tls_context) ==
+                        LSX4_FEX_STATUS_OK) {
+                    trace_exit8_taskgraph_tls_fs_base = tls_context.fs_base;
+                    trace_exit8_taskgraph_tls_scheduler = tls_context.gpr[15];
+                    std::lock_guard memory_lock(g_box64_boundary_probe_lock);
+                    if (trace_exit8_taskgraph_tls_scheduler != 0) {
+                        (void)GuestReadQwordBestEffortLocked(
+                            trace_exit8_taskgraph_tls_scheduler + 0x30,
+                            trace_exit8_taskgraph_tls_named_array);
+                    }
+                    if (tls_context.fs_base >= 0xc58) {
+                        (void)GuestReadQwordBestEffortLocked(
+                            tls_context.fs_base - 0xc58,
+                            trace_exit8_taskgraph_tls_fs_thread);
+                        (void)GuestReadQwordBestEffortLocked(
+                            tls_context.fs_base - 0xc50,
+                            trace_exit8_taskgraph_tls_fs_context);
+                        (void)GuestReadQwordBestEffortLocked(
+                            tls_context.fs_base - 0xc48,
+                            trace_exit8_taskgraph_tls_fs_depth);
+                    }
+                }
+                if (trace_exit8_taskgraph_tls_key < 256 &&
+                    current_guest_thread->specific != nullptr) {
+                    const auto& slot = current_guest_thread->specific[
+                        static_cast<std::size_t>(
+                            trace_exit8_taskgraph_tls_key)];
+                    trace_exit8_taskgraph_tls_slot = slot.data;
+                    trace_exit8_taskgraph_tls_slot_seq = slot.seqno;
+                }
+            }
+        }
+
+
+
+        static const bool trace_fex_gnm_submit_probe =
+            ExecutorEnvFlag("EXECUTOR_TRACE_FEX_THREAD_HLE_PROBE");
+        const std::string_view hle_name = target_metadata->name;
+        trace_gnm_submit_contract =
+            trace_fex_gnm_submit_probe &&
+            (hle_name == "yvZ73uQUqrk" || hle_name == "xbxNatawohc" ||
+             hle_name == "Ga6r7H6Y0RI" || hle_name == "zwY0YV91TTI" ||
+             hle_name == "jRcI8VcgTz4");
+        if (trace_gnm_submit_contract) {
+            static std::atomic<std::uint64_t> gnm_submit_calls{};
+            trace_gnm_submit_ordinal =
+                gnm_submit_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+            trace_gnm_submit_started = std::chrono::steady_clock::now();
+            if (trace_gnm_submit_ordinal <= 512 ||
+                (trace_gnm_submit_ordinal & (trace_gnm_submit_ordinal - 1)) == 0) {
+                char thread_name[32]{};
+                pthread_getname_np(pthread_self(), thread_name, sizeof(thread_name));
+                NativeLog(
+                    ANDROID_LOG_WARN,
+                    "[EXECUTOR_FEX_GNM_SUBMIT_PROBE] phase=enter ordinal=%llu "
+                    "tid=%lld thread=%s name=%s args=0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx",
+                    static_cast<unsigned long long>(trace_gnm_submit_ordinal),
+                    static_cast<long long>(syscall(SYS_gettid)),
+                    thread_name[0] ? thread_name : "<unnamed>",
+                    target_metadata->name.c_str(),
+                    static_cast<unsigned long long>(call->gpr[0]),
+                    static_cast<unsigned long long>(call->gpr[1]),
+                    static_cast<unsigned long long>(call->gpr[2]),
+                    static_cast<unsigned long long>(call->gpr[3]),
+                    static_cast<unsigned long long>(call->gpr[4]),
+                    static_cast<unsigned long long>(call->gpr[5]));
+            }
+        }
+        static const bool trace_fex_game_main_late =
+            ExecutorEnvFlag("EXECUTOR_TRACE_FEX_GAME_MAIN_LATE");
+        if (trace_fex_game_main_late && current_guest_thread != nullptr) {
+            static const auto hle_epoch = std::chrono::steady_clock::now();
+            static thread_local const Libraries::Kernel::Pthread* sampled_guest_thread{};
+            static thread_local bool sampled_thread_is_game_main{};
+            static thread_local std::uint64_t sampled_thread_calls{};
+            if (sampled_guest_thread != current_guest_thread) {
+                sampled_guest_thread = current_guest_thread;
+                sampled_thread_is_game_main = true;
+                sampled_thread_calls = 0;
+            }
+            trace_game_main_late_ordinal = ++sampled_thread_calls;
+            if (sampled_thread_is_game_main &&
+                (trace_game_main_late_ordinal & 255) == 0) {
+                trace_game_main_late_elapsed_ms =
+                    static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - hle_epoch).count());
+                trace_game_main_late_sample = trace_game_main_late_elapsed_ms >= 45000 &&
+                                              trace_game_main_late_elapsed_ms <= 60000;
+            }
+
+            const std::string_view thread_name = current_guest_thread->name;
+            const bool async_loading_thread =
+                reinterpret_cast<std::uint64_t>(current_guest_thread) ==
+                g_exit8_async_loading_guest_thread.load(std::memory_order_acquire);
+            const bool fios_thread = thread_name.find("SceFios") != std::string_view::npos;
+            const bool async_helper_thread =
+                thread_name.find("TAsync") != std::string_view::npos;
+            const bool render_thread =
+                reinterpret_cast<std::uint64_t>(current_guest_thread) ==
+                g_exit8_render_guest_thread.load(std::memory_order_acquire);
+            const auto target_contains = [&](const std::string_view token) {
+                return target_metadata->name.find(token) != std::string::npos ||
+                       target_metadata->symbol_name.find(token) != std::string::npos;
+            };
+            const bool io_target =
+                target_contains("Aio") || target_contains("aio") ||
+                target_contains("Fios") || target_contains("fios") ||
+                target_contains("Open") || target_contains("open") ||
+                target_contains("Read") || target_contains("read") ||
+                target_contains("Pread") || target_contains("pread") ||
+                target_contains("Lseek") || target_contains("lseek") ||
+                target_contains("Stat") || target_contains("stat") ||
+                target_contains("Close") || target_contains("close") ||
+                target_contains("Mmap") || target_contains("mmap") ||
+                target_contains("Ioctl") || target_contains("ioctl");
+            trace_exit8_async_io_wait =
+                target_contains("Wait") || target_contains("wait") ||
+                target_contains("Cond") || target_contains("cond") ||
+                target_contains("Event") || target_contains("event") ||
+                target_contains("Equeue") || target_contains("equeue") ||
+                target_contains("Semaphore") || target_contains("sem_") ||
+                target_contains("Sleep") || target_contains("sleep");
+            trace_exit8_async_io_call =
+                (async_loading_thread || fios_thread || async_helper_thread) &&
+                (io_target || trace_exit8_async_io_wait);
+            if (trace_exit8_async_io_call) {
+                static std::atomic<std::uint64_t> async_io_calls{};
+                trace_exit8_async_io_ordinal =
+                    async_io_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+                const bool sampled_wait =
+                    !trace_exit8_async_io_wait || trace_exit8_async_io_ordinal <= 512 ||
+                    (trace_exit8_async_io_ordinal &
+                     (trace_exit8_async_io_ordinal - 1)) == 0;
+                trace_exit8_async_io_call = sampled_wait;
+                if (trace_exit8_async_io_call) {
+                    trace_exit8_async_io_started = std::chrono::steady_clock::now();
+                    static std::mutex async_io_probe_file_mutex;
+                    std::scoped_lock probe_file_lock{async_io_probe_file_mutex};
+                    const auto probe_path = std::filesystem::path(g_root) /
+                                            "diagnostic-exit8-async-io.txt";
+                    if (std::FILE* probe_file =
+                            std::fopen(probe_path.string().c_str(), "a")) {
+                        std::fprintf(
+                            probe_file,
+                            "phase=enter ordinal=%llu tid=%lld guest=%p thread=%s "
+                            "name=%s symbol=%s rip=0x%llx ret=0x%llx "
+                            "args=0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx\n",
+                            static_cast<unsigned long long>(trace_exit8_async_io_ordinal),
+                            static_cast<long long>(syscall(SYS_gettid)),
+                            current_guest_thread, current_guest_thread->name.c_str(),
+                            target_metadata->name.c_str(),
+                            target_metadata->symbol_name.c_str(),
+                            static_cast<unsigned long long>(call->guest_rip),
+                            static_cast<unsigned long long>(
+                                GuestReturnAddress(call->guest_rsp)),
+                            static_cast<unsigned long long>(call->gpr[0]),
+                            static_cast<unsigned long long>(call->gpr[1]),
+                            static_cast<unsigned long long>(call->gpr[2]),
+                            static_cast<unsigned long long>(call->gpr[3]),
+                            static_cast<unsigned long long>(call->gpr[4]),
+                            static_cast<unsigned long long>(call->gpr[5]));
+                        std::fclose(probe_file);
+                    }
+                }
+            }
+            if (render_thread) {
+                static std::atomic<std::uint64_t> render_hle_calls{};
+                static thread_local std::string previous_render_hle_target;
+                const auto ordinal =
+                    render_hle_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+                trace_exit8_render_hle_ordinal = ordinal;
+                const std::string current_render_hle_target =
+                    !target_metadata->name.empty()
+                        ? target_metadata->name
+                        : target_metadata->symbol_name;
+                const bool render_target_changed =
+                    current_render_hle_target != previous_render_hle_target;
+                previous_render_hle_target = current_render_hle_target;
+                const bool render_wait_boundary =
+                    current_render_hle_target == "WKAXJ4XBPQ4" ||
+                    current_render_hle_target == "JGgj7Uvrl+A" ||
+                    current_render_hle_target == "9UK1vLZQft4" ||
+                    current_render_hle_target == "tn3VlD0hG60";
+                trace_exit8_render_hle_call =
+                    ordinal <= 512 || (ordinal & (ordinal - 1)) == 0 ||
+                    (ordinal >= 500000 && render_target_changed &&
+                     render_wait_boundary);
+                if (trace_exit8_render_hle_call) {
+                    Lsx4FexGuestContextV3 render_context{};
+                    render_context.struct_size = sizeof(render_context);
+                    render_context.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+                    const auto* const render_api = Executor::Fex::ActiveApi();
+                    const auto render_identity = MakeFexThreadIdentity();
+                    const int render_context_status =
+                        render_api != nullptr &&
+                                render_api->get_guest_context != nullptr
+                            ? render_api->get_guest_context(
+                                  render_api->backend_context,
+                                  &render_identity, &render_context)
+                            : LSX4_FEX_STATUS_INVALID_STATE;
+                    static std::mutex render_hle_file_mutex;
+                    std::scoped_lock render_file_lock{render_hle_file_mutex};
+                    const auto render_probe_path =
+                        std::filesystem::path(g_root) /
+                        "diagnostic-exit8-render-thread-hle.txt";
+                    if (std::FILE* const render_file =
+                            std::fopen(render_probe_path.string().c_str(), "a")) {
+                        std::string render_stack_qwords;
+                        std::ostringstream render_frame_chain;
+                        if (current_render_hle_target == "WKAXJ4XBPQ4") {
+                            std::lock_guard memory_lock(
+                                g_box64_boundary_probe_lock);
+                            render_stack_qwords =
+                                GuestQwordsHexBestEffortLocked(call->guest_rsp,
+                                                               48);
+                            std::uint64_t frame = render_context.gpr[5];
+                            for (unsigned depth = 0;
+                                 depth < 16 && frame != 0; ++depth) {
+                                std::uint64_t next_frame = 0;
+                                std::uint64_t return_address = 0;
+                                if (!GuestReadQwordBestEffortLocked(
+                                        frame, next_frame) ||
+                                    !GuestReadQwordBestEffortLocked(
+                                        frame + 8, return_address)) {
+                                    break;
+                                }
+                                if (depth != 0) {
+                                    render_frame_chain << ' ';
+                                }
+                                auto* const return_module =
+                                    FindGuestModuleByAddress(return_address);
+                                render_frame_chain
+                                    << depth << ":frame=0x" << std::hex
+                                    << frame << ",ret=0x" << return_address;
+                                if (return_module != nullptr) {
+                                    render_frame_chain
+                                        << "@0x"
+                                        << GuestModuleOffset(*return_module,
+                                                             return_address)
+                                        << ':'
+                                        << return_module->file.filename().string();
+                                }
+                                if (next_frame <= frame ||
+                                    next_frame - frame > 0x1000000) {
+                                    break;
+                                }
+                                frame = next_frame;
+                            }
+                        }
+                        std::fprintf(
+                            render_file,
+                            "phase=enter ordinal=%llu tid=%lld name=%s symbol=%s "
+                            "rip=0x%llx ret=0x%llx rsp=0x%llx args=0x%llx,0x%llx,0x%llx,0x%llx "
+                            "contextRc=%d contextRip=0x%llx rflags=0x%llx "
+                            "regs=0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,"
+                            "0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx "
+                            "chain=%s stack=%s\n",
+                            static_cast<unsigned long long>(ordinal),
+                            static_cast<long long>(syscall(SYS_gettid)),
+                            target_metadata->name.c_str(),
+                            target_metadata->symbol_name.c_str(),
+                            static_cast<unsigned long long>(call->guest_rip),
+                            static_cast<unsigned long long>(
+                                GuestReturnAddress(call->guest_rsp)),
+                            static_cast<unsigned long long>(call->guest_rsp),
+                            static_cast<unsigned long long>(call->gpr[0]),
+                            static_cast<unsigned long long>(call->gpr[1]),
+                            static_cast<unsigned long long>(call->gpr[2]),
+                            static_cast<unsigned long long>(call->gpr[3]),
+                            render_context_status,
+                            static_cast<unsigned long long>(render_context.rip),
+                            static_cast<unsigned long long>(render_context.rflags),
+                            static_cast<unsigned long long>(render_context.gpr[0]),
+                            static_cast<unsigned long long>(render_context.gpr[1]),
+                            static_cast<unsigned long long>(render_context.gpr[2]),
+                            static_cast<unsigned long long>(render_context.gpr[3]),
+                            static_cast<unsigned long long>(render_context.gpr[4]),
+                            static_cast<unsigned long long>(render_context.gpr[5]),
+                            static_cast<unsigned long long>(render_context.gpr[6]),
+                            static_cast<unsigned long long>(render_context.gpr[7]),
+                            static_cast<unsigned long long>(render_context.gpr[8]),
+                            static_cast<unsigned long long>(render_context.gpr[9]),
+                            static_cast<unsigned long long>(render_context.gpr[10]),
+                            static_cast<unsigned long long>(render_context.gpr[11]),
+                            static_cast<unsigned long long>(render_context.gpr[12]),
+                            static_cast<unsigned long long>(render_context.gpr[13]),
+                            static_cast<unsigned long long>(render_context.gpr[14]),
+                            static_cast<unsigned long long>(render_context.gpr[15]),
+                            render_frame_chain.str().c_str(),
+                            render_stack_qwords.c_str());
+                        std::fclose(render_file);
+                    }
+                }
+            }
+        }
+
+
+
+
+        if (trace_exit8_taskgraph_boundary && current_guest_thread != nullptr &&
+            reinterpret_cast<std::uint64_t>(current_guest_thread) ==
+                g_exit8_render_guest_thread.load(std::memory_order_acquire) &&
+            target_metadata->name == "WKAXJ4XBPQ4") {
+            Lsx4FexGuestContextV3 event_context{};
+            event_context.struct_size = sizeof(event_context);
+            event_context.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+            const auto* const event_api = Executor::Fex::ActiveApi();
+            const auto event_identity = MakeFexThreadIdentity();
+            const int event_context_status =
+                event_api != nullptr && event_api->get_guest_context != nullptr
+                    ? event_api->get_guest_context(event_api->backend_context,
+                                                   &event_identity,
+                                                   &event_context)
+                    : LSX4_FEX_STATUS_INVALID_STATE;
+            std::uint64_t graph_event = 0;
+            bool rhi_cleanup_wait = false;
+            std::string graph_event_qwords;
+            if (event_context_status == LSX4_FEX_STATUS_OK) {
+                std::lock_guard memory_lock(g_box64_boundary_probe_lock);
+                std::uint64_t frame = event_context.gpr[5];
+                for (unsigned depth = 0; depth < 16 && frame != 0; ++depth) {
+                    std::uint64_t next_frame = 0;
+                    std::uint64_t return_address = 0;
+                    if (!GuestReadQwordBestEffortLocked(frame, next_frame) ||
+                        !GuestReadQwordBestEffortLocked(frame + 8,
+                                                        return_address)) {
+                        break;
+                    }
+                    auto* const return_module =
+                        FindGuestModuleByAddress(return_address);
+                    const auto return_offset =
+                        return_module != nullptr
+                            ? GuestModuleOffset(*return_module, return_address)
+                            : 0;
+                    if (return_offset == 0x8cf57c) {
+                        std::uint64_t event_buffer = 0;
+                        (void)GuestReadQwordBestEffortLocked(
+                            frame - 0x40, event_buffer);
+                        const std::uint64_t event_slot =
+                            event_buffer != 0 ? event_buffer : frame - 0x60;
+                        rhi_cleanup_wait = GuestReadQwordBestEffortLocked(
+                            event_slot, graph_event);
+                    }
+                    if (next_frame <= frame ||
+                        next_frame - frame > 0x1000000) {
+                        break;
+                    }
+                    frame = next_frame;
+                }
+                if (rhi_cleanup_wait && graph_event != 0) {
+                    graph_event_qwords =
+                        GuestQwordsHexBestEffortLocked(graph_event, 32);
+                }
+            }
+            if (rhi_cleanup_wait) {
+                static std::atomic<std::uint64_t> rhi_event_wait_ordinal{};
+                const auto ordinal = rhi_event_wait_ordinal.fetch_add(
+                                         1, std::memory_order_relaxed) +
+                                     1;
+                static std::mutex rhi_event_file_mutex;
+                std::scoped_lock event_file_lock{rhi_event_file_mutex};
+                const auto event_path = std::filesystem::path(g_root) /
+                                        "diagnostic-exit8-rhi-event-enter.txt";
+                if (std::FILE* const event_file =
+                        std::fopen(event_path.string().c_str(), "a")) {
+                    std::fprintf(
+                        event_file,
+                        "ordinal=%llu tid=%lld rip=0x%llx rbp=0x%llx "
+                        "cond=0x%llx mutex=0x%llx event=0x%llx qwords=%s\n",
+                        static_cast<unsigned long long>(ordinal),
+                        static_cast<long long>(syscall(SYS_gettid)),
+                        static_cast<unsigned long long>(event_context.rip),
+                        static_cast<unsigned long long>(event_context.gpr[5]),
+                        static_cast<unsigned long long>(call->gpr[0]),
+                        static_cast<unsigned long long>(call->gpr[1]),
+                        static_cast<unsigned long long>(graph_event),
+                        graph_event_qwords.empty()
+                            ? "<unavailable>"
+                            : graph_event_qwords.c_str());
+                    std::fclose(event_file);
+                }
+            }
+        }
+#endif
+        if (target_metadata->fex_context_replacing_fiber_target) {
+
+
+
+
+            if (g_fex_hle_dispatch_depth != 1) {
+                result->status = LSX4_FEX_STATUS_INVALID_STATE;
+                NativeLog(ANDROID_LOG_ERROR,
+                          "[EXECUTOR_FEX_FIBER_CONTEXT] stage=depth-reject "
+                          "native=0x%llx depth=%u",
+                          static_cast<unsigned long long>(call->native_function),
+                          g_fex_hle_dispatch_depth);
+                return result->status;
+            }
+        }
+        RecordMappedEntryHleBoundary(
+            target_metadata->name.c_str(), target_metadata->symbol_name.c_str(),
+            call->native_function, call->guest_rsp);
+        const std::uint64_t hle_guest_thread =
+            reinterpret_cast<std::uint64_t>(current_guest_thread);
+        const bool leaf_boundary_elision =
+            Executor::CpuTuning::Frozen().function_replacements !=
+                Executor::CpuTuning::Aggressiveness::Off &&
+            FexLeafHleBoundaryElisionEnabled() && hle_guest_thread != 0 &&
+            target_metadata->executable && target_metadata->jit_leaf_direct_safe &&
+            target_metadata->fp_abi == ExecutorHleFpAbi::None &&
+            target_metadata->stack_abi == ExecutorHleStackAbi::None;
+        std::optional<ScopedExecutorHleBoundary> hle_boundary;
+        std::optional<ScopedExecutorLeafHleBoundary> leaf_hle_boundary;
+        if (leaf_boundary_elision) {
+            leaf_hle_boundary.emplace();
+        } else {
+            hle_boundary.emplace(
+                call->guest_rsp, target_metadata->name.c_str(),
+                target_metadata->symbol_name.c_str(),
+                std::array<std::uint64_t, 8>{
+                    call->xmm[0].low, call->xmm[1].low, call->xmm[2].low,
+                    call->xmm[3].low, call->xmm[4].low, call->xmm[5].low,
+                    call->xmm[6].low, call->xmm[7].low},
+                hle_guest_thread);
+        }
+#ifdef __ANDROID__
+        if (trace_fex_game_main_late && current_guest_thread != nullptr &&
+            current_guest_thread->name == "Game:Main" &&
+            target_metadata->name == "WKAXJ4XBPQ4") {
+
+
+
+
+            std::uint64_t probe_caller_return = 0;
+            {
+                std::lock_guard memory_lock(g_box64_boundary_probe_lock);
+                (void)GuestReadQwordBestEffortLocked(call->guest_rsp + 0x80,
+                                                     probe_caller_return);
+            }
+            auto* const probe_caller_module =
+                FindGuestModuleByAddress(probe_caller_return);
+            const bool title_blocking_wait =
+                probe_caller_module != nullptr &&
+                probe_caller_module->file.filename() == "eboot.bin";
+            static std::atomic_int blocking_wait_enter_budget{128};
+            if (title_blocking_wait &&
+                blocking_wait_enter_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+                std::uint64_t caller_frame = 0;
+                std::uint64_t caller_return = 0;
+                std::ostringstream frame_chain;
+                std::string stack_qwords;
+                {
+                    std::lock_guard memory_lock(g_box64_boundary_probe_lock);
+
+
+
+
+
+
+                    stack_qwords = GuestQwordsHexBestEffortLocked(call->guest_rsp, 128);
+                    (void)GuestReadQwordBestEffortLocked(call->guest_rsp + 0x78,
+                                                         caller_frame);
+                    (void)GuestReadQwordBestEffortLocked(call->guest_rsp + 0x80,
+                                                         caller_return);
+                    std::uint64_t frame = caller_frame;
+                    for (unsigned depth = 0; depth < 16 && frame != 0; ++depth) {
+                        std::uint64_t next_frame = 0;
+                        std::uint64_t return_address = 0;
+                        if (!GuestReadQwordBestEffortLocked(frame, next_frame) ||
+                            !GuestReadQwordBestEffortLocked(frame + 8,
+                                                           return_address)) {
+                            break;
+                        }
+                        if (depth != 0) {
+                            frame_chain << ' ';
+                        }
+                        auto* const return_module =
+                            FindGuestModuleByAddress(return_address);
+                        frame_chain << depth << ":frame=0x" << std::hex << frame
+                                    << ",ret=0x" << return_address;
+                        if (return_module != nullptr) {
+                            frame_chain << "@0x"
+                                        << GuestModuleOffset(*return_module,
+                                                             return_address)
+                                        << ':'
+                                        << return_module->file.filename().string();
+                        }
+                        if (next_frame <= frame || next_frame - frame > 0x1000000) {
+                            break;
+                        }
+                        frame = next_frame;
+                    }
+                }
+                auto* const caller_module = FindGuestModuleByAddress(caller_return);
+                static std::mutex blocking_wait_enter_file_mutex;
+                std::scoped_lock wait_file_lock{blocking_wait_enter_file_mutex};
+                const auto wait_probe_path =
+                    std::filesystem::path(g_root) /
+                    "diagnostic-exit8-game-main-blocking-wait-enter.txt";
+                if (std::FILE* const wait_file =
+                        std::fopen(wait_probe_path.string().c_str(), "a")) {
+                    std::fprintf(
+                        wait_file,
+                        "tid=%lld threadPtr=%p rsp=0x%llx cond=0x%llx mutex=0x%llx "
+                        "callerFrame=0x%llx callerReturn=0x%llx "
+                        "callerOffset=0x%llx callerModule=%s chain=%s stack=%s\n",
+                        static_cast<long long>(syscall(SYS_gettid)),
+                        current_guest_thread,
+                        static_cast<unsigned long long>(call->guest_rsp),
+                        static_cast<unsigned long long>(call->gpr[0]),
+                        static_cast<unsigned long long>(call->gpr[1]),
+                        static_cast<unsigned long long>(caller_frame),
+                        static_cast<unsigned long long>(caller_return),
+                        static_cast<unsigned long long>(
+                            caller_module != nullptr
+                                ? GuestModuleOffset(*caller_module, caller_return)
+                                : 0),
+                        caller_module != nullptr
+                            ? caller_module->file.string().c_str()
+                            : "<unknown>",
+                        frame_chain.str().c_str(), stack_qwords.c_str());
+                    std::fclose(wait_file);
+                }
+            }
+        }
+#endif
+        if (target_metadata->fex_context_replacing_fiber_target) {
+            const auto identity = MakeFexThreadIdentity();
+            const std::uint64_t guest_return =
+                GuestReturnAddress(call->guest_rsp);
+            fiber_context_bridge.emplace(
+                Executor::Fex::ActiveApi(), identity, call->guest_rsp,
+                guest_return);
+            if (!fiber_context_bridge->active()) {
+                result->status = fiber_context_bridge->status();
+                NativeLog(ANDROID_LOG_ERROR,
+                          "[EXECUTOR_FEX_FIBER_CONTEXT] stage=publish-failed "
+                          "native=0x%llx status=%d",
+                          static_cast<unsigned long long>(call->native_function),
+                          result->status);
+                return result->status;
+            }
+        }
+        if (target_metadata->fex_guest_thread_exit_target) {
+
+
+
+
+
+            staged_guest_thread_exit = true;
+            typed_result.rax = call->gpr[0];
+            typed_result.return_class[0] = descriptor.return_class[0];
+            typed_result.return_class[1] = descriptor.return_class[1];
+            typed_result.return_eightbyte_count = descriptor.return_eightbyte_count;
+            typed_result.sret_flags = descriptor.sret_flags;
+            typed_result.abi_descriptor_id = descriptor.descriptor_id;
+            static std::atomic_int staged_pthread_exit_log_budget{16};
+            if (staged_pthread_exit_log_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+                NativeLog(ANDROID_LOG_INFO,
+                          "[EXECUTOR_FEX_PTHREAD_EXIT_STAGED] guest=0x%llx "
+                          "status=0x%llx native=0x%llx",
+                          static_cast<unsigned long long>(hle_guest_thread),
+                          static_cast<unsigned long long>(typed_result.rax),
+                          static_cast<unsigned long long>(call->native_function));
+            }
+        } else if (!Core::AeroLib::InvokeAndroidX64HleTypedTargetResolved(
+                       descriptor, raw_call, &typed_result)) {
+            result->status = LSX4_FEX_STATUS_BACKEND_FAILURE;
+            NativeLog(
+                ANDROID_LOG_ERROR,
+                "[EXECUTOR_FEX_HLE_INVOKE_FAILED] native=0x%llx rip=0x%llx "
+                "rsp=0x%llx name=%s symbol=%s descriptor=0x%llx "
+                "signature=%s arguments=%u gpr=%u sse=%u stackBytes=%u "
+                "returnCount=%u sret=0x%x",
+                static_cast<unsigned long long>(call->native_function),
+                static_cast<unsigned long long>(call->guest_rip),
+                static_cast<unsigned long long>(call->guest_rsp),
+                target_metadata->name.empty() ? "<none>"
+                                              : target_metadata->name.c_str(),
+                target_metadata->symbol_name.empty()
+                    ? "<none>"
+                    : target_metadata->symbol_name.c_str(),
+                static_cast<unsigned long long>(descriptor.descriptor_id),
+                descriptor.signature != nullptr ? descriptor.signature : "<none>",
+                descriptor.argument_count, descriptor.gpr_argument_count,
+                descriptor.sse_argument_count, descriptor.stack_argument_bytes,
+                descriptor.return_eightbyte_count, descriptor.sret_flags);
+            return LSX4_FEX_STATUS_BACKEND_FAILURE;
+        }
+        if (fiber_context_bridge.has_value()) {
+            const std::int32_t commit_status = fiber_context_bridge->Commit();
+            if (commit_status != LSX4_FEX_STATUS_OK) {
+                result->status = commit_status;
+                NativeLog(ANDROID_LOG_ERROR,
+                          "[EXECUTOR_FEX_FIBER_CONTEXT] stage=commit-failed "
+                          "native=0x%llx status=%d",
+                          static_cast<unsigned long long>(call->native_function),
+                          commit_status);
+                return commit_status;
+            }
+        }
+        if (hle_boundary.has_value()) {
+            hle_boundary->Release();
+        } else {
+            leaf_hle_boundary->Release();
+        }
+#ifdef __ANDROID__
+        if (trace_gnm_submit_contract &&
+            (trace_gnm_submit_ordinal <= 512 ||
+             (trace_gnm_submit_ordinal & (trace_gnm_submit_ordinal - 1)) == 0)) {
+            const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() -
+                                        trace_gnm_submit_started)
+                                        .count();
+            NativeLog(
+                ANDROID_LOG_WARN,
+                "[EXECUTOR_FEX_GNM_SUBMIT_PROBE] phase=return ordinal=%llu "
+                "name=%s result=%lld elapsedUs=%lld",
+                static_cast<unsigned long long>(trace_gnm_submit_ordinal),
+                target_metadata->name.c_str(),
+                static_cast<long long>(typed_result.rax), static_cast<long long>(elapsed_us));
+            static std::mutex gnm_submit_probe_file_mutex;
+            std::scoped_lock probe_file_lock{gnm_submit_probe_file_mutex};
+            const auto probe_path = std::filesystem::path(g_root) /
+                                    "diagnostic-exit8-gnm-submit-probe.txt";
+            if (std::FILE* probe_file = std::fopen(probe_path.string().c_str(), "a")) {
+                std::fprintf(probe_file,
+                             "ordinal=%llu tid=%lld name=%s "
+                             "args=0x%llx,0x%llx,0x%llx,0x%llx,0x%llx,0x%llx "
+                             "result=%lld elapsedUs=%lld\n",
+                             static_cast<unsigned long long>(trace_gnm_submit_ordinal),
+                             static_cast<long long>(syscall(SYS_gettid)),
+                             target_metadata->name.c_str(),
+                             static_cast<unsigned long long>(call->gpr[0]),
+                             static_cast<unsigned long long>(call->gpr[1]),
+                             static_cast<unsigned long long>(call->gpr[2]),
+                             static_cast<unsigned long long>(call->gpr[3]),
+                             static_cast<unsigned long long>(call->gpr[4]),
+                             static_cast<unsigned long long>(call->gpr[5]),
+                             static_cast<long long>(typed_result.rax),
+                             static_cast<long long>(elapsed_us));
+                std::fclose(probe_file);
+            }
+        }
+
+
+
+
+
+
+        if (trace_exit8_taskgraph_boundary && current_guest_thread != nullptr &&
+            current_guest_thread->name == "Game:Main" &&
+            target_metadata->name == "BmMjYxmew1w") {
+            static const auto taskgraph_probe_epoch =
+                std::chrono::steady_clock::now();
+            const auto taskgraph_elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - taskgraph_probe_epoch)
+                    .count();
+            static std::atomic_int taskgraph_probe_budget{8};
+            if (taskgraph_elapsed_ms >= 15000 &&
+                taskgraph_probe_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+                std::uint64_t wait_owner_frame = 0;
+                std::uint64_t wait_owner_return = 0;
+                std::uint64_t wait_state = 0;
+                std::string stack_qwords;
+                std::string state_qwords;
+                {
+                    std::lock_guard memory_lock(g_box64_boundary_probe_lock);
+                    stack_qwords =
+                        GuestQwordsHexBestEffortLocked(call->guest_rsp, 64);
+                    (void)GuestReadQwordBestEffortLocked(
+                        call->guest_rsp + 0xc8, wait_owner_frame);
+                    if (wait_owner_frame != 0) {
+                        (void)GuestReadQwordBestEffortLocked(
+                            wait_owner_frame + 8, wait_owner_return);
+                        (void)GuestReadQwordBestEffortLocked(
+                            wait_owner_frame - 0x28, wait_state);
+                    }
+                    if (wait_state != 0) {
+                        state_qwords =
+                            GuestQwordsHexBestEffortLocked(wait_state, 16);
+                    }
+                }
+                auto* const wait_owner_module =
+                    FindGuestModuleByAddress(wait_owner_return);
+                static std::mutex taskgraph_probe_file_mutex;
+                std::scoped_lock probe_file_lock{taskgraph_probe_file_mutex};
+                const auto probe_path = std::filesystem::path(g_root) /
+                                        "diagnostic-exit8-taskgraph-boundary.txt";
+                if (std::FILE* const probe_file =
+                        std::fopen(probe_path.string().c_str(), "a")) {
+                    std::fprintf(
+                        probe_file,
+                        "elapsedMs=%lld rsp=0x%llx result=0x%llx "
+                        "cond=0x%llx mutex=0x%llx timeoutUs=%llu "
+                        "ownerFrame=0x%llx ownerReturn=0x%llx ownerOffset=0x%llx "
+                        "ownerModule=%s state=0x%llx stateQwords=%s stack=%s\n",
+                        static_cast<long long>(taskgraph_elapsed_ms),
+                        static_cast<unsigned long long>(call->guest_rsp),
+                        static_cast<unsigned long long>(typed_result.rax),
+                        static_cast<unsigned long long>(call->gpr[0]),
+                        static_cast<unsigned long long>(call->gpr[1]),
+                        static_cast<unsigned long long>(call->gpr[2]),
+                        static_cast<unsigned long long>(wait_owner_frame),
+                        static_cast<unsigned long long>(wait_owner_return),
+                        static_cast<unsigned long long>(
+                            wait_owner_module != nullptr
+                                ? GuestModuleOffset(*wait_owner_module,
+                                                    wait_owner_return)
+                                : 0),
+                        wait_owner_module != nullptr
+                            ? wait_owner_module->file.string().c_str()
+                            : "<unknown>",
+                        static_cast<unsigned long long>(wait_state),
+                        state_qwords.empty() ? "<unavailable>"
+                                             : state_qwords.c_str(),
+                        stack_qwords.c_str());
+                    std::fclose(probe_file);
+                }
+            }
+        }
+
+
+
+
+
+
+        if (trace_exit8_taskgraph_boundary && current_guest_thread != nullptr &&
+            reinterpret_cast<std::uint64_t>(current_guest_thread) ==
+                g_exit8_render_guest_thread.load(std::memory_order_acquire) &&
+            target_metadata->name == "WKAXJ4XBPQ4") {
+            Lsx4FexGuestContextV3 filter_context{};
+            filter_context.struct_size = sizeof(filter_context);
+            filter_context.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+            const auto* const filter_api = Executor::Fex::ActiveApi();
+            const auto filter_identity = MakeFexThreadIdentity();
+            const int filter_context_status =
+                filter_api != nullptr && filter_api->get_guest_context != nullptr
+                    ? filter_api->get_guest_context(filter_api->backend_context,
+                                                    &filter_identity,
+                                                    &filter_context)
+                    : LSX4_FEX_STATUS_INVALID_STATE;
+            bool rhi_taskgraph_wait = false;
+            if (filter_context_status == LSX4_FEX_STATUS_OK) {
+                std::lock_guard memory_lock(g_box64_boundary_probe_lock);
+                std::uint64_t frame = filter_context.gpr[5];
+                for (unsigned depth = 0; depth < 16 && frame != 0; ++depth) {
+                    std::uint64_t next_frame = 0;
+                    std::uint64_t return_address = 0;
+                    if (!GuestReadQwordBestEffortLocked(frame, next_frame) ||
+                        !GuestReadQwordBestEffortLocked(frame + 8,
+                                                        return_address)) {
+                        break;
+                    }
+                    auto* const return_module =
+                        FindGuestModuleByAddress(return_address);
+                    if (return_module != nullptr &&
+                        GuestModuleOffset(*return_module, return_address) ==
+                            0x937dd8) {
+                        rhi_taskgraph_wait = true;
+                        break;
+                    }
+                    if (next_frame <= frame ||
+                        next_frame - frame > 0x1000000) {
+                        break;
+                    }
+                    frame = next_frame;
+                }
+            }
+            static std::atomic_int render_taskgraph_probe_budget{32};
+            if (rhi_taskgraph_wait &&
+                render_taskgraph_probe_budget.fetch_sub(
+                    1, std::memory_order_relaxed) > 0) {
+                Lsx4FexGuestContextV3 render_context{};
+                render_context.struct_size = sizeof(render_context);
+                render_context.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+                const auto* const render_api = Executor::Fex::ActiveApi();
+                const auto render_identity = MakeFexThreadIdentity();
+                const int render_context_status =
+                    render_api != nullptr &&
+                            render_api->get_guest_context != nullptr
+                        ? render_api->get_guest_context(
+                              render_api->backend_context, &render_identity,
+                              &render_context)
+                        : LSX4_FEX_STATUS_INVALID_STATE;
+
+                struct RenderFrame final {
+                    std::uint64_t frame{};
+                    std::uint64_t return_address{};
+                    std::uint64_t return_offset{};
+                };
+                std::array<RenderFrame, 16> frames{};
+                std::size_t frame_count = 0;
+                std::uint64_t renderer = 0;
+                std::uint64_t visibility_event = 0;
+                std::uint64_t taskgraph_event = 0;
+                std::ostringstream frame_chain;
+                std::string renderer_qwords;
+                std::string event_qwords;
+                std::string taskgraph_event_qwords;
+                std::string stack_qwords;
+                {
+                    std::lock_guard memory_lock(g_box64_boundary_probe_lock);
+                    stack_qwords =
+                        GuestQwordsHexBestEffortLocked(call->guest_rsp, 64);
+                    std::uint64_t frame = render_context.gpr[5];
+                    for (unsigned depth = 0;
+                         depth < frames.size() && frame != 0; ++depth) {
+                        std::uint64_t next_frame = 0;
+                        std::uint64_t return_address = 0;
+                        if (!GuestReadQwordBestEffortLocked(frame, next_frame) ||
+                            !GuestReadQwordBestEffortLocked(
+                                frame + 8, return_address)) {
+                            break;
+                        }
+                        auto* const return_module =
+                            FindGuestModuleByAddress(return_address);
+                        const auto return_offset =
+                            return_module != nullptr
+                                ? GuestModuleOffset(*return_module,
+                                                    return_address)
+                                : 0;
+                        frames[frame_count++] = {
+                            .frame = frame,
+                            .return_address = return_address,
+                            .return_offset = return_offset,
+                        };
+                        if (depth != 0) {
+                            frame_chain << ' ';
+                        }
+                        frame_chain << depth << ":frame=0x" << std::hex
+                                    << frame << ",ret=0x" << return_address
+                                    << ",off=0x" << return_offset;
+                        if (next_frame <= frame ||
+                            next_frame - frame > 0x1000000) {
+                            break;
+                        }
+                        frame = next_frame;
+                    }
+                    for (std::size_t index = 1; index < frame_count; ++index) {
+                        if (frames[index].return_offset == 0x19925e4 &&
+                            GuestReadQwordBestEffortLocked(
+                                frames[index - 1].frame - 0x18, renderer)) {
+                            break;
+                        }
+                    }
+                    for (std::size_t index = 0; index < frame_count; ++index) {
+
+
+
+
+                        if (frames[index].return_offset == 0x8cf57c) {
+                            std::uint64_t event_buffer = 0;
+                            (void)GuestReadQwordBestEffortLocked(
+                                frames[index].frame - 0x40, event_buffer);
+                            const std::uint64_t event_slot =
+                                event_buffer != 0
+                                    ? event_buffer
+                                    : frames[index].frame - 0x60;
+                            if (GuestReadQwordBestEffortLocked(
+                                    event_slot, taskgraph_event)) {
+                                break;
+                            }
+                        }
+                    }
+                    if (renderer != 0) {
+                        renderer_qwords = GuestQwordsHexBestEffortLocked(
+                            renderer + 0x1af0, 16);
+                        (void)GuestReadQwordBestEffortLocked(
+                            renderer + 0x1b30, visibility_event);
+                    }
+                    if (visibility_event != 0) {
+                        event_qwords = GuestQwordsHexBestEffortLocked(
+                            visibility_event, 32);
+                    }
+                    if (taskgraph_event != 0) {
+                        taskgraph_event_qwords =
+                            GuestQwordsHexBestEffortLocked(taskgraph_event, 32);
+                    }
+                }
+                static std::mutex render_taskgraph_probe_file_mutex;
+                std::scoped_lock probe_file_lock{
+                    render_taskgraph_probe_file_mutex};
+                const auto probe_path =
+                    std::filesystem::path(g_root) /
+                    "diagnostic-exit8-render-taskgraph-boundary.txt";
+                if (std::FILE* const probe_file =
+                        std::fopen(probe_path.string().c_str(), "a")) {
+                    std::fprintf(
+                        probe_file,
+                        "contextRc=%d contextRip=0x%llx rbp=0x%llx "
+                        "cond=0x%llx mutex=0x%llx renderer=0x%llx "
+                        "visibilityEvent=0x%llx taskgraphEvent=0x%llx "
+                        "chain=%s rendererQwords=%s eventQwords=%s "
+                        "taskgraphEventQwords=%s stack=%s\n",
+                        render_context_status,
+                        static_cast<unsigned long long>(render_context.rip),
+                        static_cast<unsigned long long>(render_context.gpr[5]),
+                        static_cast<unsigned long long>(call->gpr[0]),
+                        static_cast<unsigned long long>(call->gpr[1]),
+                        static_cast<unsigned long long>(renderer),
+                        static_cast<unsigned long long>(visibility_event),
+                        static_cast<unsigned long long>(taskgraph_event),
+                        frame_chain.str().c_str(),
+                        renderer_qwords.empty() ? "<unavailable>"
+                                                : renderer_qwords.c_str(),
+                        event_qwords.empty() ? "<unavailable>"
+                                              : event_qwords.c_str(),
+                        taskgraph_event_qwords.empty()
+                            ? "<unavailable>"
+                            : taskgraph_event_qwords.c_str(),
+                        stack_qwords.c_str());
+                    std::fclose(probe_file);
+                }
+            }
+        }
+        if (trace_game_main_late_sample) {
+            static std::mutex game_main_late_probe_file_mutex;
+            std::scoped_lock probe_file_lock{game_main_late_probe_file_mutex};
+            const auto probe_path = std::filesystem::path(g_root) /
+                                    "diagnostic-exit8-game-main-late.txt";
+            if (std::FILE* probe_file = std::fopen(probe_path.string().c_str(), "a")) {
+                std::fprintf(probe_file,
+                             "elapsedMs=%llu sample=%llu tid=%lld thread=%s name=%s rip=0x%llx "
+                             "ret=0x%llx result=0x%llx args=0x%llx,0x%llx,0x%llx,0x%llx\n",
+                             static_cast<unsigned long long>(trace_game_main_late_elapsed_ms),
+                             static_cast<unsigned long long>(trace_game_main_late_ordinal),
+                             static_cast<long long>(syscall(SYS_gettid)),
+                             current_guest_thread ? current_guest_thread->name.c_str()
+                                                  : "<unknown>",
+                             target_metadata->name.c_str(),
+                             static_cast<unsigned long long>(call->guest_rip),
+                             static_cast<unsigned long long>(GuestReturnAddress(call->guest_rsp)),
+                             static_cast<unsigned long long>(typed_result.rax),
+                             static_cast<unsigned long long>(call->gpr[0]),
+                             static_cast<unsigned long long>(call->gpr[1]),
+                             static_cast<unsigned long long>(call->gpr[2]),
+                             static_cast<unsigned long long>(call->gpr[3]));
+                std::fclose(probe_file);
+            }
+        }
+        if (trace_fex_game_main_late && current_guest_thread != nullptr &&
+            current_guest_thread->name == "Game:Main" &&
+            (target_metadata->name == "BmMjYxmew1w" ||
+             target_metadata->name == "WKAXJ4XBPQ4")) {
+            static const auto wait_trace_epoch = std::chrono::steady_clock::now();
+            const auto wait_elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - wait_trace_epoch)
+                    .count();
+            static std::atomic_int timed_wait_stack_budget{16};
+            static std::atomic_int blocking_wait_stack_budget{128};
+            auto& wait_stack_budget = target_metadata->name == "WKAXJ4XBPQ4"
+                                          ? blocking_wait_stack_budget
+                                          : timed_wait_stack_budget;
+            const bool blocking_wait = target_metadata->name == "WKAXJ4XBPQ4";
+            if ((blocking_wait || wait_elapsed_ms >= 18000) &&
+                wait_stack_budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
+                std::uint64_t caller_frame = 0;
+                std::uint64_t caller_return = 0;
+                std::ostringstream frame_chain;
+                std::string stack_qwords;
+                {
+                    std::lock_guard memory_lock(g_box64_boundary_probe_lock);
+                    stack_qwords =
+                        GuestQwordsHexBestEffortLocked(call->guest_rsp, 32);
+                    (void)GuestReadQwordBestEffortLocked(
+                        call->guest_rsp + 0x78, caller_frame);
+                    (void)GuestReadQwordBestEffortLocked(
+                        call->guest_rsp + 0x80, caller_return);
+                    std::uint64_t frame = caller_frame;
+                    for (unsigned depth = 0; depth < 12 && frame != 0; ++depth) {
+                        std::uint64_t next_frame = 0;
+                        std::uint64_t return_address = 0;
+                        if (!GuestReadQwordBestEffortLocked(frame, next_frame) ||
+                            !GuestReadQwordBestEffortLocked(frame + 8,
+                                                           return_address)) {
+                            break;
+                        }
+                        if (depth != 0) {
+                            frame_chain << ' ';
+                        }
+                        auto* const return_module =
+                            FindGuestModuleByAddress(return_address);
+                        frame_chain << depth << ":frame=0x" << std::hex << frame
+                                    << ",ret=0x" << return_address;
+                        if (return_module != nullptr) {
+                            frame_chain << "@0x"
+                                        << GuestModuleOffset(*return_module,
+                                                             return_address)
+                                        << ':'
+                                        << return_module->file.filename().string();
+                        }
+                        if (next_frame <= frame || next_frame - frame > 0x1000000) {
+                            break;
+                        }
+                        frame = next_frame;
+                    }
+                }
+                auto* const caller_module =
+                    FindGuestModuleByAddress(caller_return);
+                static std::mutex wait_stack_file_mutex;
+                std::scoped_lock wait_file_lock{wait_stack_file_mutex};
+                const auto wait_probe_path =
+                    std::filesystem::path(g_root) /
+                    "diagnostic-exit8-game-main-wait-stack.txt";
+                if (std::FILE* const wait_file =
+                        std::fopen(wait_probe_path.string().c_str(), "a")) {
+                    std::fprintf(
+                        wait_file,
+                             "kind=%s elapsedMs=%lld tid=%lld threadPtr=%p "
+                             "rsp=0x%llx result=0x%llx "
+                        "cond=0x%llx mutex=0x%llx timeoutUs=%llu "
+                        "callerFrame=0x%llx callerReturn=0x%llx "
+                        "callerOffset=0x%llx callerModule=%s chain=%s stack=%s\n",
+                             blocking_wait ? "blocking" : "timed",
+                             static_cast<long long>(wait_elapsed_ms),
+                             static_cast<long long>(syscall(SYS_gettid)),
+                             current_guest_thread,
+                        static_cast<unsigned long long>(call->guest_rsp),
+                        static_cast<unsigned long long>(typed_result.rax),
+                        static_cast<unsigned long long>(call->gpr[0]),
+                        static_cast<unsigned long long>(call->gpr[1]),
+                        static_cast<unsigned long long>(call->gpr[2]),
+                        static_cast<unsigned long long>(caller_frame),
+                        static_cast<unsigned long long>(caller_return),
+                        static_cast<unsigned long long>(
+                            caller_module != nullptr
+                                ? GuestModuleOffset(*caller_module, caller_return)
+                                : 0),
+                        caller_module != nullptr
+                            ? caller_module->file.string().c_str()
+                            : "<unknown>",
+                        frame_chain.str().c_str(), stack_qwords.c_str());
+                    std::fclose(wait_file);
+                }
+                const std::uint64_t pooled_event = call->gpr[0] >= 0x28
+                                                       ? call->gpr[0] - 0x28
+                                                       : 0;
+                std::uint64_t graph_event = 0;
+                {
+                    std::lock_guard memory_lock(g_box64_boundary_probe_lock);
+                    (void)GuestReadQwordBestEffortLocked(call->guest_rsp + 0x90,
+                                                         graph_event);
+                }
+                const auto fence_probe_path =
+                    std::filesystem::path(g_root) /
+                    "diagnostic-exit8-render-fence.txt";
+                if (std::FILE* const fence_file =
+                        std::fopen(fence_probe_path.string().c_str(), "a")) {
+                    std::fprintf(
+                        fence_file,
+                        "elapsedMs=%lld pooledEvent=0x%llx pooled=%s "
+                        "graphEvent=0x%llx graph=%s frameSync=%s\n",
+                        static_cast<long long>(wait_elapsed_ms),
+                        static_cast<unsigned long long>(pooled_event),
+                        pooled_event != 0
+                            ? GuestQwordsHexBestEffortLocked(pooled_event, 16).c_str()
+                            : "<unavailable>",
+                        static_cast<unsigned long long>(graph_event),
+                        graph_event != 0
+                            ? GuestQwordsHexBestEffortLocked(graph_event, 24).c_str()
+                            : "<unavailable>",
+                        GuestQwordsHexBestEffortLocked(0x80660db98ULL, 8).c_str());
+                    std::fclose(fence_file);
+                }
+            }
+        }
+        if (trace_exit8_async_io_call) {
+            const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() -
+                                        trace_exit8_async_io_started)
+                                        .count();
+            static std::mutex async_io_probe_file_mutex;
+            std::scoped_lock probe_file_lock{async_io_probe_file_mutex};
+            const auto probe_path = std::filesystem::path(g_root) /
+                                    "diagnostic-exit8-async-io.txt";
+            if (std::FILE* probe_file = std::fopen(probe_path.string().c_str(), "a")) {
+                std::fprintf(probe_file,
+                             "phase=return ordinal=%llu tid=%lld guest=%p thread=%s "
+                             "name=%s symbol=%s result=0x%llx elapsedUs=%lld\n",
+                             static_cast<unsigned long long>(trace_exit8_async_io_ordinal),
+                             static_cast<long long>(syscall(SYS_gettid)),
+                             current_guest_thread,
+                             current_guest_thread ? current_guest_thread->name.c_str()
+                                                  : "<unknown>",
+                             target_metadata->name.c_str(),
+                             target_metadata->symbol_name.c_str(),
+                             static_cast<unsigned long long>(typed_result.rax),
+                             static_cast<long long>(elapsed_us));
+                std::fclose(probe_file);
+            }
+        }
+        if (trace_exit8_render_hle_call) {
+            static std::mutex render_hle_return_file_mutex;
+            std::scoped_lock render_return_file_lock{
+                render_hle_return_file_mutex};
+            const auto render_probe_path =
+                std::filesystem::path(g_root) /
+                "diagnostic-exit8-render-thread-hle.txt";
+            if (std::FILE* const render_file =
+                    std::fopen(render_probe_path.string().c_str(), "a")) {
+                std::fprintf(
+                    render_file,
+                    "phase=return ordinal=%llu tid=%lld name=%s result=0x%llx\n",
+                    static_cast<unsigned long long>(
+                        trace_exit8_render_hle_ordinal),
+                    static_cast<long long>(syscall(SYS_gettid)),
+                    target_metadata->name.c_str(),
+                    static_cast<unsigned long long>(typed_result.rax));
+                std::fclose(render_file);
+            }
+        }
+        if (trace_exit8_taskgraph_tls_get) {
+            static std::mutex taskgraph_tls_file_mutex;
+            std::scoped_lock tls_file_lock{taskgraph_tls_file_mutex};
+            const auto tls_path = std::filesystem::path(g_root) /
+                                  "diagnostic-exit8-taskgraph-tls.txt";
+            if (std::FILE* const tls_file =
+                    std::fopen(tls_path.string().c_str(), "a")) {
+                std::fprintf(
+                    tls_file,
+                    "tid=%lld guest=%p thread=%s key=%llu result=0x%llx "
+                    "slot=%p slotSeq=%d specificCount=%d fsBase=0x%llx "
+                    "fsThread=0x%llx fsContext=0x%llx fsDepth=0x%llx "
+                    "scheduler=0x%llx namedArray=0x%llx namedIndex=%lld\n",
+                    static_cast<long long>(syscall(SYS_gettid)),
+                    current_guest_thread,
+                    current_guest_thread != nullptr
+                        ? current_guest_thread->name.c_str()
+                        : "<unknown>",
+                    static_cast<unsigned long long>(
+                        trace_exit8_taskgraph_tls_key),
+                    static_cast<unsigned long long>(typed_result.rax),
+                    trace_exit8_taskgraph_tls_slot,
+                    trace_exit8_taskgraph_tls_slot_seq,
+                    current_guest_thread != nullptr
+                        ? current_guest_thread->specific_data_count
+                        : 0,
+                    static_cast<unsigned long long>(
+                        trace_exit8_taskgraph_tls_fs_base),
+                    static_cast<unsigned long long>(
+                        trace_exit8_taskgraph_tls_fs_thread),
+                    static_cast<unsigned long long>(
+                        trace_exit8_taskgraph_tls_fs_context),
+                    static_cast<unsigned long long>(
+                        trace_exit8_taskgraph_tls_fs_depth),
+                    static_cast<unsigned long long>(
+                        trace_exit8_taskgraph_tls_scheduler),
+                    static_cast<unsigned long long>(
+                        trace_exit8_taskgraph_tls_named_array),
+                    typed_result.rax >= trace_exit8_taskgraph_tls_named_array &&
+                            trace_exit8_taskgraph_tls_named_array != 0 &&
+                            ((typed_result.rax -
+                              trace_exit8_taskgraph_tls_named_array) % 24) == 0
+                        ? static_cast<long long>(
+                              (typed_result.rax -
+                               trace_exit8_taskgraph_tls_named_array) / 24)
+                        : -1LL);
+                std::fclose(tls_file);
+            }
+        }
+#endif
+    } catch (const std::exception& exception) {
+        result->status = LSX4_FEX_STATUS_BACKEND_FAILURE;
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_HLE_THROW] native=0x%llx what=%s",
+                  static_cast<unsigned long long>(call->native_function), exception.what());
+        return LSX4_FEX_STATUS_BACKEND_FAILURE;
+    } catch (...) {
+        result->status = LSX4_FEX_STATUS_BACKEND_FAILURE;
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_HLE_THROW] native=0x%llx what=<non-std>",
+                  static_cast<unsigned long long>(call->native_function));
+        return LSX4_FEX_STATUS_BACKEND_FAILURE;
+    }
+
+    result->rax = typed_result.rax;
+    result->rdx = typed_result.rdx;
+    result->xmm0.low = typed_result.xmm0.low;
+    result->xmm0.high = typed_result.xmm0.high;
+    result->xmm1.low = typed_result.xmm1.low;
+    result->xmm1.high = typed_result.xmm1.high;
+    result->sret_address = typed_result.sret_address;
+    result->sret_size = typed_result.sret_size;
+    result->return_class[0] = typed_result.return_class[0];
+    result->return_class[1] = typed_result.return_class[1];
+    result->return_eightbyte_count = typed_result.return_eightbyte_count;
+    result->sret_flags = typed_result.sret_flags;
+    if (staged_guest_thread_exit) {
+        result->result_flags = LSX4_FEX_HLE_RESULT_GUEST_EXIT;
+    }
+    result->abi_descriptor_id = typed_result.abi_descriptor_id;
+    result->status = LSX4_FEX_STATUS_OK;
+    RecordMappedEntryHleResult(
+        target_metadata->name.c_str(), target_metadata->symbol_name.c_str(),
+        call->native_function, typed_result.rax, call->gpr[0], call->gpr[1],
+        call->gpr[2], call->gpr[3], call->gpr[4], call->gpr[5],
+        call->guest_rsp);
+    return LSX4_FEX_STATUS_OK;
+}
+
+void ExecutorFexThreadEvent(void*, const std::uint32_t event,
+                            const Lsx4FexThreadIdentityV3* thread) {
+    if (thread != nullptr && thread->guest_thread != 0) {
+        std::scoped_lock lock(g_fex_live_thread_identity_mutex);
+        if (event == 1) {
+            g_fex_live_thread_identities[thread->guest_thread] = *thread;
+        } else if (event == 2) {
+            g_fex_live_thread_identities.erase(thread->guest_thread);
+        }
+    }
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_THREAD_EVENT] event=%u guest=0x%llx hostTid=%lld "
+              "backend=0x%llx",
+              event,
+              static_cast<unsigned long long>(thread != nullptr ? thread->guest_thread : 0),
+              static_cast<long long>(thread != nullptr ? thread->host_tid : 0),
+              static_cast<unsigned long long>(thread != nullptr ? thread->backend_thread : 0));
+}
+
+void ExecutorFexFatalError(void*, const std::int32_t status, const char* message) {
+    NativeLog(ANDROID_LOG_ERROR, "[EXECUTOR_FEX_FATAL] status=%d message=%s",
+              status, message != nullptr ? message : "<empty>");
+}
+
+constexpr bool ExecutorFexLeaseAllowsDeferredWrite(
+    const std::uint32_t access_flags) noexcept {
+    return (access_flags & LSX4_FEX_GUEST_MEMORY_ACCESS_NO_HOST_REENTRY) != 0;
+}
+
+static_assert(!ExecutorFexLeaseAllowsDeferredWrite(
+    LSX4_FEX_GUEST_MEMORY_ACCESS_READ |
+    LSX4_FEX_GUEST_MEMORY_ACCESS_WRITE));
+static_assert(ExecutorFexLeaseAllowsDeferredWrite(
+    LSX4_FEX_GUEST_MEMORY_ACCESS_READ |
+    LSX4_FEX_GUEST_MEMORY_ACCESS_WRITE |
+    LSX4_FEX_GUEST_MEMORY_ACCESS_NO_HOST_REENTRY));
+
+struct ExecutorFexGuestMemoryLease final {
+    std::optional<Core::MemoryManager::SnapshotReadGuard> guard;
+    std::unique_lock<std::mutex> external_stack_guard;
+    VAddr address{};
+    u64 size{};
+    bool bulk_write_active{};
+
+    ExecutorFexGuestMemoryLease(Core::MemoryManager::SnapshotReadGuard&& guard_,
+                                const VAddr address_, const u64 size_)
+        : guard{std::move(guard_)}, address{address_}, size{size_} {}
+
+    ExecutorFexGuestMemoryLease(std::unique_lock<std::mutex>&& guard_,
+                                const VAddr address_, const u64 size_)
+        : external_stack_guard{std::move(guard_)}, address{address_},
+          size{size_} {}
+
+    ~ExecutorFexGuestMemoryLease() {
+        if (bulk_write_active) {
+            VideoCore::PageManager::LeaveBulkGuestWrite(address, size);
+            VideoCore::EndBulkGuestWrite();
+        }
+        guard.reset();
+    }
+};
+
+int32_t ExecutorFexAcquireGuestMemoryLease(
+    void*, const std::uint64_t guest_address, const std::uint64_t size,
+    const std::uint32_t access_flags, std::uint64_t* const lease_token) {
+    if (lease_token == nullptr) {
+        return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+    }
+    *lease_token = 0;
+    constexpr std::uint32_t permission_flags =
+        LSX4_FEX_GUEST_MEMORY_ACCESS_READ |
+        LSX4_FEX_GUEST_MEMORY_ACCESS_WRITE;
+    constexpr std::uint32_t valid_flags =
+        permission_flags |
+        LSX4_FEX_GUEST_MEMORY_ACCESS_NO_HOST_REENTRY;
+    if (size == 0 || guest_address > std::numeric_limits<VAddr>::max() - size ||
+        (access_flags & ~valid_flags) != 0 ||
+        (access_flags & permission_flags) == 0) {
+        return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+    }
+    Core::MemoryManager* const memory = Core::Memory::Instance();
+    if (memory == nullptr) {
+        return LSX4_FEX_STATUS_INVALID_STATE;
+    }
+
+    const bool read =
+        (access_flags & LSX4_FEX_GUEST_MEMORY_ACCESS_READ) != 0;
+    const bool write =
+        (access_flags & LSX4_FEX_GUEST_MEMORY_ACCESS_WRITE) != 0;
+    const bool no_host_reentry =
+        ExecutorFexLeaseAllowsDeferredWrite(access_flags);
+    const bool strict_non_reentrant =
+        no_host_reentry &&
+        VideoCore::PageManager::FexDeferredWriteEpochEnabled();
+    Core::MemoryManager::SnapshotAccessDiagnostic diagnostic{};
+    constexpr std::uint32_t MaxDeferredLeaseAttempts = 64;
+    const std::uint32_t managed_attempts =
+        strict_non_reentrant ? MaxDeferredLeaseAttempts : 1;
+    for (std::uint32_t attempt = 0; attempt < managed_attempts; ++attempt) {
+        try {
+            auto lease = std::make_unique<ExecutorFexGuestMemoryLease>(
+                memory->AcquireSnapshotReadGuard(), guest_address, size);
+            if (!memory->ValidateSnapshotAccess(
+                    *lease->guard, guest_address, size, read, write,
+                    &diagnostic)) {
+                break;
+            }
+            if (strict_non_reentrant) {
+                if (!memory->SnapshotGpuTrackingActive(*lease->guard)) {
+                    *lease_token = reinterpret_cast<std::uint64_t>(
+                        lease.release());
+                    return LSX4_FEX_STATUS_OK;
+                }
+                const bool ready = write
+                    ? VideoCore::PageManager::
+                          TryBeginFexDeferredBulkGuestWrite(
+                              guest_address, size, read && write)
+                    : VideoCore::PageManager::IsFexGuestMemoryReadReady(
+                          guest_address, size);
+                if (ready) {
+                    if (write) {
+                        VideoCore::BeginBulkGuestWrite(guest_address, size);
+                        lease->bulk_write_active = true;
+                    }
+                    *lease_token = reinterpret_cast<std::uint64_t>(
+                        lease.release());
+                    return LSX4_FEX_STATUS_OK;
+                }
+                lease.reset();
+                if (attempt + 1 != managed_attempts) {
+                    std::this_thread::yield();
+                    continue;
+                }
+                NativeLog(
+                    ANDROID_LOG_ERROR,
+                    "[EXECUTOR_FEX_MEMORY_LEASE_ADMISSION] address=0x%llx "
+                    "size=0x%llx flags=0x%x state=0x%llx",
+                    static_cast<unsigned long long>(guest_address),
+                    static_cast<unsigned long long>(size), access_flags,
+                    static_cast<unsigned long long>(
+                        VideoCore::PageManager::DebugFexGuestMemoryLeaseState(
+                            guest_address, size, read && write)));
+                return LSX4_FEX_STATUS_BACKEND_FAILURE;
+            } else {
+                if (read) {
+                    VideoCore::PageManager::PrepareBulkGuestRead(guest_address,
+                                                                  size);
+                }
+                if (write) {
+                    const bool fused_fast_bulk_lease =
+                        VideoCore::PageManager::TryBeginFastBulkGuestWrite(
+                            guest_address, size);
+                    if (!fused_fast_bulk_lease) {
+                        VideoCore::PageManager::PrepareBulkGuestWrite(
+                            guest_address, size);
+                        VideoCore::PageManager::EnterBulkGuestWrite(
+                            guest_address, size);
+                    }
+                    VideoCore::BeginBulkGuestWrite(guest_address, size);
+                    lease->bulk_write_active = true;
+                }
+            }
+            *lease_token = reinterpret_cast<std::uint64_t>(lease.release());
+            return LSX4_FEX_STATUS_OK;
+        } catch (const std::exception& exception) {
+            NativeLog(
+                ANDROID_LOG_ERROR,
+                "[EXECUTOR_FEX_MEMORY_LEASE_EXCEPTION] range=managed "
+                "address=0x%llx size=0x%llx flags=0x%x what=%s state=0x%llx",
+                static_cast<unsigned long long>(guest_address),
+                static_cast<unsigned long long>(size), access_flags,
+                exception.what(),
+                static_cast<unsigned long long>(
+                    VideoCore::PageManager::DebugFexGuestMemoryLeaseState(
+                        guest_address, size, read && write)));
+            return LSX4_FEX_STATUS_BACKEND_FAILURE;
+        } catch (...) {
+            NativeLog(
+                ANDROID_LOG_ERROR,
+                "[EXECUTOR_FEX_MEMORY_LEASE_EXCEPTION] range=managed "
+                "address=0x%llx size=0x%llx flags=0x%x what=unknown state=0x%llx",
+                static_cast<unsigned long long>(guest_address),
+                static_cast<unsigned long long>(size), access_flags,
+                static_cast<unsigned long long>(
+                    VideoCore::PageManager::DebugFexGuestMemoryLeaseState(
+                        guest_address, size, read && write)));
+            return LSX4_FEX_STATUS_BACKEND_FAILURE;
+        }
+    }
+
+
+
+
+
+
+
+
+    {
+        std::unique_lock dynamic_lock(g_fex_executable_range_mutation_mutex);
+        const auto dynamic_range = std::ranges::find_if(
+            g_fex_dynamic_executable_ranges,
+            [&](const Lsx4FexExecutableRangeV5& range) {
+                return guest_address >= range.address &&
+                       guest_address - range.address <= range.size &&
+                       size <= range.size - (guest_address - range.address) &&
+                       (!read || (range.protection & PROT_READ) != 0) &&
+                       (!write || (range.protection & PROT_WRITE) != 0);
+            });
+        if (dynamic_range != g_fex_dynamic_executable_ranges.end()) {
+            auto lease = std::make_unique<ExecutorFexGuestMemoryLease>(
+                std::move(dynamic_lock), guest_address, size);
+            *lease_token = reinterpret_cast<std::uint64_t>(lease.release());
+            return LSX4_FEX_STATUS_OK;
+        }
+    }
+
+
+
+
+
+
+
+
+    if (no_host_reentry) {
+        std::unique_lock mutable_lock(g_box64_guest_stack_lock);
+        if (IsExternalGuestMutableRangeLocked(guest_address, size)) {
+            auto lease = std::make_unique<ExecutorFexGuestMemoryLease>(
+                std::move(mutable_lock), guest_address, size);
+            *lease_token = reinterpret_cast<std::uint64_t>(lease.release());
+            return LSX4_FEX_STATUS_OK;
+        }
+    }
+    if (no_host_reentry &&
+        IsActiveHleGuestReadLeaseRange(guest_address, size)) {
+        auto lease = std::make_unique<ExecutorFexGuestMemoryLease>(
+            std::unique_lock<std::mutex>{}, guest_address, size);
+        *lease_token = reinterpret_cast<std::uint64_t>(lease.release());
+        return LSX4_FEX_STATUS_OK;
+    }
+
+
+
+
+
+
+
+    if (!write) {
+        std::unique_lock readable_lock(g_box64_guest_stack_lock);
+        const auto readable_range = std::ranges::find_if(
+            g_box64_guest_readable_ranges,
+            [&](const ExecutorGuestReadableRange& range) {
+                return guest_address >= range.base &&
+                       guest_address - range.base <= range.size &&
+                       size <= range.size - (guest_address - range.base);
+            });
+        if (readable_range != g_box64_guest_readable_ranges.end()) {
+            auto lease = std::make_unique<ExecutorFexGuestMemoryLease>(
+                std::move(readable_lock), guest_address, size);
+            *lease_token = reinterpret_cast<std::uint64_t>(lease.release());
+            return LSX4_FEX_STATUS_OK;
+        }
+    }
+
+    const std::uint32_t external_attempts =
+        strict_non_reentrant ? MaxDeferredLeaseAttempts : 1;
+    for (std::uint32_t attempt = 0; attempt < external_attempts; ++attempt) {
+        try {
+            std::unique_lock stack_lock(g_box64_guest_stack_lock);
+            const auto external_stack = std::ranges::find_if(
+                g_box64_external_guest_stack_ranges,
+                [&](const ExecutorGuestReadableRange& range) {
+                    return guest_address >= range.base &&
+                           guest_address - range.base <= range.size &&
+                           size <= range.size - (guest_address - range.base);
+                });
+            if (external_stack == g_box64_external_guest_stack_ranges.end()) {
+                break;
+            }
+            auto lease = std::make_unique<ExecutorFexGuestMemoryLease>(
+                std::move(stack_lock), guest_address, size);
+            if (strict_non_reentrant) {
+                *lease_token = reinterpret_cast<std::uint64_t>(
+                    lease.release());
+                return LSX4_FEX_STATUS_OK;
+            } else {
+                if (read) {
+                    VideoCore::PageManager::PrepareBulkGuestRead(guest_address,
+                                                                  size);
+                }
+                if (write) {
+                    VideoCore::PageManager::PrepareBulkGuestWrite(guest_address,
+                                                                   size);
+                    VideoCore::PageManager::EnterBulkGuestWrite(guest_address,
+                                                                 size);
+                    VideoCore::BeginBulkGuestWrite(guest_address, size);
+                    lease->bulk_write_active = true;
+                }
+            }
+            *lease_token = reinterpret_cast<std::uint64_t>(lease.release());
+            return LSX4_FEX_STATUS_OK;
+        } catch (const std::exception& exception) {
+            NativeLog(
+                ANDROID_LOG_ERROR,
+                "[EXECUTOR_FEX_MEMORY_LEASE_EXCEPTION] range=external "
+                "address=0x%llx size=0x%llx flags=0x%x what=%s state=0x%llx",
+                static_cast<unsigned long long>(guest_address),
+                static_cast<unsigned long long>(size), access_flags,
+                exception.what(),
+                static_cast<unsigned long long>(
+                    VideoCore::PageManager::DebugFexGuestMemoryLeaseState(
+                        guest_address, size, read && write)));
+            return LSX4_FEX_STATUS_BACKEND_FAILURE;
+        } catch (...) {
+            NativeLog(
+                ANDROID_LOG_ERROR,
+                "[EXECUTOR_FEX_MEMORY_LEASE_EXCEPTION] range=external "
+                "address=0x%llx size=0x%llx flags=0x%x what=unknown state=0x%llx",
+                static_cast<unsigned long long>(guest_address),
+                static_cast<unsigned long long>(size), access_flags,
+                static_cast<unsigned long long>(
+                    VideoCore::PageManager::DebugFexGuestMemoryLeaseState(
+                        guest_address, size, read && write)));
+            return LSX4_FEX_STATUS_BACKEND_FAILURE;
+        }
+    }
+
+    NativeLog(
+        ANDROID_LOG_ERROR,
+        "[EXECUTOR_FEX_MEMORY_LEASE_REJECTED] address=0x%llx size=0x%llx "
+        "flags=0x%x reason=%u cursor=0x%llx area=[0x%llx,+0x%llx) "
+        "type=%u prot=0x%x externalStack=0",
+        static_cast<unsigned long long>(guest_address),
+        static_cast<unsigned long long>(size), access_flags,
+        diagnostic.reason,
+        static_cast<unsigned long long>(diagnostic.cursor),
+        static_cast<unsigned long long>(diagnostic.area_base),
+        static_cast<unsigned long long>(diagnostic.area_size),
+        static_cast<unsigned>(diagnostic.area_type),
+        static_cast<unsigned>(diagnostic.area_protection));
+    return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+}
+
+void ExecutorFexReleaseGuestMemoryLease(void*, const std::uint64_t lease_token) {
+    delete reinterpret_cast<ExecutorFexGuestMemoryLease*>(lease_token);
+}
+
+int32_t ExecutorFexTryDispatchLeafHle(
+    void*, const std::uint64_t native_function, const std::uint64_t guest_rip,
+    const std::uint64_t guest_rsp,
+    const std::uint64_t gpr[LSX4_FEX_HLE_GPR_ARGUMENT_COUNT],
+    std::uint64_t* const result_rax) {
+    auto* const current_guest_thread = Libraries::Kernel::g_curthread;
+    if (!FexDirectLeafHleDispatchEnabled() || native_function == 0 ||
+        guest_rsp == 0 || gpr == nullptr || result_rax == nullptr ||
+        Executor::CpuTuning::Frozen().function_replacements ==
+            Executor::CpuTuning::Aggressiveness::Off ||
+        current_guest_thread == nullptr) {
+        return 0;
+    }
+
+    const auto& metadata = GetExecutorHleTargetMetadata(native_function);
+    if (!metadata.executable || !metadata.jit_leaf_direct_safe ||
+        metadata.fp_abi != ExecutorHleFpAbi::None ||
+        metadata.stack_abi != ExecutorHleStackAbi::None ||
+        metadata.fex_guest_thread_exit_target ||
+        metadata.fex_context_replacing_fiber_target) {
+        return 0;
+    }
+
+    const ScopedFexHleDispatchDepth dispatch_depth(current_guest_thread);
+    if (!dispatch_depth) {
+        return 0;
+    }
+    const ScopedFexBulkLeaseAbort bulk_lease_abort;
+    ScopedExecutorLeafHleBoundary hle_boundary;
+    RecordHleCoverageCall();
+    RecordMappedEntryHleBoundary(metadata.name.c_str(),
+                                 metadata.symbol_name.c_str(),
+                                 native_function, guest_rsp);
+
+    std::uint64_t value = 0;
+    try {
+        using NativeLeafFn = std::uint64_t (*)(
+            std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+            std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+        value = reinterpret_cast<NativeLeafFn>(native_function)(
+            gpr[0], gpr[1], gpr[2], gpr[3], gpr[4], gpr[5], guest_rsp, 0);
+    } catch (const std::exception& exception) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_DIRECT_LEAF_THROW] native=0x%llx what=%s",
+                  static_cast<unsigned long long>(native_function),
+                  exception.what());
+        value = 0;
+    } catch (...) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_DIRECT_LEAF_THROW] native=0x%llx what=<non-std>",
+                  static_cast<unsigned long long>(native_function));
+        value = 0;
+    }
+    hle_boundary.Release();
+    RecordMappedEntryHleResult(
+        metadata.name.c_str(), metadata.symbol_name.c_str(), native_function,
+        value, gpr[0], gpr[1], gpr[2], gpr[3], gpr[4], gpr[5], guest_rsp);
+    *result_rax = value;
+
+    return 1;
+}
+
+int32_t ExecutorFexTryDispatchTypedTimeHle(
+    void*, const std::uint64_t native_function, const std::uint64_t guest_rip,
+    const std::uint64_t guest_rsp,
+    const std::uint64_t gpr[LSX4_FEX_HLE_GPR_ARGUMENT_COUNT],
+    std::uint64_t* const result_rax) {
+    auto* const current_guest_thread = Libraries::Kernel::g_curthread;
+    if (native_function == 0 || guest_rip == 0 || guest_rsp == 0 ||
+        gpr == nullptr || result_rax == nullptr ||
+        Executor::CpuTuning::Frozen().function_replacements ==
+            Executor::CpuTuning::Aggressiveness::Off ||
+        current_guest_thread == nullptr) {
+        return 0;
+    }
+
+    const auto& metadata = GetExecutorHleTargetMetadata(native_function);
+    if (!metadata.exact_typed_time_target || !metadata.executable ||
+        metadata.fp_abi != ExecutorHleFpAbi::None ||
+        metadata.stack_abi != ExecutorHleStackAbi::None ||
+        metadata.fex_guest_thread_exit_target ||
+        metadata.fex_context_replacing_fiber_target) {
+        return 0;
+    }
+
+    const ScopedFexHleDispatchDepth dispatch_depth(current_guest_thread);
+    if (!dispatch_depth) {
+        return 0;
+    }
+    const ScopedFexBulkLeaseAbort bulk_lease_abort;
+    ScopedExecutorLeafHleBoundary hle_boundary;
+    RecordHleCoverageCall();
+    RecordMappedEntryHleBoundary(metadata.name.c_str(),
+                                 metadata.symbol_name.c_str(),
+                                 native_function, guest_rsp);
+
+    std::uint64_t value = 0;
+    try {
+        using NativeTimeFn = std::uint64_t (*)(
+            std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+            std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+        value = reinterpret_cast<NativeTimeFn>(native_function)(
+            gpr[0], gpr[1], gpr[2], gpr[3], gpr[4], gpr[5], guest_rsp, 0);
+    } catch (const std::exception& exception) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_TYPED_TIME_THROW] native=0x%llx what=%s",
+                  static_cast<unsigned long long>(native_function),
+                  exception.what());
+        value = 0;
+    } catch (...) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_TYPED_TIME_THROW] native=0x%llx what=<non-std>",
+                  static_cast<unsigned long long>(native_function));
+        value = 0;
+    }
+    hle_boundary.Release();
+    RecordMappedEntryHleResult(
+        metadata.name.c_str(), metadata.symbol_name.c_str(), native_function,
+        value, gpr[0], gpr[1], gpr[2], gpr[3], gpr[4], gpr[5], guest_rsp);
+    *result_rax = value;
+    return 1;
+}
+
+int32_t ExecutorFexTryDispatchScalarFpHle(
+    void*, const std::uint64_t native_function, const std::uint64_t guest_rip,
+    const std::uint64_t guest_rsp,
+    const std::uint64_t gpr[LSX4_FEX_HLE_GPR_ARGUMENT_COUNT],
+    const Lsx4FexXmm128 xmm[2], Lsx4FexXmm128* const result_xmm0) {
+    auto* const current_guest_thread = Libraries::Kernel::g_curthread;
+    if (!FexDirectScalarFpHleDispatchEnabled() || native_function == 0 ||
+        guest_rip == 0 || guest_rsp == 0 || gpr == nullptr || xmm == nullptr ||
+        result_xmm0 == nullptr ||
+        Executor::CpuTuning::Frozen().function_replacements ==
+            Executor::CpuTuning::Aggressiveness::Off ||
+        current_guest_thread == nullptr) {
+        return 0;
+    }
+
+    const auto& metadata = GetExecutorHleTargetMetadata(native_function);
+    if (!metadata.executable || metadata.stack_abi != ExecutorHleStackAbi::None ||
+        metadata.fex_guest_thread_exit_target ||
+        metadata.fex_context_replacing_fiber_target) {
+        return 0;
+    }
+    switch (metadata.fp_abi) {
+    case ExecutorHleFpAbi::UnaryF32:
+    case ExecutorHleFpAbi::BinaryF32:
+    case ExecutorHleFpAbi::UnaryF64:
+    case ExecutorHleFpAbi::BinaryF64:
+        break;
+    case ExecutorHleFpAbi::None:
+    case ExecutorHleFpAbi::SincosF32:
+    case ExecutorHleFpAbi::SincosF64:
+    case ExecutorHleFpAbi::Ngs2PanInit:
+    case ExecutorHleFpAbi::VideoOutGamma:
+        return 0;
+    }
+
+    const ScopedFexHleDispatchDepth dispatch_depth(current_guest_thread);
+    if (!dispatch_depth) {
+        return 0;
+    }
+    const ScopedFexBulkLeaseAbort bulk_lease_abort;
+    ScopedExecutorLeafHleBoundary hle_boundary;
+    RecordHleCoverageCall();
+    RecordMappedEntryHleBoundary(metadata.name.c_str(),
+                                 metadata.symbol_name.c_str(),
+                                 native_function, guest_rsp);
+
+    std::uint64_t raw{};
+    try {
+        switch (metadata.fp_abi) {
+        case ExecutorHleFpAbi::UnaryF32: {
+            using Fn = float (*)(float);
+            raw = FloatToXmmLow32(reinterpret_cast<Fn>(native_function)(
+                FloatFromXmmLow32(xmm[0].low)));
+            break;
+        }
+        case ExecutorHleFpAbi::BinaryF32: {
+            using Fn = float (*)(float, float);
+            raw = FloatToXmmLow32(reinterpret_cast<Fn>(native_function)(
+                FloatFromXmmLow32(xmm[0].low),
+                FloatFromXmmLow32(xmm[1].low)));
+            break;
+        }
+        case ExecutorHleFpAbi::UnaryF64: {
+            using Fn = double (*)(double);
+            raw = DoubleToXmmLow64(reinterpret_cast<Fn>(native_function)(
+                DoubleFromXmmLow64(xmm[0].low)));
+            break;
+        }
+        case ExecutorHleFpAbi::BinaryF64: {
+            using Fn = double (*)(double, double);
+            raw = DoubleToXmmLow64(reinterpret_cast<Fn>(native_function)(
+                DoubleFromXmmLow64(xmm[0].low),
+                DoubleFromXmmLow64(xmm[1].low)));
+            break;
+        }
+        case ExecutorHleFpAbi::None:
+        case ExecutorHleFpAbi::SincosF32:
+        case ExecutorHleFpAbi::SincosF64:
+        case ExecutorHleFpAbi::Ngs2PanInit:
+        case ExecutorHleFpAbi::VideoOutGamma:
+            break;
+        }
+    } catch (const std::exception& exception) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_DIRECT_SCALAR_FP_THROW] native=0x%llx what=%s",
+                  static_cast<unsigned long long>(native_function),
+                  exception.what());
+        raw = 0;
+    } catch (...) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_DIRECT_SCALAR_FP_THROW] native=0x%llx "
+                  "what=<non-std>",
+                  static_cast<unsigned long long>(native_function));
+        raw = 0;
+    }
+    hle_boundary.Release();
+    RecordMappedEntryHleResult(
+        metadata.name.c_str(), metadata.symbol_name.c_str(), native_function,
+        0, gpr[0], gpr[1], gpr[2], gpr[3], gpr[4], gpr[5], guest_rsp);
+    result_xmm0->low = raw;
+    result_xmm0->high = 0;
+    return 1;
+}
+
+const Lsx4FexHostCallbacksV3& ExecutorFexHostCallbacks() {
+    static const Lsx4FexHostCallbacksV3 callbacks{
+        .struct_size = sizeof(Lsx4FexHostCallbacksV3),
+        .abi_version = LSX4_FEX_BACKEND_ABI_V3,
+        .callback_context = nullptr,
+        .log = ExecutorFexHostLog,
+        .dispatch_hle = ExecutorFexDispatchHle,
+        .thread_event = ExecutorFexThreadEvent,
+        .fatal_error = ExecutorFexFatalError,
+        .acquire_guest_memory_lease = ExecutorFexAcquireGuestMemoryLease,
+        .release_guest_memory_lease = ExecutorFexReleaseGuestMemoryLease,
+        .try_dispatch_leaf_hle = FexDirectLeafHleDispatchEnabled()
+                                     ? ExecutorFexTryDispatchLeafHle
+                                     : nullptr,
+        .try_dispatch_typed_time_hle = FexTypedTimeDirectHleDispatchEnabled()
+                                           ? ExecutorFexTryDispatchTypedTimeHle
+                                           : nullptr,
+        .try_dispatch_scalar_fp_hle =
+            FexDirectScalarFpHleDispatchEnabled()
+                ? ExecutorFexTryDispatchScalarFpHle
+                : nullptr,
+    };
+    return callbacks;
+}
+
 extern "C" int executor_jit_lookup_leaf_hle_thunk(
     std::uint64_t thunk, std::uint64_t* native_function);
 
@@ -7056,6 +11806,7 @@ extern "C" std::uint64_t ExecutorJitResolvedLeafHleCallback(
     const std::uint64_t native_function, const std::uint64_t arg0,
     const std::uint64_t arg1, const std::uint64_t arg2, const std::uint64_t arg3,
     const std::uint64_t arg4, const std::uint64_t arg5, const std::uint64_t guest_rsp) {
+    RecordHleCoverageCall();
     static const bool trace_hot_edges =
         ExecutorEnvFlag("EXECUTOR_TRACE_JIT_HOT_HLE_EDGE") ||
         ExecutorEnvFlag("EXECUTOR_TRACE_LIVE_HLE");
@@ -7176,6 +11927,60 @@ bool AddressInsideHleTrampolineSlab(const std::uint64_t address) {
     const auto begin = reinterpret_cast<std::uint64_t>(g_box64_hle_trampoline_slab);
     const auto end = begin + ExecutorBox64HleTrampolineSlabSize;
     return address >= begin && address < end;
+}
+
+std::uint64_t BeginBox64HleManifestGeneration() {
+    std::scoped_lock lock(g_box64_hle_slab_mutex);
+    std::uint64_t next = g_box64_hle_manifest_generation;
+    if (!Lsx4::FexHleLease::TryAdvanceManifestGeneration(next)) {
+        g_box64_hle_manifest_sealed = true;
+        return 0;
+    }
+    g_box64_hle_manifest_generation = next;
+    g_box64_hle_manifest_sealed = false;
+    return g_box64_hle_manifest_generation;
+}
+
+void SealBox64HleManifestGeneration() {
+    std::scoped_lock lock(g_box64_hle_slab_mutex);
+    g_box64_hle_manifest_sealed = true;
+}
+
+bool SnapshotBox64HleLeaseManifest(
+    std::vector<ExactHleSpan>& ranges, std::uint64_t& generation,
+    std::string& error) {
+    std::scoped_lock lock(g_box64_hle_slab_mutex);
+    if (!g_box64_hle_manifest_sealed) {
+        error = "Box64 HLE lease manifest is not sealed";
+        return false;
+    }
+    if (!Lsx4::FexHleLease::IsCurrentManifestGeneration(
+            g_box64_hle_manifest_generation)) {
+        error = "Box64 HLE lease manifest protocol generation is invalid";
+        return false;
+    }
+    ranges = g_box64_hle_lease_manifest;
+    generation = g_box64_hle_manifest_generation;
+    for (std::size_t index = 0; index < ranges.size(); ++index) {
+        const auto& range = ranges[index];
+        if (range.address == 0 || range.size != ExecutorBox64HleTrampolineSize ||
+            range.address > UINT64_MAX - range.size ||
+            g_box64_hle_trampoline_slab == nullptr) {
+            error = "invalid Box64 HLE lease manifest entry";
+            return false;
+        }
+        const auto slab_begin =
+            reinterpret_cast<std::uint64_t>(g_box64_hle_trampoline_slab);
+        const auto slab_end = slab_begin + ExecutorBox64HleTrampolineSlabSize;
+        if (range.address < slab_begin || range.address + range.size > slab_end ||
+            (range.address - slab_begin) % ExecutorBox64HleTrampolineSize != 0 ||
+            (index != 0 && ranges[index - 1].address + ranges[index - 1].size >
+                               range.address)) {
+            error = "overlapping or out-of-slab Box64 HLE lease manifest";
+            return false;
+        }
+    }
+    return true;
 }
 
 bool LooksLikeNativeRuntimePointer(const std::uint64_t value) {
@@ -7410,22 +12215,172 @@ void RegisterBox64HleTrampolineSlabWithFex() {
     if (!g_box64_hle_trampoline_slab) {
         return;
     }
-    static void* s_registered_base = nullptr;
-    if (s_registered_base == g_box64_hle_trampoline_slab) {
-        return;
-    }
-    static ExecutorFexRegisterGuestExecutableRangeFn registrar = ResolveFexExecRangeRegistrar();
-    if (registrar == nullptr) {
-        return;
-    }
     const std::uint64_t base = reinterpret_cast<std::uint64_t>(g_box64_hle_trampoline_slab);
     constexpr std::uint32_t kPfReadExec = 0x5u;
-    const int rc = registrar(base, ExecutorBox64HleTrampolineSlabSize, kPfReadExec);
-    s_registered_base = g_box64_hle_trampoline_slab;
-    NativeLog(ANDROID_LOG_INFO,
-              "[EXECUTOR_HLE_TRAMPOLINE_FEX_RANGE] base=%p size=0x%llx rc=%d",
-              reinterpret_cast<void*>(base),
-              static_cast<unsigned long long>(ExecutorBox64HleTrampolineSlabSize), rc);
+
+
+
+
+    if (RuntimeGuestFexActive()) {
+        return;
+    }
+    static void* s_backend_registered_base = nullptr;
+    if (RuntimeGuestFexActive() &&
+        s_backend_registered_base != g_box64_hle_trampoline_slab) {
+        const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+        if (api != nullptr && api->snapshot_executable_ranges_v5 != nullptr &&
+            api->bulk_register_executable_ranges_v5 != nullptr) {
+            Lsx4FexExecutableRangeSnapshotV5 query{};
+            query.struct_size = sizeof(query);
+            query.abi_version = LSX4_FEX_EXECUTABLE_RANGE_ABI_V5;
+            int rc = api->snapshot_executable_ranges_v5(api->backend_context, &query);
+            bool already_registered = false;
+            if (rc == LSX4_FEX_STATUS_OK) {
+                std::vector<Lsx4FexExecutableRangeV5> ranges(query.range_count);
+                Lsx4FexExecutableRangeSnapshotV5 copy = query;
+                copy.ranges = ranges.empty() ? nullptr : ranges.data();
+                copy.capacity = static_cast<std::uint32_t>(ranges.size());
+                rc = api->snapshot_executable_ranges_v5(api->backend_context, &copy);
+                if (rc == LSX4_FEX_STATUS_OK) {
+                    const std::uint64_t end = base + ExecutorBox64HleTrampolineSlabSize;
+                    already_registered = std::any_of(
+                        ranges.begin(), ranges.end(), [&](const auto& range) {
+                            return range.address <= base &&
+                                   range.size <= UINT64_MAX - range.address &&
+                                   range.address + range.size >= end &&
+                                   (range.range_flags &
+                                    (LSX4_FEX_RANGE_EXECUTABLE |
+                                     LSX4_FEX_RANGE_HLE_TRAMPOLINE)) ==
+                                       (LSX4_FEX_RANGE_EXECUTABLE |
+                                        LSX4_FEX_RANGE_HLE_TRAMPOLINE);
+                        });
+                    if (!already_registered) {
+                        const Lsx4FexExecutableRangeV5 hle_range{
+                            .address = base,
+                            .size = ExecutorBox64HleTrampolineSlabSize,
+                            .range_cookie =
+                                base ^ std::rotl(
+                                           static_cast<std::uint64_t>(
+                                               ExecutorBox64HleTrampolineSlabSize),
+                                           29),
+                            .protection = kPfReadExec,
+                            .range_flags = LSX4_FEX_RANGE_EXECUTABLE |
+                                           LSX4_FEX_RANGE_HLE_TRAMPOLINE,
+                        };
+                        std::uint64_t new_generation = query.generation;
+                        rc = api->bulk_register_executable_ranges_v5(
+                            api->backend_context, &hle_range, 1, query.generation,
+                            &new_generation);
+                    }
+                }
+            }
+            if (rc == LSX4_FEX_STATUS_OK) {
+                s_backend_registered_base = g_box64_hle_trampoline_slab;
+            }
+            NativeLog(rc == LSX4_FEX_STATUS_OK ? ANDROID_LOG_INFO
+                                               : ANDROID_LOG_ERROR,
+                      "[EXECUTOR_HLE_TRAMPOLINE_FEX_RANGE] route=backend-v3 "
+                      "base=%p size=0x%llx rc=%d existing=%d",
+                      reinterpret_cast<void*>(base),
+                      static_cast<unsigned long long>(
+                          ExecutorBox64HleTrampolineSlabSize),
+                      rc, already_registered ? 1 : 0);
+            if (rc == LSX4_FEX_STATUS_OK) {
+                return;
+            }
+        }
+    }
+
+    static void* s_legacy_registered_base = nullptr;
+    if (s_legacy_registered_base == g_box64_hle_trampoline_slab) {
+        return;
+    }
+    static ExecutorFexRegisterGuestExecutableRangeFn registrar =
+        ResolveFexExecRangeRegistrar();
+    if (registrar != nullptr) {
+        const int rc = registrar(base, ExecutorBox64HleTrampolineSlabSize,
+                                 kPfReadExec);
+        if (rc == 0) {
+            s_legacy_registered_base = g_box64_hle_trampoline_slab;
+        }
+        NativeLog(rc == 0 ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR,
+                  "[EXECUTOR_HLE_TRAMPOLINE_FEX_RANGE] route=legacy "
+                  "base=%p size=0x%llx rc=%d",
+                  reinterpret_cast<void*>(base),
+                  static_cast<unsigned long long>(
+                      ExecutorBox64HleTrampolineSlabSize),
+                  rc);
+    }
+}
+
+struct ExecutorBox64HleSafePoolState {
+    std::uint64_t base{};
+    std::uint64_t cursor{};
+    std::uint64_t token_counter{};
+};
+
+const ExecutorBox64HleSafePoolState& GetExecutorBox64HleSafePool() {
+    static const ExecutorBox64HleSafePoolState state = [] {
+        const auto allocate_safe = [](const std::size_t size) -> void* {
+            for (std::uint64_t base = 0x400000000ULL; base < 0x5c0000000ULL;
+                 base += 0x40000000ULL) {
+                void* mapping = mmap(reinterpret_cast<void*>(base), size,
+                                     PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS |
+                                         MAP_FIXED_NOREPLACE,
+                                     -1, 0);
+                if (mapping == reinterpret_cast<void*>(base)) {
+                    return mapping;
+                }
+                if (mapping != MAP_FAILED) {
+                    munmap(mapping, size);
+                }
+            }
+            for (int attempt = 0; attempt < 8; ++attempt) {
+                void* mapping = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (mapping == MAP_FAILED) {
+                    break;
+                }
+                const std::uint64_t address =
+                    reinterpret_cast<std::uint64_t>(mapping);
+                if (address < 0x200000000ULL || address >= 0x300000000ULL) {
+                    return mapping;
+                }
+                munmap(mapping, size);
+            }
+            return MAP_FAILED;
+        };
+
+        void* pool = allocate_safe(ExecutorBox64HleSafePoolSize);
+        void* cursor = allocate_safe(4096);
+        if (pool == MAP_FAILED || cursor == MAP_FAILED) {
+            if (pool != MAP_FAILED) {
+                munmap(pool, ExecutorBox64HleSafePoolSize);
+            }
+            if (cursor != MAP_FAILED) {
+                munmap(cursor, 4096);
+            }
+            return ExecutorBox64HleSafePoolState{};
+        }
+        std::memset(cursor, 0, 4096);
+        RegisterBox64GuestReadableRange(pool, ExecutorBox64HleSafePoolSize,
+                                        "hle_safe_stack_pool");
+        RegisterBox64GuestReadableRange(cursor, 4096,
+                                        "hle_safe_stack_cursor");
+        const ExecutorBox64HleSafePoolState result{
+            reinterpret_cast<std::uint64_t>(pool),
+            reinterpret_cast<std::uint64_t>(cursor),
+            reinterpret_cast<std::uint64_t>(cursor) + sizeof(std::uint64_t)};
+        NativeLog(ANDROID_LOG_WARN,
+                  "[EXECUTOR_HLE_SAFE_POOL] base=0x%llx cursor=0x%llx "
+                  "size=0x%zx slot=0x%x",
+                  static_cast<unsigned long long>(result.base),
+                  static_cast<unsigned long long>(result.cursor),
+                  ExecutorBox64HleSafePoolSize, ExecutorBox64HleSafeSlotSize);
+        return result;
+    }();
+    return state;
 }
 
 std::uint64_t AllocateBox64HleSidebandSlot() {
@@ -7455,6 +12410,23 @@ std::uint64_t AllocateBox64HleTrampoline(const std::uint64_t native_function,
     if (!native_function) {
         return 0;
     }
+    const bool is_guest_exit = name.rfind("6Z83sYWFlA8", 0) == 0;
+    std::unique_lock slab_lock(g_box64_hle_slab_mutex);
+    if (const auto cached =
+            g_box64_hle_trampoline_by_native.find(native_function);
+        cached != g_box64_hle_trampoline_by_native.end()) {
+        return cached->second;
+    }
+    if (!is_guest_exit && g_box64_hle_manifest_sealed) {
+        const auto generation = g_box64_hle_manifest_generation;
+        slab_lock.unlock();
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_HLE_MANIFEST_LATE_REJECT] slab=box64 name=%s "
+                  "generation=%llu",
+                  name.c_str(),
+                  static_cast<unsigned long long>(generation));
+        return 0;
+    }
     if (!g_box64_hle_trampoline_slab) {
         g_box64_hle_trampoline_slab =
             mmap(nullptr, ExecutorBox64HleTrampolineSlabSize,
@@ -7465,49 +12437,41 @@ std::uint64_t AllocateBox64HleTrampoline(const std::uint64_t native_function,
         }
         g_box64_hle_trampoline_used = 0;
     }
-    static std::uint64_t s_hle_pool_base = 0;
-    static std::uint64_t s_hle_pool_cursor = 0;
-    if (s_hle_pool_base == 0) {
-        auto alloc_safe = [](std::size_t sz) -> void* {
-            for (std::uint64_t base = 0x400000000ULL; base < 0x5c0000000ULL; base += 0x40000000ULL) {
-                void* m = mmap(reinterpret_cast<void*>(base), sz, PROT_READ | PROT_WRITE,
-                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-                if (m == reinterpret_cast<void*>(base)) return m;
-                if (m != MAP_FAILED) munmap(m, sz);
-            }
-            for (int attempt = 0; attempt < 8; ++attempt) {
-                void* m = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-                if (m == MAP_FAILED) break;
-                const std::uint64_t a = reinterpret_cast<std::uint64_t>(m);
-                if (a < 0x200000000ULL || a >= 0x300000000ULL) return m;
-                munmap(m, sz);
-            }
-            return MAP_FAILED;
-        };
-        void* pool = alloc_safe(ExecutorBox64HleSafePoolSize);
-        void* cur = alloc_safe(4096);
-        if (pool == MAP_FAILED || cur == MAP_FAILED) {
+    const auto& safe_pool = GetExecutorBox64HleSafePool();
+    if (safe_pool.base == 0 || safe_pool.cursor == 0) {
+        return 0;
+    }
+    const std::size_t aligned_hle_used =
+        (g_box64_hle_trampoline_used + ExecutorBox64HleTrampolineSize - 1) &
+        ~(ExecutorBox64HleTrampolineSize - 1);
+    if (aligned_hle_used > g_box64_hle_trampoline_used) {
+        if (aligned_hle_used > ExecutorBox64HleTrampolineSlabSize) {
             return 0;
         }
-        s_hle_pool_base = reinterpret_cast<std::uint64_t>(pool);
-        s_hle_pool_cursor = reinterpret_cast<std::uint64_t>(cur);
-        *reinterpret_cast<volatile std::uint64_t*>(cur) = 0;
-        RegisterBox64GuestReadableRange(pool, ExecutorBox64HleSafePoolSize, "hle_safe_stack_pool");
-        RegisterBox64GuestReadableRange(cur, 4096, "hle_safe_stack_cursor");
-        NativeLog(ANDROID_LOG_WARN,
-                  "[EXECUTOR_HLE_SAFE_POOL] base=0x%llx cursor=0x%llx size=0x%zx slot=0x%x",
-                  (unsigned long long)s_hle_pool_base, (unsigned long long)s_hle_pool_cursor,
-                  ExecutorBox64HleSafePoolSize, ExecutorBox64HleSafeSlotSize);
+        auto* padding = static_cast<std::uint8_t*>(g_box64_hle_trampoline_slab) +
+                        g_box64_hle_trampoline_used;
+        std::memset(padding, 0xcc, aligned_hle_used - g_box64_hle_trampoline_used);
+        __builtin___clear_cache(
+            reinterpret_cast<char*>(padding),
+            reinterpret_cast<char*>(padding +
+                                    (aligned_hle_used - g_box64_hle_trampoline_used)));
+        g_box64_hle_trampoline_used = aligned_hle_used;
     }
     if (g_box64_hle_trampoline_used + ExecutorBox64HleTrampolineSize >
         ExecutorBox64HleTrampolineSlabSize) {
         return 0;
     }
 
-    auto* code = static_cast<std::uint8_t*>(g_box64_hle_trampoline_slab) +
-                 g_box64_hle_trampoline_used;
+    auto* slot_code = static_cast<std::uint8_t*>(g_box64_hle_trampoline_slab) +
+                      g_box64_hle_trampoline_used;
+    std::array<std::uint8_t, ExecutorBox64HleTrampolineSize * 2> staged_code{};
+    std::fill(staged_code.begin(), staged_code.end(), std::uint8_t{0xa5});
+    std::fill_n(staged_code.begin(), ExecutorBox64HleTrampolineSize,
+                std::uint8_t{0xcc});
+    auto* const code = staged_code.data();
+    const std::uint64_t slot_address =
+        reinterpret_cast<std::uint64_t>(slot_code);
     std::size_t cursor = 0;
-    const bool is_guest_exit = name.rfind("6Z83sYWFlA8", 0) == 0;
     if (is_guest_exit) {
         code[cursor++] = 0xb8;
         std::uint32_t syscall = ExecutorBox64GuestExitSyscall;
@@ -7517,6 +12481,22 @@ std::uint64_t AllocateBox64HleTrampoline(const std::uint64_t native_function,
         code[cursor++] = 0x05;
         code[cursor++] = 0xcc;
     } else {
+
+
+
+        code[cursor++] = 0x49;
+        code[cursor++] = 0x89;
+        code[cursor++] = 0xc3;
+        code[cursor++] = 0x66;
+        code[cursor++] = 0x4d;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x6e;
+        code[cursor++] = 0xfb;
+        code[cursor++] = 0x66;
+        code[cursor++] = 0x4c;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x6e;
+        code[cursor++] = 0xf1;
         code[cursor++] = 0x48;
         code[cursor++] = 0x89;
         code[cursor++] = 0xe0;
@@ -7576,9 +12556,13 @@ std::uint64_t AllocateBox64HleTrampoline(const std::uint64_t native_function,
             std::memcpy(code + cursor, &stack_slot, sizeof(stack_slot));
             cursor += sizeof(stack_slot);
         }
+
+
         code[cursor++] = 0x48;
-        code[cursor++] = 0x89;
-        code[cursor++] = 0xe0;
+        code[cursor++] = 0x8d;
+        code[cursor++] = 0x44;
+        code[cursor++] = 0x24;
+        code[cursor++] = 0x08;
         code[cursor++] = 0x4c;
         code[cursor++] = 0x8d;
         code[cursor++] = 0x94;
@@ -7592,6 +12576,21 @@ std::uint64_t AllocateBox64HleTrampoline(const std::uint64_t native_function,
         code[cursor++] = 0x89;
         code[cursor++] = 0x50;
         code[cursor++] = 0x40;
+        code[cursor++] = 0x45;
+        code[cursor++] = 0x31;
+        code[cursor++] = 0xd2;
+        for (const std::uint32_t metadata_offset : {
+                 Lsx4::FexHleLease::OriginalReturnOffset,
+                 Lsx4::FexHleLease::GuardPointerOffset,
+                 Lsx4::FexHleLease::LeaseTokenOffset,
+                 Lsx4::FexHleLease::StubBeginOffset}) {
+            code[cursor++] = 0x4c;
+            code[cursor++] = 0x89;
+            code[cursor++] = 0x90;
+            std::memcpy(code + cursor, &metadata_offset,
+                        sizeof(metadata_offset));
+            cursor += sizeof(metadata_offset);
+        }
         code[cursor++] = 0xe9;
         const std::size_t jmp_ready_rel_pos = cursor;
         {
@@ -7607,14 +12606,82 @@ std::uint64_t AllocateBox64HleTrampoline(const std::uint64_t native_function,
                 reinterpret_cast<std::uint64_t>(code + jmp_pool_rel_pos + sizeof(std::int32_t)));
             std::memcpy(code + jmp_pool_rel_pos, &rel, sizeof(rel));
         }
+        code[cursor++] = 0x49;
+        code[cursor++] = 0xba;
+        std::memcpy(code + cursor, &safe_pool.token_counter,
+                    sizeof(safe_pool.token_counter));
+        cursor += sizeof(safe_pool.token_counter);
+        code[cursor++] = 0x49;
+        code[cursor++] = 0x8b;
+        code[cursor++] = 0x02;
+        code[cursor++] = 0xb9;
+        {
+            const std::uint32_t attempts =
+                Lsx4::FexHleLease::MaxTokenAllocateAttempts;
+            std::memcpy(code + cursor, &attempts, sizeof(attempts));
+            cursor += sizeof(attempts);
+        }
+        const std::size_t token_retry_path = cursor;
+        code[cursor++] = 0x48;
+        code[cursor++] = 0x83;
+        code[cursor++] = 0xf8;
+        code[cursor++] = 0xff;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x84;
+        const std::size_t token_exhausted_rel_pos = cursor;
+        cursor += sizeof(std::int32_t);
+        code[cursor++] = 0x4c;
+        code[cursor++] = 0x8d;
+        code[cursor++] = 0x58;
+        code[cursor++] = 0x01;
+        code[cursor++] = 0xf0;
+        code[cursor++] = 0x4d;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0xb1;
+        code[cursor++] = 0x1a;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x84;
+        const std::size_t token_acquired_rel_pos = cursor;
+        cursor += sizeof(std::int32_t);
+        code[cursor++] = 0xff;
+        code[cursor++] = 0xc9;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x85;
+        {
+            const std::int32_t rel = static_cast<std::int32_t>(
+                reinterpret_cast<std::uint64_t>(code + token_retry_path) -
+                reinterpret_cast<std::uint64_t>(code + cursor +
+                                                sizeof(std::int32_t)));
+            std::memcpy(code + cursor, &rel, sizeof(rel));
+            cursor += sizeof(rel);
+        }
+        code[cursor++] = 0xe9;
+        const std::size_t token_contended_exhausted_rel_pos = cursor;
+        cursor += sizeof(std::int32_t);
+        const std::size_t token_acquired_path = cursor;
+        {
+            const std::int32_t rel = static_cast<std::int32_t>(
+                reinterpret_cast<std::uint64_t>(code + token_acquired_path) -
+                reinterpret_cast<std::uint64_t>(
+                    code + token_acquired_rel_pos + sizeof(std::int32_t)));
+            std::memcpy(code + token_acquired_rel_pos, &rel, sizeof(rel));
+        }
+        code[cursor++] = 0xb9;
+        {
+            const std::uint32_t attempts =
+                Lsx4::FexHleLease::MaxAcquireAttempts;
+            std::memcpy(code + cursor, &attempts, sizeof(attempts));
+            cursor += sizeof(attempts);
+        }
+        const std::size_t pool_retry_path = cursor;
         code[cursor++] = 0x48;
         code[cursor++] = 0xb8;
-        std::memcpy(code + cursor, &s_hle_pool_cursor, sizeof(s_hle_pool_cursor));
-        cursor += sizeof(s_hle_pool_cursor);
+        std::memcpy(code + cursor, &safe_pool.cursor, sizeof(safe_pool.cursor));
+        cursor += sizeof(safe_pool.cursor);
         code[cursor++] = 0x41;
         code[cursor++] = 0xba;
         {
-            std::uint32_t slot_sz = ExecutorBox64HleSafeSlotSize;
+            const std::uint32_t slot_sz = ExecutorBox64HleSafeSlotSize;
             std::memcpy(code + cursor, &slot_sz, sizeof(slot_sz));
             cursor += sizeof(slot_sz);
         }
@@ -7627,16 +12694,72 @@ std::uint64_t AllocateBox64HleTrampoline(const std::uint64_t native_function,
         code[cursor++] = 0x81;
         code[cursor++] = 0xe2;
         {
-            std::uint32_t mask = static_cast<std::uint32_t>(ExecutorBox64HleSafePoolSize - 1);
+            const std::uint32_t mask = static_cast<std::uint32_t>(
+                ExecutorBox64HleSafePoolSize - 1);
             std::memcpy(code + cursor, &mask, sizeof(mask));
             cursor += sizeof(mask);
         }
         code[cursor++] = 0x48;
         code[cursor++] = 0xb8;
-        std::memcpy(code + cursor, &s_hle_pool_base, sizeof(s_hle_pool_base));
-        cursor += sizeof(s_hle_pool_base);
+        std::memcpy(code + cursor, &safe_pool.base, sizeof(safe_pool.base));
+        cursor += sizeof(safe_pool.base);
         code[cursor++] = 0x4c;
         code[cursor++] = 0x01;
+        code[cursor++] = 0xd0;
+        code[cursor++] = 0x49;
+        code[cursor++] = 0x89;
+        code[cursor++] = 0xc2;
+        code[cursor++] = 0x31;
+        code[cursor++] = 0xc0;
+        code[cursor++] = 0xf0;
+        code[cursor++] = 0x4d;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0xb1;
+        code[cursor++] = 0x1a;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x84;
+        const std::size_t pool_acquired_rel_pos = cursor;
+        cursor += sizeof(std::int32_t);
+        code[cursor++] = 0xff;
+        code[cursor++] = 0xc9;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x85;
+        {
+            const std::int32_t rel = static_cast<std::int32_t>(
+                reinterpret_cast<std::uint64_t>(code + pool_retry_path) -
+                reinterpret_cast<std::uint64_t>(code + cursor +
+                                                sizeof(std::int32_t)));
+            std::memcpy(code + cursor, &rel, sizeof(rel));
+            cursor += sizeof(rel);
+        }
+        const std::size_t pool_exhausted_path = cursor;
+
+
+
+
+
+
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x0b;
+        for (const std::size_t exhausted_rel_pos : {
+                 token_exhausted_rel_pos,
+                 token_contended_exhausted_rel_pos}) {
+            const std::int32_t rel = static_cast<std::int32_t>(
+                reinterpret_cast<std::uint64_t>(code + pool_exhausted_path) -
+                reinterpret_cast<std::uint64_t>(
+                    code + exhausted_rel_pos + sizeof(std::int32_t)));
+            std::memcpy(code + exhausted_rel_pos, &rel, sizeof(rel));
+        }
+        const std::size_t pool_acquired_path = cursor;
+        {
+            const std::int32_t rel = static_cast<std::int32_t>(
+                reinterpret_cast<std::uint64_t>(code + pool_acquired_path) -
+                reinterpret_cast<std::uint64_t>(
+                    code + pool_acquired_rel_pos + sizeof(std::int32_t)));
+            std::memcpy(code + pool_acquired_rel_pos, &rel, sizeof(rel));
+        }
+        code[cursor++] = 0x4c;
+        code[cursor++] = 0x89;
         code[cursor++] = 0xd0;
         code[cursor++] = 0x48;
         code[cursor++] = 0x05;
@@ -7649,6 +12772,39 @@ std::uint64_t AllocateBox64HleTrampoline(const std::uint64_t native_function,
         code[cursor++] = 0x89;
         code[cursor++] = 0x60;
         code[cursor++] = 0x40;
+        code[cursor++] = 0x4c;
+        code[cursor++] = 0x89;
+        code[cursor++] = 0x90;
+        {
+            const std::uint32_t lease_pointer_offset =
+                ExecutorBox64HleLeasePointerOffset;
+            std::memcpy(code + cursor, &lease_pointer_offset,
+                        sizeof(lease_pointer_offset));
+            cursor += sizeof(lease_pointer_offset);
+        }
+        code[cursor++] = 0x4c;
+        code[cursor++] = 0x89;
+        code[cursor++] = 0x98;
+        {
+            const std::uint32_t token_offset =
+                Lsx4::FexHleLease::LeaseTokenOffset;
+            std::memcpy(code + cursor, &token_offset, sizeof(token_offset));
+            cursor += sizeof(token_offset);
+        }
+        code[cursor++] = 0x49;
+        code[cursor++] = 0xba;
+        const std::uint64_t stub_begin = slot_address;
+        std::memcpy(code + cursor, &stub_begin, sizeof(stub_begin));
+        cursor += sizeof(stub_begin);
+        code[cursor++] = 0x4c;
+        code[cursor++] = 0x89;
+        code[cursor++] = 0x90;
+        {
+            const std::uint32_t stub_offset =
+                Lsx4::FexHleLease::StubBeginOffset;
+            std::memcpy(code + cursor, &stub_offset, sizeof(stub_offset));
+            cursor += sizeof(stub_offset);
+        }
 
         const std::size_t sideband_ready = cursor;
         {
@@ -7657,6 +12813,19 @@ std::uint64_t AllocateBox64HleTrampoline(const std::uint64_t native_function,
                 reinterpret_cast<std::uint64_t>(code + jmp_ready_rel_pos + sizeof(std::int32_t)));
             std::memcpy(code + jmp_ready_rel_pos, &rel, sizeof(rel));
         }
+        code[cursor++] = 0x66;
+        code[cursor++] = 0x4d;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x7e;
+        code[cursor++] = 0xfb;
+        code[cursor++] = 0x66;
+        code[cursor++] = 0x4c;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x7e;
+        code[cursor++] = 0xf1;
+        code[cursor++] = 0x4c;
+        code[cursor++] = 0x89;
+        code[cursor++] = 0x18;
         code[cursor++] = 0x4c;
         code[cursor++] = 0x89;
         code[cursor++] = 0x58;
@@ -7805,41 +12974,271 @@ std::uint64_t AllocateBox64HleTrampoline(const std::uint64_t native_function,
         code[cursor++] = 0x49;
         code[cursor++] = 0x89;
         code[cursor++] = 0x0a;
+        code[cursor++] = 0x49;
+        code[cursor++] = 0x89;
+        code[cursor++] = 0xc3;
+        code[cursor++] = 0x48;
+        code[cursor++] = 0x8b;
+        code[cursor++] = 0x94;
+        code[cursor++] = 0x24;
+        {
+            const std::uint32_t guard_offset =
+                Lsx4::FexHleLease::GuardPointerOffset;
+            std::memcpy(code + cursor, &guard_offset, sizeof(guard_offset));
+            cursor += sizeof(guard_offset);
+        }
+        code[cursor++] = 0x48;
+        code[cursor++] = 0x85;
+        code[cursor++] = 0xd2;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x84;
+        const std::size_t stack_cleanup_rel_pos = cursor;
+        cursor += sizeof(std::int32_t);
+        code[cursor++] = 0x48;
+        code[cursor++] = 0x8b;
+        code[cursor++] = 0x84;
+        code[cursor++] = 0x24;
+        {
+            const std::uint32_t token_offset =
+                Lsx4::FexHleLease::LeaseTokenOffset;
+            std::memcpy(code + cursor, &token_offset, sizeof(token_offset));
+            cursor += sizeof(token_offset);
+        }
+        code[cursor++] = 0x48;
+        code[cursor++] = 0x85;
+        code[cursor++] = 0xc0;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x84;
+        const std::size_t token_zero_rel_pos = cursor;
+        cursor += sizeof(std::int32_t);
+        code[cursor++] = 0x4c;
+        code[cursor++] = 0x8d;
+        code[cursor++] = 0x84;
+        code[cursor++] = 0x24;
+        {
+            const std::int32_t negative_frame_offset =
+                -static_cast<std::int32_t>(Lsx4::FexHleLease::FrameOffset);
+            std::memcpy(code + cursor, &negative_frame_offset,
+                        sizeof(negative_frame_offset));
+            cursor += sizeof(negative_frame_offset);
+        }
+        code[cursor++] = 0x4c;
+        code[cursor++] = 0x39;
+        code[cursor++] = 0xc2;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x85;
+        const std::size_t frame_mismatch_rel_pos = cursor;
+        cursor += sizeof(std::int32_t);
+        code[cursor++] = 0x49;
+        code[cursor++] = 0xb9;
+        std::memcpy(code + cursor, &safe_pool.base, sizeof(safe_pool.base));
+        cursor += sizeof(safe_pool.base);
+        code[cursor++] = 0x4d;
+        code[cursor++] = 0x29;
+        code[cursor++] = 0xc8;
+        code[cursor++] = 0x49;
+        code[cursor++] = 0x81;
+        code[cursor++] = 0xf8;
+        {
+            const std::uint32_t pool_size =
+                static_cast<std::uint32_t>(ExecutorBox64HleSafePoolSize);
+            std::memcpy(code + cursor, &pool_size, sizeof(pool_size));
+            cursor += sizeof(pool_size);
+        }
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x83;
+        const std::size_t pool_range_rel_pos = cursor;
+        cursor += sizeof(std::int32_t);
+        code[cursor++] = 0x49;
+        code[cursor++] = 0xf7;
+        code[cursor++] = 0xc0;
+        {
+            const std::uint32_t slot_mask =
+                Lsx4::FexHleLease::SlotSize - 1;
+            std::memcpy(code + cursor, &slot_mask, sizeof(slot_mask));
+            cursor += sizeof(slot_mask);
+        }
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x85;
+        const std::size_t alignment_rel_pos = cursor;
+        cursor += sizeof(std::int32_t);
+        code[cursor++] = 0x49;
+        code[cursor++] = 0xb9;
+        const std::uint64_t expected_stub_begin = slot_address;
+        std::memcpy(code + cursor, &expected_stub_begin,
+                    sizeof(expected_stub_begin));
+        cursor += sizeof(expected_stub_begin);
+        code[cursor++] = 0x4c;
+        code[cursor++] = 0x39;
+        code[cursor++] = 0x8c;
+        code[cursor++] = 0x24;
+        {
+            const std::uint32_t stub_offset =
+                Lsx4::FexHleLease::StubBeginOffset;
+            std::memcpy(code + cursor, &stub_offset, sizeof(stub_offset));
+            cursor += sizeof(stub_offset);
+        }
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x85;
+        const std::size_t stub_mismatch_rel_pos = cursor;
+        cursor += sizeof(std::int32_t);
+        code[cursor++] = 0x45;
+        code[cursor++] = 0x31;
+        code[cursor++] = 0xc0;
+        code[cursor++] = 0xf0;
+        code[cursor++] = 0x4c;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0xb1;
+        code[cursor++] = 0x02;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x85;
+        const std::size_t stale_owner_rel_pos = cursor;
+        cursor += sizeof(std::int32_t);
+        for (const std::uint32_t metadata_offset : {
+                 Lsx4::FexHleLease::GuardPointerOffset,
+                 Lsx4::FexHleLease::LeaseTokenOffset,
+                 Lsx4::FexHleLease::StubBeginOffset}) {
+            code[cursor++] = 0x4c;
+            code[cursor++] = 0x89;
+            code[cursor++] = 0x84;
+            code[cursor++] = 0x24;
+            std::memcpy(code + cursor, &metadata_offset,
+                        sizeof(metadata_offset));
+            cursor += sizeof(metadata_offset);
+        }
+        code[cursor++] = 0xe9;
+        const std::size_t cleanup_done_rel_pos = cursor;
+        cursor += sizeof(std::int32_t);
+
+        const std::size_t stack_cleanup_path = cursor;
+        {
+            const std::int32_t rel = static_cast<std::int32_t>(
+                reinterpret_cast<std::uint64_t>(code + stack_cleanup_path) -
+                reinterpret_cast<std::uint64_t>(
+                    code + stack_cleanup_rel_pos + sizeof(std::int32_t)));
+            std::memcpy(code + stack_cleanup_rel_pos, &rel, sizeof(rel));
+        }
+        std::array<std::size_t, 2> corrupt_stack_rel_positions{};
+        std::size_t corrupt_stack_index = 0;
+        for (const std::uint32_t metadata_offset : {
+                 Lsx4::FexHleLease::LeaseTokenOffset,
+                 Lsx4::FexHleLease::StubBeginOffset}) {
+            code[cursor++] = 0x48;
+            code[cursor++] = 0x83;
+            code[cursor++] = 0xbc;
+            code[cursor++] = 0x24;
+            std::memcpy(code + cursor, &metadata_offset,
+                        sizeof(metadata_offset));
+            cursor += sizeof(metadata_offset);
+            code[cursor++] = 0x00;
+            code[cursor++] = 0x0f;
+            code[cursor++] = 0x85;
+            corrupt_stack_rel_positions[corrupt_stack_index++] = cursor;
+            cursor += sizeof(std::int32_t);
+        }
+        const std::size_t cleanup_done_path = cursor;
+        {
+            const std::int32_t rel = static_cast<std::int32_t>(
+                reinterpret_cast<std::uint64_t>(code + cleanup_done_path) -
+                reinterpret_cast<std::uint64_t>(
+                    code + cleanup_done_rel_pos + sizeof(std::int32_t)));
+            std::memcpy(code + cleanup_done_rel_pos, &rel, sizeof(rel));
+        }
+        code[cursor++] = 0x4c;
+        code[cursor++] = 0x89;
+        code[cursor++] = 0xd8;
         code[cursor++] = 0x4c;
         code[cursor++] = 0x89;
         code[cursor++] = 0xd4;
         code[cursor++] = 0xc3;
-        const std::uint64_t helper = reinterpret_cast<std::uint64_t>(code) + cursor;
+        const std::size_t cleanup_fail_path = cursor;
+        code[cursor++] = 0x0f;
+        code[cursor++] = 0x0b;
+        for (const std::size_t rel_pos : {
+                 token_zero_rel_pos, frame_mismatch_rel_pos,
+                 pool_range_rel_pos, alignment_rel_pos,
+                 stub_mismatch_rel_pos, stale_owner_rel_pos}) {
+            const std::int32_t rel = static_cast<std::int32_t>(
+                reinterpret_cast<std::uint64_t>(code + cleanup_fail_path) -
+                reinterpret_cast<std::uint64_t>(code + rel_pos +
+                                                sizeof(std::int32_t)));
+            std::memcpy(code + rel_pos, &rel, sizeof(rel));
+        }
+        for (const std::size_t rel_pos : corrupt_stack_rel_positions) {
+            const std::int32_t rel = static_cast<std::int32_t>(
+                reinterpret_cast<std::uint64_t>(code + cleanup_fail_path) -
+                reinterpret_cast<std::uint64_t>(code + rel_pos +
+                                                sizeof(std::int32_t)));
+            std::memcpy(code + rel_pos, &rel, sizeof(rel));
+        }
+        const std::uint64_t helper = slot_address + cursor;
         rel32 = static_cast<std::int32_t>(
-            helper - (reinterpret_cast<std::uint64_t>(code) + call_pos + 5));
+            helper - (slot_address + call_pos + 5));
         std::memcpy(code + rel_pos, &rel32, sizeof(rel32));
         code[cursor++] = 0x0f;
         code[cursor++] = 0x3f;
         const auto& hle_hash =
-            RuntimeGuestJitActive() ? Lsx4::Translation::TranslationThunkIdentity
-                                    : Lsx4::Translation::FexThunkIdentity;
+            RuntimeGuestJitActive()
+                ? Lsx4::Translation::TranslationThunkIdentity
+                : (RuntimeGuestFexActive()
+                       ? Lsx4::Translation::FexThunkIdentity
+                       : Lsx4::Translation::FexLegacyThunkIdentity);
         std::memcpy(code + cursor, hle_hash.data(), hle_hash.size());
         cursor += hle_hash.size();
     }
+    const std::size_t emitted_bytes = cursor;
+    const bool canary_intact = std::all_of(
+        staged_code.begin() + ExecutorBox64HleTrampolineSize,
+        staged_code.begin() + ExecutorBox64HleTrampolineSize +
+            Lsx4::FexHleLease::StubEmissionCanaryBytes,
+        [](const std::uint8_t byte) { return byte == 0xa5; });
+    if (!canary_intact) {
+        ++g_box64_hle_emission_canary_failures;
+    }
+    if (!canary_intact ||
+        emitted_bytes > ExecutorBox64HleTrampolineSize -
+                            Lsx4::FexHleLease::MinimumStubSpareBytes) {
+        NativeLog(ANDROID_LOG_FATAL,
+                  "[EXECUTOR_FEX_HLE_STUB_OVERSIZE] slab=box64 size=%zu "
+                  "capacity=%zu spare=%zu canary=%d",
+                  emitted_bytes, ExecutorBox64HleTrampolineSize,
+                  Lsx4::FexHleLease::MinimumStubSpareBytes,
+                  canary_intact ? 1 : 0);
+        return 0;
+    }
+    g_box64_hle_max_emitted_bytes =
+        std::max(g_box64_hle_max_emitted_bytes, emitted_bytes);
     while (cursor < ExecutorBox64HleTrampolineSize) {
         code[cursor++] = 0xcc;
     }
 
-    __builtin___clear_cache(reinterpret_cast<char*>(code),
-                            reinterpret_cast<char*>(code + ExecutorBox64HleTrampolineSize));
+    std::memcpy(slot_code, code, ExecutorBox64HleTrampolineSize);
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(slot_code),
+        reinterpret_cast<char*>(slot_code + ExecutorBox64HleTrampolineSize));
     g_box64_hle_trampoline_used += ExecutorBox64HleTrampolineSize;
     ++g_box64_hle_trampoline_count;
-    const std::uint64_t thunk = reinterpret_cast<std::uint64_t>(code);
+    const std::uint64_t thunk = slot_address;
+    if (!is_guest_exit) {
+        g_box64_hle_lease_manifest.push_back({
+            .address = thunk,
+            .size = ExecutorBox64HleTrampolineSize,
+        });
+    }
     g_box64_hle_targets.push_back({
         .native_function = native_function,
         .thunk = thunk,
         .name = name,
     });
+    g_box64_hle_trampoline_by_native.emplace(native_function, thunk);
     NativeLog(ANDROID_LOG_INFO,
               "[EXECUTOR_HLE_THUNK_MODE] mode=%s name=%s thunk=%p target=%p "
               "guest_exit=%d",
-              RuntimeGuestJitActive() ? "jit-native-marker-r1"
-                                           : "fex-stack-or-pool-sideband-r3",
+              RuntimeGuestJitActive()
+                  ? "jit-native-marker-r1"
+                  : (RuntimeGuestFexActive()
+                         ? "fex-2608-stack-sideband-v3"
+                         : "fex-stack-or-pool-sideband-r3"),
               name.c_str(), reinterpret_cast<void*>(thunk),
               reinterpret_cast<void*>(native_function), is_guest_exit ? 1 : 0);
     if (g_box64_hle_trampoline_samples.size() < 64) {
@@ -7847,10 +13246,115 @@ std::uint64_t AllocateBox64HleTrampoline(const std::uint64_t native_function,
                                                  Hex64(native_function) +
                                                  (is_guest_exit ? " guest_exit=true" : ""));
     }
+    slab_lock.unlock();
+    RegisterBox64HleTrampolineSlabWithFex();
     std::fprintf(stderr, "[EXECUTOR_HLE_MAP] name=%s thunk=%p target=%p guest_exit=%d\n",
                  name.c_str(), reinterpret_cast<void*>(thunk),
                  reinterpret_cast<void*>(native_function), is_guest_exit ? 1 : 0);
     return thunk;
+}
+
+bool PrewarmFexHleManifests(std::string& error) {
+    constexpr std::size_t ExpectedCurlDlsymTargets = 11;
+    constexpr std::size_t ExpectedPigletDlsymTargets = 1;
+    std::size_t executor_override_count = 0;
+    std::size_t curl_dlsym_count = 0;
+    std::size_t piglet_dlsym_count = 0;
+    if (!Core::AeroLib::PrewarmAndroidX64ExecutorOverrides(
+            &executor_override_count, &error)) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_HLE_PREWARM] result=executor_overrides_rejected "
+                  "error=%s",
+                  error.c_str());
+        return false;
+    }
+    if (!Libraries::Kernel::PrewarmAndroidCurlDlsymHleTargets(
+            &curl_dlsym_count) ||
+        curl_dlsym_count != ExpectedCurlDlsymTargets) {
+        error = "failed to materialize the complete curl dlsym HLE catalog";
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_HLE_PREWARM] result=curl_dlsym_rejected "
+                  "targets=%zu expected=%zu",
+                  curl_dlsym_count, ExpectedCurlDlsymTargets);
+        return false;
+    }
+    if (!Libraries::Piglet::PrewarmAndroidPigletDlsymHleTargets(
+            &piglet_dlsym_count) ||
+        piglet_dlsym_count != ExpectedPigletDlsymTargets) {
+        error = "failed to materialize the complete Piglet dlsym HLE catalog";
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_HLE_PREWARM] result=piglet_dlsym_rejected "
+                  "targets=%zu expected=%zu",
+                  piglet_dlsym_count, ExpectedPigletDlsymTargets);
+        return false;
+    }
+    std::vector<Core::AeroLib::AndroidX64TypedHleTarget> targets;
+    if (!Core::AeroLib::SnapshotAndroidX64TypedHleTargets(&targets, &error)) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_HLE_PREWARM] result=inventory_rejected error=%s",
+                  error.c_str());
+        return false;
+    }
+    std::size_t upstream_count = 0;
+    for (const auto& target : targets) {
+        const char* const name =
+            target.name.empty() ? "<typed-hle>" : target.name.c_str();
+        if (Core::AeroLib::GetAndroidX64HleStubForNative(
+                name, target.native_function) == 0) {
+            error = std::string("failed to reserve upstream HLE target: ") + name;
+            NativeLog(ANDROID_LOG_ERROR,
+                      "[EXECUTOR_FEX_HLE_PREWARM] result=upstream_rejected "
+                      "name=%s target=%p",
+                      name, reinterpret_cast<void*>(target.native_function));
+            return false;
+        }
+        ++upstream_count;
+    }
+    std::size_t box64_cached = 0;
+    {
+        std::scoped_lock slab_lock(g_box64_hle_slab_mutex);
+        box64_cached = g_box64_hle_trampoline_by_native.size();
+    }
+    error.clear();
+    NativeLog(ANDROID_LOG_INFO,
+               "[EXECUTOR_FEX_HLE_PREWARM] result=ok targets=%zu upstream=%zu "
+               "executorOverrides=%zu curlDlsym=%zu pigletDlsym=%zu "
+               "box64Cached=%zu usedBytes=%zu capacity=%zu",
+               targets.size(), upstream_count, executor_override_count,
+               curl_dlsym_count, piglet_dlsym_count, box64_cached,
+               g_box64_hle_trampoline_used,
+               ExecutorBox64HleTrampolineSlabSize);
+    return true;
+}
+
+std::uint64_t ResolveFexHleImportThunk(
+    const std::uint64_t native_function, const std::string& name) {
+    bool manifest_sealed = false;
+    {
+        std::scoped_lock slab_lock(g_box64_hle_slab_mutex);
+        if (const auto cached =
+                g_box64_hle_trampoline_by_native.find(native_function);
+            cached != g_box64_hle_trampoline_by_native.end()) {
+            return cached->second;
+        }
+        manifest_sealed = g_box64_hle_manifest_sealed;
+    }
+    if (!manifest_sealed || !RuntimeGuestFexActive()) {
+        return AllocateBox64HleTrampoline(native_function, name);
+    }
+
+
+
+
+    const std::uint64_t canonical =
+        Core::AeroLib::GetAndroidX64HleStubForNative(
+            name.c_str(), native_function);
+    if (canonical == 0) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_HLE_CANONICAL_MISS] name=%s target=%p",
+                  name.c_str(), reinterpret_cast<void*>(native_function));
+    }
+    return canonical;
 }
 
 static const std::uint8_t kImtThunkTemplate38[38] = {
@@ -7868,6 +13372,13 @@ static const std::uint8_t kImtThunkTemplate38[38] = {
     0x41, 0xff, 0x22,
     0xcc};
 static constexpr std::size_t kImtDynSlabSize = 4 * 1024 * 1024;
+static constexpr std::uint64_t kImtDynSlabCookieDomain =
+    UINT64_C(0x494d54534c414258);
+static constexpr std::uint32_t kImtDynSlabProtection =
+    PROT_READ | PROT_WRITE | PROT_EXEC;
+static constexpr std::uint32_t kImtDynSlabRangeFlags =
+    LSX4_FEX_RANGE_EXECUTABLE | LSX4_FEX_RANGE_WRITABLE |
+    LSX4_FEX_RANGE_SELF_MODIFYING;
 static constexpr std::uint32_t kImtPoolN = 32768;
 static constexpr std::size_t kImtThunkBytes = 45;
 static constexpr std::uint32_t kImtWrapperPoolN = 32768;
@@ -7910,15 +13421,110 @@ struct alignas(64) ManagedSpawnProbeState {
     std::atomic<std::uint64_t> compile_count{0};
     std::atomic<std::uint64_t> entry_count{0};
     std::atomic<std::uint64_t> return_count{0};
+    std::atomic<std::uint64_t> last_return_value{0};
+    std::atomic<std::uint64_t> last_this{0};
+    std::atomic<std::uint64_t> last_state_word{0};
+    std::atomic<std::uint64_t> last_current{0};
+    std::atomic<std::uint64_t> first_entry_sequence{0};
+    std::atomic<std::uint64_t> last_entry_sequence{0};
 };
-std::array<ManagedSpawnProbeState, 4> g_managed_spawn_probe_states{};
-std::array<std::uint64_t, 4> g_managed_spawn_probe_wrappers{};
-std::array<std::uint64_t, 4> g_managed_spawn_probe_target_cells{};
+std::array<ManagedSpawnProbeState, 8> g_managed_spawn_probe_states{};
+std::array<std::uint64_t, 8> g_managed_spawn_probe_wrappers{};
+std::array<std::uint64_t, 8> g_managed_spawn_probe_target_cells{};
 std::atomic<std::uint64_t> g_managed_spawn_probe_last_entered_token{0};
 std::atomic<std::uint64_t> g_managed_spawn_probe_entry_sequence{0};
 std::atomic_bool g_managed_spawn_probe_thread_started{false};
 std::atomic<std::size_t> g_imt_patch_cursor{0};
-bool g_imt_pool_ready = false;
+std::atomic_bool g_imt_pool_ready{false};
+std::mutex g_imt_pool_init_mutex;
+
+extern "C" int executor_lsx4_android_fex_publish_dynamic_executable_range(
+    std::uint64_t address, std::uint64_t size, std::uint64_t range_cookie,
+    std::uint32_t protection, std::uint32_t range_flags);
+extern "C" int executor_lsx4_android_fex_invalidate_dynamic_executable_range(
+    std::uint64_t address, std::uint64_t size, std::uint64_t range_cookie,
+    std::uint32_t invalidate_flags);
+
+static std::uint64_t ExecutorImtDynamicSlabCookie() noexcept {
+    return g_imt_dyn_slab != nullptr
+               ? StableGlobalExecutableRangeCookie(
+                     kImtDynSlabCookieDomain,
+                     reinterpret_cast<std::uint64_t>(g_imt_dyn_slab),
+                     kImtDynSlabSize)
+               : 0;
+}
+
+static bool ExecutorPublishImtDynamicSlabForActiveFex() {
+    if (!RuntimeGuestFexActive()) {
+        return true;
+    }
+
+
+
+    if (Executor::Fex::ActiveApi() == nullptr) {
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_FEX_IMT_SLAB] phase=publish result=deferred_initial_snapshot "
+                  "addr=%p size=0x%zx",
+                  g_imt_dyn_slab, kImtDynSlabSize);
+        return true;
+    }
+    const std::uint64_t cookie = ExecutorImtDynamicSlabCookie();
+    const int status = executor_lsx4_android_fex_publish_dynamic_executable_range(
+        reinterpret_cast<std::uint64_t>(g_imt_dyn_slab), kImtDynSlabSize,
+        cookie, kImtDynSlabProtection, kImtDynSlabRangeFlags);
+    NativeLog(status == LSX4_FEX_STATUS_OK ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR,
+              "[EXECUTOR_FEX_IMT_SLAB] phase=publish result=%d addr=%p size=0x%zx "
+              "cookie=0x%llx protection=0x%x flags=0x%x activation=existing",
+              status, g_imt_dyn_slab, kImtDynSlabSize,
+              static_cast<unsigned long long>(cookie), kImtDynSlabProtection,
+              kImtDynSlabRangeFlags);
+    return status == LSX4_FEX_STATUS_OK;
+}
+
+static bool ExecutorCommitImtDynamicCode(void* const code,
+                                         const std::size_t size,
+                                         const char* const site) {
+    if (code == nullptr || size == 0 || g_imt_dyn_slab == nullptr) {
+        return false;
+    }
+    const std::uint64_t slab_begin =
+        reinterpret_cast<std::uint64_t>(g_imt_dyn_slab);
+    const std::uint64_t code_begin = reinterpret_cast<std::uint64_t>(code);
+    if (code_begin < slab_begin || code_begin - slab_begin > kImtDynSlabSize ||
+        size > kImtDynSlabSize - (code_begin - slab_begin)) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_IMT_SLAB] phase=commit result=invalid_span "
+                  "site=%s addr=%p size=0x%zx slab=%p",
+                  site ? site : "?", code, size, g_imt_dyn_slab);
+        return false;
+    }
+
+    __builtin___clear_cache(reinterpret_cast<char*>(code),
+                            reinterpret_cast<char*>(code) + size);
+    if (!RuntimeGuestFexActive() || Executor::Fex::ActiveApi() == nullptr) {
+        return true;
+    }
+    const std::uint64_t cookie = ExecutorImtDynamicSlabCookie();
+    const int status = executor_lsx4_android_fex_invalidate_dynamic_executable_range(
+        code_begin, size, cookie, LSX4_FEX_RANGE_INVALIDATE_TRANSLATIONS);
+    NativeLog(status == LSX4_FEX_STATUS_OK ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR,
+              "[EXECUTOR_FEX_IMT_SLAB] phase=commit result=%d site=%s addr=%p "
+              "size=0x%zx cookie=0x%llx invalidate=translations",
+              status, site ? site : "?", code, size,
+              static_cast<unsigned long long>(cookie));
+    return status == LSX4_FEX_STATUS_OK;
+}
+
+static bool ExecutorImtDynamicSlabContainsExecutableAddress(
+    const std::uint64_t address) noexcept {
+    if (!g_imt_pool_ready.load(std::memory_order_acquire) ||
+        g_imt_dyn_slab == nullptr) {
+        return false;
+    }
+    const std::uint64_t begin =
+        reinterpret_cast<std::uint64_t>(g_imt_dyn_slab);
+    return address >= begin && address - begin < kImtDynSlabSize;
+}
 
 static std::uint64_t ExecutorBuildEnvironmentNewLineGate() {
     static std::uint64_t s_env_newline_gate = 0;
@@ -7930,7 +13536,6 @@ static std::uint64_t ExecutorBuildEnvironmentNewLineGate() {
     if (!cell || co + 32 > kImtDynSlabSize) {
         return 0;
     }
-    s_env_newline_gate = reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + co;
     auto* s = static_cast<std::uint8_t*>(g_imt_dyn_slab) + co;
     std::size_t k = 0;
     s[k++] = 0x49; s[k++] = 0xbb;
@@ -7943,7 +13548,10 @@ static std::uint64_t ExecutorBuildEnvironmentNewLineGate() {
     while (k < 32) {
         s[k++] = 0xcc;
     }
-    __builtin___clear_cache(reinterpret_cast<char*>(s), reinterpret_cast<char*>(s + 32));
+    if (!ExecutorCommitImtDynamicCode(s, 32, "environment_newline_gate")) {
+        return 0;
+    }
+    s_env_newline_gate = reinterpret_cast<std::uint64_t>(s);
     return s_env_newline_gate;
 }
 
@@ -7980,10 +13588,11 @@ extern "C" std::uint64_t executor_aot_got_install(std::uint64_t amodule) {
 }
 
 static bool ExecutorMonoSetupImtPool() {
-    if (g_imt_pool_ready) {
+    std::scoped_lock init_lock(g_imt_pool_init_mutex);
+    if (g_imt_pool_ready.load(std::memory_order_acquire)) {
         return true;
     }
-    g_imt_dyn_slab = mmap(nullptr, kImtDynSlabSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+    g_imt_dyn_slab = mmap(nullptr, kImtDynSlabSize, kImtDynSlabProtection,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (g_imt_dyn_slab == MAP_FAILED) {
         g_imt_dyn_slab = nullptr;
@@ -8054,7 +13663,25 @@ static bool ExecutorMonoSetupImtPool() {
                             reinterpret_cast<char*>(g_imt_thunk_base + thunks_sz));
     __builtin___clear_cache(reinterpret_cast<char*>(g_imt_wrapper_base),
                             reinterpret_cast<char*>(g_imt_wrapper_base + wrappers_sz));
-    g_imt_pool_ready = true;
+    if (!ExecutorPublishImtDynamicSlabForActiveFex()) {
+        (void)munmap(g_imt_dyn_slab, kImtDynSlabSize);
+        g_imt_dyn_slab = nullptr;
+        g_imt_thunk_base = 0;
+        g_imt_slot_base = 0;
+        g_imt_counter_addr = 0;
+        g_imt_wrapper_base = 0;
+        g_imt_wrapper_arg_base = 0;
+        g_imt_wrapper_func_cell = 0;
+        g_imt_wrapper_counter_addr = 0;
+        g_imt_alloc_overflow_counter_addr = 0;
+        g_imt_alloc_overflow_log_addr = 0;
+        g_imt_tail_overflow_counter_addr = 0;
+        g_imt_probe_method_addr = 0;
+        g_imt_probe_propid_addr = 0;
+        g_imt_patch_cursor.store(0, std::memory_order_relaxed);
+        return false;
+    }
+    g_imt_pool_ready.store(true, std::memory_order_release);
     return true;
 }
 
@@ -8064,11 +13691,15 @@ struct ManagedSpawnProbeSpec {
     const char* method_name;
 };
 
-static constexpr std::array<ManagedSpawnProbeSpec, 4> kManagedSpawnProbeSpecs{{
-    {0x06000080u, "CutscenePanelScript", "OnCoach"},
-    {0x060011a4u, "WorldDataManager", "SetTargetLevel"},
-    {0x060011a9u, "WorldDataManager", "LoadLevel"},
-    {0x060011a0u, "WorldDataManager", "get_Instance"},
+static constexpr std::array<ManagedSpawnProbeSpec, 8> kManagedSpawnProbeSpecs{{
+    {0x0600377bu, "SubsceneNode", "SubscribeCuller"},
+    {0x06003780u, "SubsceneNode", "Awake"},
+    {0x0600376bu, "SubsceneCullingManager", "<AllCullersFinished>m__169"},
+    {0x06003737u, "SubsceneCullingManager", "get_ValidRootNode"},
+    {0x06004f14u, "SubsceneCuller+<LoadSceneInternal>", "MoveNext"},
+    {0x06003700u, "SubsceneCuller", "set_LoadedState"},
+    {0x06003781u, "SubsceneNode", "OnNodeLoaded"},
+    {0x06004f21u, "SubsceneCullingManager+<LoadAndActivateIfRoutine>", "MoveNext"},
 }};
 
 static bool ExecutorManagedSpawnProbeEnabled() {
@@ -8096,7 +13727,7 @@ static std::uint64_t ExecutorBuildManagedSpawnProbeWrapper(const std::size_t ind
         return 0;
     }
 
-    constexpr std::size_t kWrapperSize = 128;
+    constexpr std::size_t kWrapperSize = 320;
     constexpr std::size_t kTargetCellOffset = kWrapperSize - sizeof(std::uint64_t);
     const std::size_t offset =
         g_imt_patch_cursor.fetch_add(kWrapperSize, std::memory_order_relaxed);
@@ -8127,7 +13758,42 @@ static std::uint64_t ExecutorBuildManagedSpawnProbeWrapper(const std::size_t ind
     auto& state = g_managed_spawn_probe_states[index];
     emit_counter_inc(state.entry_count);
 
-    emit({0x9c, 0x50, 0x51});
+    auto emit_store = [&](std::atomic<std::uint64_t>& destination,
+                          std::initializer_list<std::uint8_t> source) {
+        emit({0x9c, 0x50});
+        emit({0x48, 0xb8});
+        emit_u64(reinterpret_cast<std::uint64_t>(&destination));
+        emit(source);
+        emit({0x58, 0x9d});
+    };
+    emit_store(state.last_this, {0x48, 0x89, 0x38});
+    if (index == 0 || index == 5) {
+        emit_store(state.last_state_word, {0x48, 0x89, 0x30});
+    }
+    if (index == 4) {
+        emit({0x9c, 0x50, 0x51});
+        emit({0x48, 0xb8});
+        emit_u64(reinterpret_cast<std::uint64_t>(&state.last_state_word));
+        emit({0x48, 0x8b, 0x4f, 0x38});
+        emit({0x48, 0x89, 0x08});
+        emit({0x59, 0x58, 0x9d});
+        emit({0x9c, 0x50, 0x51});
+        emit({0x48, 0xb8});
+        emit_u64(reinterpret_cast<std::uint64_t>(&state.last_current));
+        emit({0x48, 0x8b, 0x4f, 0x40});
+        emit({0x48, 0x89, 0x08});
+        emit({0x59, 0x58, 0x9d});
+    }
+    if (index == 7) {
+        emit({0x9c, 0x50, 0x51});
+        emit({0x48, 0xb8});
+        emit_u64(reinterpret_cast<std::uint64_t>(&state.last_current));
+        emit({0x48, 0x8b, 0x4f, 0x28});
+        emit({0x48, 0x89, 0x08});
+        emit({0x59, 0x58, 0x9d});
+    }
+
+    emit({0x9c, 0x50, 0x51, 0x52});
     emit({0x48, 0xb8});
     emit_u64(reinterpret_cast<std::uint64_t>(&g_managed_spawn_probe_last_entered_token));
     emit({0x48, 0xb9});
@@ -8135,8 +13801,17 @@ static std::uint64_t ExecutorBuildManagedSpawnProbeWrapper(const std::size_t ind
     emit({0x48, 0x89, 0x08});
     emit({0x48, 0xb8});
     emit_u64(reinterpret_cast<std::uint64_t>(&g_managed_spawn_probe_entry_sequence));
-    emit({0xf0, 0x48, 0xff, 0x00});
-    emit({0x59, 0x58, 0x9d});
+    emit({0x48, 0xc7, 0xc1, 0x01, 0x00, 0x00, 0x00});
+    emit({0xf0, 0x48, 0x0f, 0xc1, 0x08});
+    emit({0x48, 0xff, 0xc1});
+    emit({0x48, 0xb8});
+    emit_u64(reinterpret_cast<std::uint64_t>(&state.last_entry_sequence));
+    emit({0x48, 0x89, 0x08});
+    emit({0x48, 0xba});
+    emit_u64(reinterpret_cast<std::uint64_t>(&state.first_entry_sequence));
+    emit({0x31, 0xc0});
+    emit({0xf0, 0x48, 0x0f, 0xb1, 0x0a});
+    emit({0x5a, 0x59, 0x58, 0x9d});
 
     emit({0x48, 0x83, 0xec, 0x08});
     emit({0xff, 0x15});
@@ -8146,6 +13821,11 @@ static std::uint64_t ExecutorBuildManagedSpawnProbeWrapper(const std::size_t ind
     std::memcpy(code + cursor, &target_disp, sizeof(target_disp));
     cursor += sizeof(target_disp);
     emit({0x48, 0x83, 0xc4, 0x08});
+    emit({0x9c, 0x51});
+    emit({0x48, 0xb9});
+    emit_u64(reinterpret_cast<std::uint64_t>(&state.last_return_value));
+    emit({0x48, 0x89, 0x01});
+    emit({0x59, 0x9d});
     emit_counter_inc(state.return_count);
     emit({0xc3});
     if (cursor > kTargetCellOffset) {
@@ -8155,8 +13835,10 @@ static std::uint64_t ExecutorBuildManagedSpawnProbeWrapper(const std::size_t ind
         code[cursor++] = 0xcc;
     }
     std::memset(code + kTargetCellOffset, 0, sizeof(std::uint64_t));
-    __builtin___clear_cache(reinterpret_cast<char*>(code),
-                            reinterpret_cast<char*>(code + kWrapperSize));
+    if (!ExecutorCommitImtDynamicCode(code, kWrapperSize,
+                                      "managed_spawn_probe_wrapper")) {
+        return 0;
+    }
     g_managed_spawn_probe_wrappers[index] = reinterpret_cast<std::uint64_t>(code);
     g_managed_spawn_probe_target_cells[index] =
         reinterpret_cast<std::uint64_t>(code) + kTargetCellOffset;
@@ -8168,12 +13850,14 @@ static int ExecutorInstallManagedSpawnProbe(void* seg_host, const std::size_t se
     if (!ExecutorManagedSpawnProbeEnabled() || !RuntimeGuestJitRequestedOrActive()) {
         return 0;
     }
-    constexpr std::size_t kCompileEntryOff = 0x0e8080;
-    static constexpr std::array<std::uint8_t, 13> kCompileEntry{{
+    constexpr std::size_t kCompileEntryOff = 0x0e67b0;
+    static constexpr std::array<std::uint8_t, 17> kCompileEntry{{
         0x55,
         0x48, 0x89, 0xe5,
         0x41, 0x57,
         0x41, 0x56,
+        0x41, 0x55,
+        0x41, 0x54,
         0x53,
         0x48, 0x83, 0xec, 0x18,
     }};
@@ -8228,10 +13912,12 @@ static int ExecutorInstallManagedSpawnProbe(void* seg_host, const std::size_t se
     std::memcpy(body + kCompileEntry.size() + 6, &continuation, sizeof(continuation));
     std::memset(body + kCompileEntry.size() + 14, 0xcc,
                 kBodyTrampolineSize - kCompileEntry.size() - 14);
-    __builtin___clear_cache(reinterpret_cast<char*>(body),
-                            reinterpret_cast<char*>(body + kBodyTrampolineSize));
+    if (!ExecutorCommitImtDynamicCode(body, kBodyTrampolineSize,
+                                      "managed_spawn_probe_body")) {
+        return -4;
+    }
 
-    constexpr std::size_t kTrampolineSize = 768;
+    constexpr std::size_t kTrampolineSize = 1536;
     const std::size_t offset =
         g_imt_patch_cursor.fetch_add(kTrampolineSize, std::memory_order_relaxed);
     if (offset + kTrampolineSize > kImtDynSlabSize) {
@@ -8354,30 +14040,43 @@ static int ExecutorInstallManagedSpawnProbe(void* seg_host, const std::size_t se
     while (cursor < kTrampolineSize) {
         code[cursor++] = 0xcc;
     }
-    __builtin___clear_cache(reinterpret_cast<char*>(code),
-                            reinterpret_cast<char*>(code + kTrampolineSize));
+    if (!ExecutorCommitImtDynamicCode(code, kTrampolineSize,
+                                      "managed_spawn_probe_trampoline")) {
+        return -6;
+    }
 
     const std::uint64_t trampoline = reinterpret_cast<std::uint64_t>(code);
-    std::array<std::uint8_t, kCompileEntry.size()> patch{};
+    std::array<std::uint8_t, 13> patch{};
     patch[0] = 0x49;
     patch[1] = 0xbb;
     std::memcpy(patch.data() + 2, &trampoline, sizeof(trampoline));
     patch[10] = 0x41;
     patch[11] = 0xff;
     patch[12] = 0xe3;
+    const long patch_page_size = sysconf(_SC_PAGESIZE);
+    if (patch_page_size <= 0) {
+        return -7;
+    }
+    const auto patch_page_mask = static_cast<std::uintptr_t>(patch_page_size - 1);
+    const auto patch_address = reinterpret_cast<std::uintptr_t>(bytes + kCompileEntryOff);
+    const auto patch_page = patch_address & ~patch_page_mask;
+    if (mprotect(reinterpret_cast<void*>(patch_page),
+                 static_cast<std::size_t>(patch_page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        return -8;
+    }
     std::memcpy(bytes + kCompileEntryOff, patch.data(), patch.size());
     __builtin___clear_cache(reinterpret_cast<char*>(bytes + kCompileEntryOff),
                             reinterpret_cast<char*>(bytes + kCompileEntryOff + patch.size()));
+    (void)mprotect(reinterpret_cast<void*>(patch_page),
+                   static_cast<std::size_t>(patch_page_size), PROT_READ | PROT_EXEC);
     NativeLog(ANDROID_LOG_INFO,
               "[EXECUTOR_MANAGED_COACH_PROBE_INSTALL] result=patched route=managed base=0x%llx "
-              "compilerEntry=0x%llx trampoline=0x%llx tokens="
-              "0x%08x,0x%08x,0x%08x,0x%08x",
+              "compilerEntry=0x%llx trampoline=0x%llx tokens=%zu",
               (unsigned long long)reinterpret_cast<std::uint64_t>(bytes),
               (unsigned long long)(reinterpret_cast<std::uint64_t>(bytes) +
                                    kCompileEntryOff),
-              (unsigned long long)trampoline, kManagedSpawnProbeSpecs[0].token,
-              kManagedSpawnProbeSpecs[1].token, kManagedSpawnProbeSpecs[2].token,
-              kManagedSpawnProbeSpecs[3].token);
+              (unsigned long long)trampoline, kManagedSpawnProbeSpecs.size());
     return 1;
 }
 
@@ -8387,7 +14086,7 @@ static void ExecutorStartManagedSpawnProbePoller() {
         return;
     }
     std::thread([] {
-        std::array<std::array<std::uint64_t, 4>, kManagedSpawnProbeSpecs.size()> previous{};
+        std::array<std::array<std::uint64_t, 10>, kManagedSpawnProbeSpecs.size()> previous{};
         for (auto& values : previous) {
             values.fill(~0ull);
         }
@@ -8395,7 +14094,7 @@ static void ExecutorStartManagedSpawnProbePoller() {
         bool base2_installed = false;
         constexpr std::uint64_t kMonoBase2 = 0x809ee8000ull;
         constexpr std::size_t kMonoTextSize = 0x1f0dd4;
-        constexpr std::size_t kCompileEntryOff = 0x0e8080;
+        constexpr std::size_t kCompileEntryOff = 0x0e67b0;
         const long page_size = sysconf(_SC_PAGESIZE);
         for (int iteration = 0; iteration < 7200; ++iteration) {
             if (!base2_installed && page_size > 0) {
@@ -8414,11 +14113,17 @@ static void ExecutorStartManagedSpawnProbePoller() {
             }
             for (std::size_t i = 0; i < kManagedSpawnProbeSpecs.size(); ++i) {
                 const auto& state = g_managed_spawn_probe_states[i];
-                const std::array<std::uint64_t, 4> current{{
+                const std::array<std::uint64_t, 10> current{{
                     state.target.load(std::memory_order_relaxed),
                     state.compile_count.load(std::memory_order_relaxed),
                     state.entry_count.load(std::memory_order_relaxed),
                     state.return_count.load(std::memory_order_relaxed),
+                    state.last_return_value.load(std::memory_order_relaxed),
+                    state.last_this.load(std::memory_order_relaxed),
+                    state.last_state_word.load(std::memory_order_relaxed),
+                    state.last_current.load(std::memory_order_relaxed),
+                    state.first_entry_sequence.load(std::memory_order_relaxed),
+                    state.last_entry_sequence.load(std::memory_order_relaxed),
                 }};
                 if (current == previous[i]) {
                     continue;
@@ -8426,15 +14131,26 @@ static void ExecutorStartManagedSpawnProbePoller() {
                 previous[i] = current;
                 const auto inflight = static_cast<std::int64_t>(current[2]) -
                                       static_cast<std::int64_t>(current[3]);
+                const std::string scene_name =
+                    i == 0 ? DecodeMonoStringBestEffortLocked(current[5]) : std::string{};
                 NativeLog(ANDROID_LOG_INFO,
                           "[EXECUTOR_MANAGED_COACH_PROBE] type=%s method=%s token=0x%08x "
-                          "target=0x%llx compile=%llu entry=%llu return=%llu inflight=%lld",
+                          "target=0x%llx compile=%llu entry=%llu return=%llu inflight=%lld "
+                          "lastRax=0x%llx bool=%u this=0x%llx stateWord=0x%llx current=0x%llx "
+                          "firstSeq=%llu lastSeq=%llu scene=%s",
                           kManagedSpawnProbeSpecs[i].type_name,
                           kManagedSpawnProbeSpecs[i].method_name,
                           kManagedSpawnProbeSpecs[i].token,
                           (unsigned long long)current[0], (unsigned long long)current[1],
                           (unsigned long long)current[2], (unsigned long long)current[3],
-                          (long long)inflight);
+                          (long long)inflight, (unsigned long long)current[4],
+                          static_cast<unsigned>(current[4] & 1u),
+                          (unsigned long long)current[5],
+                          (unsigned long long)current[6],
+                          (unsigned long long)current[7],
+                          (unsigned long long)current[8],
+                          (unsigned long long)current[9],
+                          scene_name.empty() ? "-" : scene_name.c_str());
             }
             const std::uint64_t entry_sequence =
                 g_managed_spawn_probe_entry_sequence.load(std::memory_order_relaxed);
@@ -8461,7 +14177,190 @@ static void ExecutorStartManagedSpawnProbePoller() {
     }).detach();
 }
 
+extern "C" int executor_lsx4_probe_mono_aot_get_method(const std::uint64_t address) {
+    if (!ExecutorManagedSpawnProbeEnabled() || address == 0) {
+        return 0;
+    }
+    static std::atomic<std::uint64_t> installed_at{0};
+    if (installed_at.load(std::memory_order_acquire) == address) {
+        return 1;
+    }
+    static constexpr std::array<std::uint8_t, 13> kEntry{{
+        0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+        0x56, 0x41, 0x55, 0x41, 0x54, 0x53,
+    }};
+    auto* entry = reinterpret_cast<std::uint8_t*>(address);
+    if (std::memcmp(entry, kEntry.data(), kEntry.size()) != 0) {
+        NativeLog(ANDROID_LOG_WARN,
+                  "[EXECUTOR_MANAGED_AOT_PROBE_INSTALL] result=signature_mismatch "
+                  "address=0x%llx bytes=%s",
+                  (unsigned long long)address,
+                  GuestBytesHexBestEffortLocked(address, 32).c_str());
+        return -1;
+    }
+    for (std::size_t i = 0; i < g_managed_spawn_probe_wrappers.size(); ++i) {
+        if (ExecutorBuildManagedSpawnProbeWrapper(i) == 0) {
+            return -2;
+        }
+    }
+    RegisterBox64GuestReadableRange(g_managed_spawn_probe_states.data(),
+                                    sizeof(g_managed_spawn_probe_states),
+                                    "managed_spawn_probe_states");
+
+    constexpr std::size_t kBodySize = 48;
+    const std::size_t body_offset =
+        g_imt_patch_cursor.fetch_add(kBodySize, std::memory_order_relaxed);
+    if (body_offset + kBodySize > kImtDynSlabSize) {
+        return -3;
+    }
+    auto* body = static_cast<std::uint8_t*>(g_imt_dyn_slab) + body_offset;
+    std::memcpy(body, kEntry.data(), kEntry.size());
+    body[kEntry.size() + 0] = 0xff;
+    body[kEntry.size() + 1] = 0x25;
+    std::memset(body + kEntry.size() + 2, 0, 4);
+    const std::uint64_t continuation = address + kEntry.size();
+    std::memcpy(body + kEntry.size() + 6, &continuation, sizeof(continuation));
+    std::memset(body + kEntry.size() + 14, 0xcc,
+                kBodySize - kEntry.size() - 14);
+    if (!ExecutorCommitImtDynamicCode(body, kBodySize,
+                                      "managed_aot_probe_body")) {
+        return -3;
+    }
+
+    constexpr std::size_t kTrampolineSize = 1024;
+    const std::size_t trampoline_offset =
+        g_imt_patch_cursor.fetch_add(kTrampolineSize, std::memory_order_relaxed);
+    if (trampoline_offset + kTrampolineSize > kImtDynSlabSize) {
+        return -4;
+    }
+    auto* code = static_cast<std::uint8_t*>(g_imt_dyn_slab) + trampoline_offset;
+    std::size_t cursor = 0;
+    auto emit = [&](std::initializer_list<std::uint8_t> payload) {
+        for (const std::uint8_t byte : payload) {
+            code[cursor++] = byte;
+        }
+    };
+    auto emit_u32 = [&](const std::uint32_t value) {
+        std::memcpy(code + cursor, &value, sizeof(value));
+        cursor += sizeof(value);
+    };
+    auto emit_u64 = [&](const std::uint64_t value) {
+        std::memcpy(code + cursor, &value, sizeof(value));
+        cursor += sizeof(value);
+    };
+    auto emit_jcc = [&](const std::uint8_t opcode) {
+        emit({0x0f, opcode});
+        const std::size_t displacement = cursor;
+        emit_u32(0);
+        return displacement;
+    };
+    auto emit_jmp = [&] {
+        emit({0xe9});
+        const std::size_t displacement = cursor;
+        emit_u32(0);
+        return displacement;
+    };
+    auto patch_branch = [&](const std::size_t displacement, const std::size_t target) {
+        const auto relative = static_cast<std::int32_t>(
+            static_cast<std::int64_t>(target) -
+            static_cast<std::int64_t>(displacement + sizeof(std::int32_t)));
+        std::memcpy(code + displacement, &relative, sizeof(relative));
+    };
+
+    emit({0x48, 0x83, 0xec, 0x18});
+    emit({0x48, 0x89, 0x3c, 0x24});
+    emit({0x48, 0x89, 0x74, 0x24, 0x08});
+    emit({0x49, 0xbb});
+    emit_u64(reinterpret_cast<std::uint64_t>(body));
+    emit({0x41, 0xff, 0xd3});
+    emit({0x4c, 0x8b, 0x5c, 0x24, 0x08});
+    emit({0x4d, 0x85, 0xdb});
+    const std::size_t null_method_to_normal = emit_jcc(0x84);
+
+    std::array<std::size_t, kManagedSpawnProbeSpecs.size()> token_to_target{};
+    for (std::size_t i = 0; i < kManagedSpawnProbeSpecs.size(); ++i) {
+        emit({0x41, 0x81, 0x7b, 0x04});
+        emit_u32(kManagedSpawnProbeSpecs[i].token);
+        token_to_target[i] = emit_jcc(0x84);
+    }
+    const std::size_t unmatched_to_normal = emit_jmp();
+
+    std::array<std::size_t, kManagedSpawnProbeSpecs.size()> target_labels{};
+    std::array<std::size_t, kManagedSpawnProbeSpecs.size()> null_target_to_normal{};
+    std::array<std::size_t, kManagedSpawnProbeSpecs.size()> target_to_normal{};
+    for (std::size_t i = 0; i < kManagedSpawnProbeSpecs.size(); ++i) {
+        auto& state = g_managed_spawn_probe_states[i];
+        target_labels[i] = cursor;
+        emit({0x48, 0x85, 0xc0});
+        null_target_to_normal[i] = emit_jcc(0x84);
+        emit({0x49, 0xbb});
+        emit_u64(reinterpret_cast<std::uint64_t>(&state.target));
+        emit({0x49, 0x89, 0x03});
+        emit({0x49, 0xbb});
+        emit_u64(g_managed_spawn_probe_target_cells[i]);
+        emit({0x49, 0x89, 0x03});
+        emit({0x49, 0xbb});
+        emit_u64(reinterpret_cast<std::uint64_t>(&state.compile_count));
+        emit({0xf0, 0x49, 0xff, 0x03});
+        emit({0x48, 0xb8});
+        emit_u64(g_managed_spawn_probe_wrappers[i]);
+        target_to_normal[i] = emit_jmp();
+    }
+    const std::size_t normal = cursor;
+    emit({0x48, 0x83, 0xc4, 0x18, 0xc3});
+    patch_branch(null_method_to_normal, normal);
+    patch_branch(unmatched_to_normal, normal);
+    for (std::size_t i = 0; i < kManagedSpawnProbeSpecs.size(); ++i) {
+        patch_branch(token_to_target[i], target_labels[i]);
+        patch_branch(null_target_to_normal[i], normal);
+        patch_branch(target_to_normal[i], normal);
+    }
+    if (cursor > kTrampolineSize) {
+        return -5;
+    }
+    std::memset(code + cursor, 0xcc, kTrampolineSize - cursor);
+    if (!ExecutorCommitImtDynamicCode(code, kTrampolineSize,
+                                      "managed_aot_probe_trampoline")) {
+        return -5;
+    }
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        return -6;
+    }
+    const auto page_mask = static_cast<std::uintptr_t>(page_size - 1);
+    const auto page = static_cast<std::uintptr_t>(address) & ~page_mask;
+    if (mprotect(reinterpret_cast<void*>(page), static_cast<std::size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        return -7;
+    }
+    const std::uint64_t trampoline = reinterpret_cast<std::uint64_t>(code);
+    std::array<std::uint8_t, 13> patch{};
+    patch[0] = 0x49;
+    patch[1] = 0xbb;
+    std::memcpy(patch.data() + 2, &trampoline, sizeof(trampoline));
+    patch[10] = 0x41;
+    patch[11] = 0xff;
+    patch[12] = 0xe3;
+    std::memcpy(entry, patch.data(), patch.size());
+    __builtin___clear_cache(reinterpret_cast<char*>(entry),
+                            reinterpret_cast<char*>(entry + patch.size()));
+    (void)mprotect(reinterpret_cast<void*>(page), static_cast<std::size_t>(page_size),
+                   PROT_READ | PROT_EXEC);
+    installed_at.store(address, std::memory_order_release);
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_MANAGED_AOT_PROBE_INSTALL] result=patched address=0x%llx "
+              "trampoline=0x%llx tokens=%zu",
+              (unsigned long long)address, (unsigned long long)trampoline,
+              kManagedSpawnProbeSpecs.size());
+    return 1;
+}
+
 extern "C" int executor_lsx4_probe_env_newline_icall_table(std::uint64_t mono_base) {
+    if (ExecutorManagedSpawnProbeEnabled()) {
+        constexpr std::size_t kMonoTextSize = 0x1f0dd4;
+        ExecutorInstallManagedSpawnProbe(reinterpret_cast<void*>(mono_base), kMonoTextSize);
+    }
     if (RuntimeGuestJitRequestedOrActive()) {
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_ENV_NEWLINE_RET] jit-skip wrap base=0x%llx reason=use-native-mono-icall-table",
@@ -8523,7 +14422,9 @@ extern "C" int executor_lsx4_probe_env_newline_icall_table(std::uint64_t mono_ba
     while (k < 80) {
         wr[k++] = 0xcc;
     }
-    __builtin___clear_cache(reinterpret_cast<char*>(wr), reinterpret_cast<char*>(wr + 80));
+    if (!ExecutorCommitImtDynamicCode(wr, 80, "environment_newline_wrapper")) {
+        return -4;
+    }
 
     const std::uintptr_t page = slot & ~std::uintptr_t{0xfffull};
     mprotect(reinterpret_cast<void*>(page), 0x1000, PROT_READ | PROT_WRITE);
@@ -8792,8 +14693,10 @@ static int ExecutorInstallMonoLibcStringFastpath(void* seg_host, std::size_t seg
             return -5;
         }
         std::memset(helper + n, 0xcc, kHelperBytes - n);
-        __builtin___clear_cache(reinterpret_cast<char*>(helper),
-                                reinterpret_cast<char*>(helper + kHelperBytes));
+        if (!ExecutorCommitImtDynamicCode(helper, kHelperBytes,
+                                          "mono_libc_string_helper")) {
+            return -5;
+        }
 
         std::array<std::uint8_t, kAotCompareOriginal.size()> detour{};
         detour.fill(0x90);
@@ -9145,8 +15048,10 @@ static int ExecutorInstallMonoAotClassNameChainGuard(void* seg_host, std::size_t
     }
     std::memset(step_helper + step_size, 0xcc,
                 kGuardBytes - kStepHelperOffset - step_size);
-    __builtin___clear_cache(reinterpret_cast<char*>(init_helper),
-                            reinterpret_cast<char*>(init_helper + kGuardBytes));
+    if (!ExecutorCommitImtDynamicCode(init_helper, kGuardBytes,
+                                      "mono_aot_chain_guard")) {
+        return -6;
+    }
 
     auto install_detour = [](std::uint8_t* target, const std::size_t size,
                              const std::uint64_t helper) {
@@ -9366,8 +15271,10 @@ static int ExecutorInstallGHashCycleGuard(void* seg_host, std::size_t seg_size) 
     patch_rel32(loop_fixup, loop);
     patch_rel32(epilogue_fixup, epilogue);
     std::memset(pr + k, 0xcc, kGuardBytes - k);
-    __builtin___clear_cache(reinterpret_cast<char*>(pr),
-                            reinterpret_cast<char*>(pr + kGuardBytes));
+    if (!ExecutorCommitImtDynamicCode(pr, kGuardBytes,
+                                      "mono_ghash_cycle_guard")) {
+        return -5;
+    }
     std::uint8_t det[13];
     det[0] = 0x49;
     det[1] = 0xbb;
@@ -9464,8 +15371,10 @@ static int ExecutorInstallGHashCycleGuard(void* seg_host, std::size_t seg_size) 
                     ipatch_rel32(fixup, invalid_slot);
                 }
                 std::memset(insert_guard + i, 0xcc, kInsertGuardBytes - i);
-                __builtin___clear_cache(reinterpret_cast<char*>(insert_guard),
-                                        reinterpret_cast<char*>(insert_guard + kInsertGuardBytes));
+                if (!ExecutorCommitImtDynamicCode(insert_guard, kInsertGuardBytes,
+                                                  "mono_ghash_insert_guard")) {
+                    return -6;
+                }
 
                 std::uint8_t insert_detour[kInsertLoopPatchSize];
                 std::memset(insert_detour, 0x90, sizeof(insert_detour));
@@ -9600,8 +15509,10 @@ static int ExecutorInstallGHashCycleGuard(void* seg_host, std::size_t seg_size) 
                             kRehashInnerGuardOffset - outer_size);
                 std::memset(rehash_inner + inner_size, 0xcc,
                             kRehashGuardBytes - kRehashInnerGuardOffset - inner_size);
-                __builtin___clear_cache(reinterpret_cast<char*>(rehash_guard),
-                                        reinterpret_cast<char*>(rehash_guard + kRehashGuardBytes));
+                if (!ExecutorCommitImtDynamicCode(rehash_guard, kRehashGuardBytes,
+                                                  "mono_ghash_rehash_guard")) {
+                    return -7;
+                }
 
                 auto install_detour = [&](std::size_t off, std::size_t size,
                                           std::uint64_t target) {
@@ -9885,7 +15796,9 @@ static bool ExecutorInstallIfaceMissCapture(std::uint8_t* bytes, std::size_t seg
     emit({0x41, 0x89, 0x43, 0x20});
     emit({0x49, 0xbb}); emitq(cont);
     emit({0x41, 0xff, 0xe3});
-    __builtin___clear_cache(reinterpret_cast<char*>(pr), reinterpret_cast<char*>(pr + k));
+    if (!ExecutorCommitImtDynamicCode(pr, k, "mono_iface_miss_capture")) {
+        return false;
+    }
 
     std::uint8_t patch[18];
     std::size_t d = 0;
@@ -10098,7 +16011,9 @@ static bool ExecutorInstallCurrentThreadSetForce(std::uint8_t* bytes, std::size_
     }
     emit({0x49, 0xbb}); emitq(cont);
     emit({0x41, 0xff, 0xe3});
-    __builtin___clear_cache(reinterpret_cast<char*>(pr), reinterpret_cast<char*>(pr + k));
+    if (!ExecutorCommitImtDynamicCode(pr, k, "mono_current_thread_force")) {
+        return false;
+    }
 
     std::uint8_t patch[16];
     std::size_t d = 0;
@@ -10358,7 +16273,9 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
         pr[i++] = 0x49; pr[i++] = 0xbb;
         emit_u64(epilogue_target);
         emit({0x41, 0xff, 0xe3});
-        __builtin___clear_cache(reinterpret_cast<char*>(pr), reinterpret_cast<char*>(pr + i));
+        if (!ExecutorCommitImtDynamicCode(pr, i, "imt_alloc_overflow")) {
+            return -6;
+        }
 
         const std::uint64_t prg = reinterpret_cast<std::uint64_t>(pr);
         std::uint8_t ap[0x26];
@@ -10489,7 +16406,9 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
         patch_rel32(jmp_back_a, back_label);
         pr[i++] = 0x49; pr[i++] = 0xbb; emit_u64(back_target);
         emit({0x41, 0xff, 0xe3});
-        __builtin___clear_cache(reinterpret_cast<char*>(pr), reinterpret_cast<char*>(pr + i));
+        if (!ExecutorCommitImtDynamicCode(pr, i, "imt_tail_overflow")) {
+            return -6;
+        }
 
         const std::uint64_t prg = reinterpret_cast<std::uint64_t>(pr);
         std::uint8_t tp[15];
@@ -10534,7 +16453,9 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
         pr[k++] = 0x49; pr[k++] = 0xbb;
         emit_u64(reinterpret_cast<std::uint64_t>(bytes) + cs.off + cs.reloc_len);
         emit({0x41, 0xff, 0xe3});
-        __builtin___clear_cache(reinterpret_cast<char*>(pr), reinterpret_cast<char*>(pr + k));
+        if (!ExecutorCommitImtDynamicCode(pr, k, "imt_caller_overflow")) {
+            return -6;
+        }
         const std::uint64_t prg = reinterpret_cast<std::uint64_t>(pr);
         bytes[cs.off] = 0x49; bytes[cs.off + 1] = 0xbb; std::memcpy(bytes + cs.off + 2, &prg, 8);
         bytes[cs.off + 10] = 0x41; bytes[cs.off + 11] = 0xff; bytes[cs.off + 12] = 0xe3;
@@ -10661,6 +16582,9 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
                     const std::uint64_t cont = 0x80328792eull;
                     std::memcpy(rt + k, &cont, 8); k += 8;
                     rt[k++] = 0x41; rt[k++] = 0xff; rt[k++] = 0xe3;
+                    if (!ExecutorCommitImtDynamicCode(rt, k, "mono_phash_detour")) {
+                        return -6;
+                    }
                     const std::uint64_t rt_addr =
                         reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + ro;
                     bytes[kPHLookupOff] = 0x49; bytes[kPHLookupOff + 1] = 0xbb;
@@ -10749,6 +16673,9 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
                     rt[k++] = 0xc3;
                     patch_rel32(jz_ret, ret0);
                     patch_rel32(jne_ret, ret0);
+                    if (!ExecutorCommitImtDynamicCode(rt, k, "mono_ghash_guard")) {
+                        return -6;
+                    }
                     const std::uint64_t grt = reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + ro;
                     bytes[kGHashOff] = 0x49; bytes[kGHashOff + 1] = 0xbb;
                     std::memcpy(bytes + kGHashOff + 2, &grt, 8);
@@ -10868,6 +16795,10 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
                     emit({0x49, 0xbb});
                     { const std::uint64_t cont = 0x8031d8df4ull; std::memcpy(rt + k, &cont, 8); k += 8; }
                     emit({0x41, 0xff, 0xe3});
+                    if (!ExecutorCommitImtDynamicCode(rt, k,
+                                                      "mono_image_cache_repair")) {
+                        return -6;
+                    }
                     const std::uint64_t irt = reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + ro;
                     bytes[kImgAccOff] = 0x49; bytes[kImgAccOff + 1] = 0xbb;
                     std::memcpy(bytes + kImgAccOff + 2, &irt, 8);
@@ -10963,6 +16894,10 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
                       std::memcpy(rt + k, &cont, 8); k += 8; }
                     emit({0x41, 0xff, 0xe3});
 
+                    if (!ExecutorCommitImtDynamicCode(
+                            rt, k, "mono_class_image_repair")) {
+                        return -6;
+                    }
                     const std::uint64_t crt = reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + ro;
                     bytes[kClassSetupOff] = 0x49;
                     bytes[kClassSetupOff + 1] = 0xbb;
@@ -11090,6 +17025,10 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
                         std::memcpy(rt + jp, &d, 4);
                     }
 
+                    if (!ExecutorCommitImtDynamicCode(
+                            rt, k, "mono_class_image_late_repair")) {
+                        return -6;
+                    }
                     const std::uint64_t lrt = reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + ro;
                     bytes[kClassImageAllocOff] = 0x49;
                     bytes[kClassImageAllocOff + 1] = 0xba;
@@ -11252,6 +17191,10 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
                         std::memcpy(rt + jp, &d, 4);
                     }
 
+                    if (!ExecutorCommitImtDynamicCode(
+                            rt, k, "mono_current_thread_sidecar")) {
+                        return -6;
+                    }
                     const std::uint64_t crt = reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + ro;
                     bytes[kCurrentThreadMissingOff] = 0x49;
                     bytes[kCurrentThreadMissingOff + 1] = 0xbb;
@@ -11393,6 +17336,10 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
                         patch_rel32(jp, assert_path);
                     }
 
+                    if (!ExecutorCommitImtDynamicCode(
+                            rt, k, "mono_reflection_gc_repair")) {
+                        return -6;
+                    }
                     const std::uint64_t rrt = reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + ro;
                     bytes[kReflectionGcCheckOff] = 0x49;
                     bytes[kReflectionGcCheckOff + 1] = 0xbb;
@@ -11444,6 +17391,10 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
                     emit({0x49, 0xbb});
                     { const std::uint64_t cont = 0x8032a2f5eull; std::memcpy(rt + k, &cont, 8); k += 8; }
                     emit({0x41, 0xff, 0xe3});
+                    if (!ExecutorCommitImtDynamicCode(rt, k,
+                                                      "mono_assert_probe")) {
+                        return -6;
+                    }
                     const std::uint64_t art = reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + ro;
                     bytes[kAssertOff] = 0x49; bytes[kAssertOff + 1] = 0xbb;
                     std::memcpy(bytes + kAssertOff + 2, &art, 8);
@@ -11492,6 +17443,10 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
                     emit({0x49, 0xbb});
                     { const std::uint64_t cont = 0x80319becfull; std::memcpy(rt + k, &cont, 8); k += 8; }
                     emit({0x41, 0xff, 0xe3});
+                    if (!ExecutorCommitImtDynamicCode(
+                            rt, k, "mono_generic_method_probe")) {
+                        return -6;
+                    }
                     const std::uint64_t grt = reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + ro;
                     bytes[kGmgcOff] = 0x49; bytes[kGmgcOff + 1] = 0xbb;
                     std::memcpy(bytes + kGmgcOff + 2, &grt, 8);
@@ -11558,8 +17513,10 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
                     for (std::uint8_t b : kTypeHashOrig) rt[k++] = b;
                     emit({0x49, 0xbb}); emitq(0x8031f88fdull);
                     emit({0x41, 0xff, 0xe3});
-                    __builtin___clear_cache(reinterpret_cast<char*>(rt),
-                                            reinterpret_cast<char*>(rt + k));
+                    if (!ExecutorCommitImtDynamicCode(rt, k,
+                                                      "mono_type_hash_probe")) {
+                        return -6;
+                    }
 
                     const std::uint64_t tramp =
                         reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + ro;
@@ -11627,6 +17584,10 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
                     for (int i = 0; i < 13; ++i) rt[k++] = kMfnOrig[i];
                     emit({0x49, 0xbb}); { std::memcpy(rt + k, &kCont, 8); k += 8; }
                     emit({0x41, 0xff, 0xe3});
+                    if (!ExecutorCommitImtDynamicCode(
+                            rt, k, "mono_method_full_name_guard")) {
+                        return -6;
+                    }
                     const std::uint64_t wrt = reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + ro;
                     bytes[kMfnOff] = 0x48; bytes[kMfnOff + 1] = 0xb8;
                     std::memcpy(bytes + kMfnOff + 2, &wrt, 8);
@@ -11653,9 +17614,13 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
             if (s_icall_noop_stub == 0) {
                 const std::size_t co = g_imt_patch_cursor.fetch_add(16, std::memory_order_relaxed);
                 if (co + 16 <= kImtDynSlabSize) {
-                    s_icall_noop_stub = reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + co;
                     auto* s = static_cast<std::uint8_t*>(g_imt_dyn_slab) + co;
                     s[0] = 0x31; s[1] = 0xc0; s[2] = 0xc3;
+                    if (!ExecutorCommitImtDynamicCode(
+                            s, 3, "mono_icall_noop_stub")) {
+                        return -6;
+                    }
+                    s_icall_noop_stub = reinterpret_cast<std::uint64_t>(s);
                 }
             }
             if (g_icall_noop_count_addr == 0) {
@@ -11712,6 +17677,10 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
                     emit({0x49, 0xbb}); { const std::uint64_t cont = 0x8031c71bdull;
                                           std::memcpy(rt + k, &cont, 8); k += 8; }
                     emit({0x41, 0xff, 0xe3});
+                    if (!ExecutorCommitImtDynamicCode(
+                            rt, k, "mono_icall_bind_detour")) {
+                        return -6;
+                    }
                     const std::uint64_t irt = reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + ro;
                     bytes[kIcallOff] = 0x48; bytes[kIcallOff + 1] = 0xb8;
                     std::memcpy(bytes + kIcallOff + 2, &irt, 8);
@@ -11726,10 +17695,17 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
         }
         {
             constexpr std::size_t kLicOff = 0x37350;
-            bool isf_disabled = false;
+
+
+
+
+
+
+
+            bool isf_enabled = false;
             if (std::FILE* df = std::fopen(
-                    "/data/data/app.lsx4.android/files/run-no-icall-slot-fill", "r")) {
-                isf_disabled = true; std::fclose(df);
+                    "/data/data/app.lsx4.android/files/run-enable-icall-slot-fill", "r")) {
+                isf_enabled = true; std::fclose(df);
             }
             static const std::uint8_t kLicOrig[16] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
                                                       0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xec};
@@ -11737,9 +17713,13 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
             if (s_lic_noop == 0) {
                 const std::size_t co = g_imt_patch_cursor.fetch_add(16, std::memory_order_relaxed);
                 if (co + 16 <= kImtDynSlabSize) {
-                    s_lic_noop = reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + co;
                     auto* s = static_cast<std::uint8_t*>(g_imt_dyn_slab) + co;
                     s[0] = 0x31; s[1] = 0xc0; s[2] = 0xc3;
+                    if (!ExecutorCommitImtDynamicCode(
+                            s, 3, "mono_icall_slot_noop_stub")) {
+                        return -6;
+                    }
+                    s_lic_noop = reinterpret_cast<std::uint64_t>(s);
                 }
             }
             if (g_icall_slot_fill_count == 0) {
@@ -11749,7 +17729,7 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
                     std::memset(reinterpret_cast<void*>(g_icall_slot_fill_count), 0, 64);
                 }
             }
-            if (!isf_disabled && s_lic_noop && g_icall_slot_fill_count && g_imt_dyn_slab &&
+            if (isf_enabled && s_lic_noop && g_icall_slot_fill_count && g_imt_dyn_slab &&
                 kLicOff + 16 <= seg_size && std::memcmp(bytes + kLicOff, kLicOrig, 16) == 0) {
                 const std::uint64_t env_newline_gate = 0;
                 const std::uint64_t hle_stub_slab_base =
@@ -11842,6 +17822,10 @@ extern "C" int executor_lsx4_install_imt_dynamic_fix(void* seg_host, std::size_t
                     emit({0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53});
                     emit({0x49, 0xbb}); emitq(0x8031c735dull);
                     emit({0x41, 0xff, 0xe3});
+                    if (!ExecutorCommitImtDynamicCode(
+                            rt, k, "mono_icall_slot_fill")) {
+                        return -6;
+                    }
                     bytes[kLicOff] = 0x49; bytes[kLicOff + 1] = 0xbb;
                     std::memcpy(bytes + kLicOff + 2, &base, 8);
                     bytes[kLicOff + 10] = 0x41; bytes[kLicOff + 11] = 0xff;
@@ -12566,7 +18550,8 @@ extern "C" void executor_lsx4_register_guest_gc_roots() {
 
 extern "C" void executor_lsx4_android_publish_guest_gc_register_roots(
     const void* regs, const std::size_t regs_size) {
-    if (!ExecutorGcGuestRootsEnabled() || !RuntimeGuestJitActive() || regs == nullptr ||
+    if (!ExecutorGcGuestRootsEnabled() ||
+        (!RuntimeGuestJitActive() && !RuntimeGuestFexActive()) || regs == nullptr ||
         regs_size < sizeof(ExecutorBox64GuestRegsSnapshot)) {
         return;
     }
@@ -12650,7 +18635,9 @@ extern "C" int executor_lsx4_install_vtnull_probe(void* seg_host, std::size_t se
         if (so + 4 <= kImtDynSlabSize) {
             auto* sp = static_cast<std::uint8_t*>(g_imt_dyn_slab) + so;
             sp[0] = 0x48; sp[1] = 0x89; sp[2] = 0xf8; sp[3] = 0xc3;
-            __builtin___clear_cache(reinterpret_cast<char*>(sp), reinterpret_cast<char*>(sp + 4));
+            if (!ExecutorCommitImtDynamicCode(sp, 4, "imt_limp_stub")) {
+                return -4;
+            }
             g_imt_limp_stub = reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) + so;
         }
     }
@@ -12857,8 +18844,9 @@ extern "C" int executor_lsx4_install_vtnull_probe(void* seg_host, std::size_t se
                 for (std::uint8_t x : orig) epr[ei++] = x;
                 epr[ei++] = 0x49; epr[ei++] = 0xbb; std::memcpy(epr + ei, &econt, 8); ei += 8;
                 eemit({0x41, 0xff, 0xe3});
-                __builtin___clear_cache(reinterpret_cast<char*>(epr),
-                                        reinterpret_cast<char*>(epr + ei));
+                if (!ExecutorCommitImtDynamicCode(epr, ei, "mono_vcall_entry_probe")) {
+                    return -4;
+                }
                 std::uint8_t tp[13];
                 std::size_t tj = 0;
                 const std::uint64_t eprg = reinterpret_cast<std::uint64_t>(epr);
@@ -12904,7 +18892,9 @@ extern "C" int executor_lsx4_install_vtnull_probe(void* seg_host, std::size_t se
     emit({0x49, 0xc7, 0x83, 0x80, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00});
     pr[i++] = 0x49; pr[i++] = 0xbb; std::memcpy(pr + i, &cont, 8); i += 8;
     emit({0x41, 0xff, 0xe3});
-    __builtin___clear_cache(reinterpret_cast<char*>(pr), reinterpret_cast<char*>(pr + i));
+    if (!ExecutorCommitImtDynamicCode(pr, i, "mono_vtnull_probe")) {
+        return -4;
+    }
     std::uint8_t tp[13];
     std::size_t j = 0;
     const std::uint64_t prg = reinterpret_cast<std::uint64_t>(pr);
@@ -12988,7 +18978,9 @@ extern "C" int executor_lsx4_install_mono_value_copy_probe(void* target_addr) {
     emit({0x48, 0x89, 0xc1});
     pr[i++] = 0x49; pr[i++] = 0xbb; std::memcpy(pr + i, &tail, 8); i += 8;
     emit({0x41, 0xff, 0xe3});
-    __builtin___clear_cache(reinterpret_cast<char*>(pr), reinterpret_cast<char*>(pr + i));
+    if (!ExecutorCommitImtDynamicCode(pr, i, "mono_value_copy_probe")) {
+        return -4;
+    }
     const std::uint64_t pg = 0x1000;
     const std::uint64_t pstart = reinterpret_cast<std::uint64_t>(t) & ~(pg - 1);
     const std::uint64_t pend = (reinterpret_cast<std::uint64_t>(t) + 16 + pg - 1) & ~(pg - 1);
@@ -13039,6 +19031,208 @@ static std::uint64_t AbortNoopStub() {
     return s;
 }
 
+bool IsMappedGuestPltResolverTail(const Core::Module& module,
+                                  const std::uint64_t raw_target,
+                                  std::uint64_t* normalized_target = nullptr) {
+    const auto info = module.GetModuleInfo();
+    const auto base = module.GetBaseAddress();
+    const std::array<std::uint64_t, 2> candidates = {
+        raw_target,
+        raw_target <= UINT64_MAX - base ? base + raw_target : 0,
+    };
+    for (const auto target : candidates) {
+        if (target == 0) {
+            continue;
+        }
+        bool executable = false;
+        for (std::uint32_t index = 0; index < info.num_segments; ++index) {
+            const auto& segment = info.segments[index];
+            if ((segment.prot & PF_EXEC) == 0 || target < segment.address ||
+                target > segment.address + segment.size ||
+                segment.address + segment.size - target < 6) {
+                continue;
+            }
+            executable = true;
+            break;
+        }
+        if (!executable) {
+            continue;
+        }
+        const auto* code = reinterpret_cast<const std::uint8_t*>(target);
+        const bool push_imm32_tail = code[0] == 0x68 && code[5] == 0xe9;
+        const bool push_imm8_tail = code[0] == 0x6a && code[2] == 0xe9;
+        if (!push_imm32_tail && !push_imm8_tail) {
+            continue;
+        }
+        if (normalized_target != nullptr) {
+            *normalized_target = target;
+        }
+        return true;
+    }
+    return false;
+}
+
+struct FexLazyPltAudit {
+    std::uint32_t scanned{};
+    std::uint32_t repaired{};
+    std::uint32_t remaining{};
+    std::vector<std::string> samples;
+};
+
+FexLazyPltAudit ScanFexLazyPltSlots(Core::Linker& linker, const bool clear_rela_bits) {
+    FexLazyPltAudit audit{};
+    for (std::size_t module_index = 0; module_index < linker.GetModuleCount(); ++module_index) {
+        Core::Module* module = linker.GetModule(static_cast<s32>(module_index));
+        if (module == nullptr || module->dynamic_info.symbol_table == nullptr ||
+            module->dynamic_info.str_table == nullptr) {
+            continue;
+        }
+        const auto base = module->GetBaseAddress();
+        const std::uint32_t regular_relocation_count =
+            module->dynamic_info.relocation_table_size / sizeof(elf_relocation);
+        module->ForEachRelocation([&](elf_relocation* relocation, const u32 index,
+                                      const bool is_jump_relocation) {
+            if (!is_jump_relocation || relocation->GetType() != R_X86_64_JUMP_SLOT) {
+                return;
+            }
+            ++audit.scanned;
+            const std::uint64_t slot = base + relocation->rel_offset;
+            std::uint64_t target = 0;
+            std::memcpy(&target, reinterpret_cast<const void*>(slot), sizeof(target));
+            std::uint64_t normalized_target = 0;
+            if (!IsMappedGuestPltResolverTail(*module, target, &normalized_target)) {
+                return;
+            }
+            const auto symbol_index = relocation->GetSymbol();
+            const elf_symbol& symbol = module->dynamic_info.symbol_table[symbol_index];
+            const char* raw_name = module->dynamic_info.str_table + symbol.st_name;
+            const std::uint32_t bit_index = regular_relocation_count + index;
+            if (audit.samples.size() < 8) {
+                std::ostringstream sample;
+                sample << module->file.filename().string() << ':'
+                       << (raw_name != nullptr ? raw_name : "<unnamed>") << "@slot="
+                       << Hex64(slot) << " target=" << Hex64(normalized_target)
+                       << " bit=" << bit_index;
+                audit.samples.emplace_back(sample.str());
+            }
+            if (clear_rela_bits) {
+                module->ClearRelaBit(bit_index);
+                ++audit.repaired;
+            } else {
+                ++audit.remaining;
+            }
+        });
+    }
+    return audit;
+}
+
+struct FexOptionalWeakPltRepair {
+    std::uint32_t zeroed{};
+    std::vector<std::string> samples;
+};
+
+FexOptionalWeakPltRepair ResolveFexOptionalWeakPltSlots(Core::Linker& linker) {
+    FexOptionalWeakPltRepair repair{};
+    for (std::size_t module_index = 0; module_index < linker.GetModuleCount(); ++module_index) {
+        Core::Module* module = linker.GetModule(static_cast<s32>(module_index));
+        if (module == nullptr || module->dynamic_info.symbol_table == nullptr ||
+            module->dynamic_info.str_table == nullptr) {
+            continue;
+        }
+        const auto base = module->GetBaseAddress();
+        const std::uint32_t regular_relocation_count =
+            module->dynamic_info.relocation_table_size / sizeof(elf_relocation);
+        const std::size_t symbol_count =
+            module->dynamic_info.symbol_table_total_size / sizeof(elf_symbol);
+        module->ForEachRelocation([&](elf_relocation* relocation, const u32 index,
+                                      const bool is_jump_relocation) {
+            if (!is_jump_relocation || relocation->GetType() != R_X86_64_JUMP_SLOT) {
+                return;
+            }
+            const std::uint64_t slot = base + relocation->rel_offset;
+            std::uint64_t target = 0;
+            std::memcpy(&target, reinterpret_cast<const void*>(slot), sizeof(target));
+            if (!IsMappedGuestPltResolverTail(*module, target)) {
+                return;
+            }
+
+            const auto symbol_index = relocation->GetSymbol();
+            if (symbol_index >= symbol_count) {
+                return;
+            }
+            const elf_symbol& symbol = module->dynamic_info.symbol_table[symbol_index];
+            const auto symbol_type = symbol.GetType();
+            if (symbol.GetBind() != STB_WEAK || symbol.st_shndx != 0 || symbol.st_value != 0 ||
+                (symbol_type != STT_NOTYPE && symbol_type != STT_FUN) ||
+                symbol.st_name >= module->dynamic_info.str_table_size) {
+                return;
+            }
+
+            const char* raw_name = module->dynamic_info.str_table + symbol.st_name;
+            const std::size_t available = module->dynamic_info.str_table_size - symbol.st_name;
+            const auto* name_end = static_cast<const char*>(std::memchr(raw_name, '\0', available));
+            if (name_end == nullptr || name_end == raw_name) {
+                return;
+            }
+            const std::string_view name{raw_name,
+                                        static_cast<std::size_t>(name_end - raw_name)};
+            if (name.find('#') != std::string_view::npos) {
+                return;
+            }
+
+            const std::uint64_t weak_undefined_value = 0;
+            std::memcpy(reinterpret_cast<void*>(slot), &weak_undefined_value,
+                        sizeof(weak_undefined_value));
+            const std::uint32_t bit_index = regular_relocation_count + index;
+            module->SetRelaBit(bit_index);
+            ++repair.zeroed;
+            if (repair.samples.size() < 8) {
+                std::ostringstream sample;
+                sample << module->file.filename().string() << ':' << name << "@slot="
+                       << Hex64(slot) << " bit=" << bit_index;
+                repair.samples.emplace_back(sample.str());
+            }
+        });
+    }
+    return repair;
+}
+
+bool ResolveFexLazyPltSlots(Core::Linker& linker, std::string& error) {
+    const auto before = ScanFexLazyPltSlots(linker, true);
+    if (before.repaired != 0) {
+        linker.RelocateAllImports();
+    }
+    const auto optional_weak = ResolveFexOptionalWeakPltSlots(linker);
+    const auto after = ScanFexLazyPltSlots(linker, false);
+    std::ostringstream samples;
+    for (std::size_t index = 0; index < after.samples.size(); ++index) {
+        if (index != 0) {
+            samples << ';';
+        }
+        samples << after.samples[index];
+    }
+    std::ostringstream optional_weak_samples;
+    for (std::size_t index = 0; index < optional_weak.samples.size(); ++index) {
+        if (index != 0) {
+            optional_weak_samples << ';';
+        }
+        optional_weak_samples << optional_weak.samples[index];
+    }
+    NativeLog(after.remaining == 0 ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR,
+              "[EXECUTOR_FEX_EAGER_PLT] scanned=%u repaired=%u optionalWeakZeroed=%u "
+              "remaining=%u samples=%s optionalWeakSamples=%s",
+              before.scanned, before.repaired, optional_weak.zeroed, after.remaining,
+              samples.str().empty() ? "<none>" : samples.str().c_str(),
+              optional_weak_samples.str().empty() ? "<none>"
+                                                  : optional_weak_samples.str().c_str());
+    if (after.remaining == 0) {
+        return true;
+    }
+    error = "FEX requires eager JUMP_SLOT resolution; unresolved lazy PLT slots remain: " +
+            samples.str();
+    return false;
+}
+
 void InstallBox64HleTrampolines(Core::Module& module) {
     ResetHleTrampolineTelemetry();
     const auto base = module.GetBaseAddress();
@@ -13074,7 +19268,7 @@ void InstallBox64HleTrampolines(Core::Module& module) {
 
         const char* raw_name = module.dynamic_info.str_table + symbol.st_name;
         const std::string name = raw_name ? raw_name : "";
-        const std::uint64_t thunk = AllocateBox64HleTrampoline(native_value, name);
+        const std::uint64_t thunk = ResolveFexHleImportThunk(native_value, name);
         if (!thunk) {
             ++g_box64_hle_trampoline_skipped;
             return;
@@ -13140,7 +19334,7 @@ void InstallBox64HleTrampolines(Core::Module& module) {
 
             const std::string name = known_target->name.empty() ? NativePointerImportName(native_value)
                                                                 : known_target->name;
-            const std::uint64_t thunk = AllocateBox64HleTrampoline(native_value, name);
+            const std::uint64_t thunk = ResolveFexHleImportThunk(native_value, name);
             if (!thunk) {
                 ++g_box64_hle_trampoline_skipped;
                 continue;
@@ -13181,14 +19375,17 @@ extern "C" int executor_lsx4_android_patch_box64_hle_imports(void* module_ptr) {
         return -1;
     }
     InstallBox64HleTrampolines(*module);
-    NativeLog(ANDROID_LOG_INFO,
-              "[EXECUTOR_HLE_DYNAMIC_TRAMPOLINES] path=%s count=%llu postScanPatched=%llu "
-              "usedBytes=%llu",
+    const int status = g_box64_hle_trampoline_skipped == 0 ? 0 : -2;
+    NativeLog(status == 0 ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR,
+              "[EXECUTOR_HLE_DYNAMIC_TRAMPOLINES] path=%s result=%d count=%llu "
+              "skipped=%u postScanPatched=%llu usedBytes=%llu",
               module->file.string().c_str(),
+              status,
               static_cast<unsigned long long>(g_box64_hle_trampoline_count),
+              g_box64_hle_trampoline_skipped,
               static_cast<unsigned long long>(g_box64_hle_trampoline_post_scan_patched),
               static_cast<unsigned long long>(g_box64_hle_trampoline_used));
-    return 0;
+    return status;
 }
 
 std::string BuildHleTrampolineStatusJson() {
@@ -13204,6 +19401,12 @@ std::string BuildHleTrampolineStatusJson() {
         << Hex64(reinterpret_cast<std::uint64_t>(g_box64_hle_trampoline_slab)) << R"(",)"
         << R"("slabCapacity":)" << ExecutorBox64HleTrampolineSlabSize << ","
         << R"("usedBytes":)" << g_box64_hle_trampoline_used << ","
+        << R"("slotBytes":)" << ExecutorBox64HleTrampolineSize << ","
+        << R"("maxEmittedBytes":)" << g_box64_hle_max_emitted_bytes << ","
+        << R"("emissionCanaryFailures":)"
+        << g_box64_hle_emission_canary_failures << ","
+        << R"("protocolFingerprint":")"
+        << Hex64(Lsx4::FexHleLease::ProtocolFingerprint) << R"(",)"
         << R"("samples":[)";
     for (std::size_t i = 0; i < g_box64_hle_trampoline_samples.size(); ++i) {
         if (i != 0) {
@@ -13800,6 +20003,9 @@ bool ModuleContainsWritableRange(const Core::Module& module, const std::uint64_t
 
 bool ModuleContainsExecutableRange(const Core::Module& module, const std::uint64_t address,
                                    const std::size_t size) {
+    if (size == 0) {
+        return false;
+    }
     const auto info = module.GetModuleInfo();
     for (std::uint32_t i = 0; i < info.num_segments; ++i) {
         const auto& segment = info.segments[i];
@@ -13807,10 +20013,44 @@ bool ModuleContainsExecutableRange(const Core::Module& module, const std::uint64
             continue;
         }
         if (address >= segment.address && size <= segment.size &&
-            address + size <= segment.address + segment.size) {
+            address - segment.address <= segment.size - size) {
             return true;
         }
     }
+    return false;
+}
+
+bool IsGuestExecutableAddress(const std::uint64_t address,
+                              Core::Module** const module_out) {
+    if (module_out != nullptr) {
+        *module_out = nullptr;
+    }
+    if (address == 0) {
+        return false;
+    }
+
+    if (Core::Module* const module = FindGuestModuleByAddress(address);
+        module != nullptr && ModuleContainsExecutableRange(*module, address, 1)) {
+        if (module_out != nullptr) {
+            *module_out = module;
+        }
+        return true;
+    }
+
+#ifdef __ANDROID__
+
+
+
+    if ((RuntimeGuestJitActive() || RuntimeGuestFexActive()) &&
+        ExecutorImtDynamicSlabContainsExecutableAddress(address)) {
+        return true;
+    }
+    if ((RuntimeGuestJitActive() || RuntimeGuestFexActive()) &&
+        executor_lsx4_android_is_live_dynamic_guest_executable_address != nullptr &&
+        executor_lsx4_android_is_live_dynamic_guest_executable_address(address) == 1) {
+        return true;
+    }
+#endif
     return false;
 }
 
@@ -14001,6 +20241,7 @@ std::uint64_t AllocateUnityFrameProbeTrampoline(const std::size_t size) {
     if (size == 0 || size > ExecutorBox64HleTrampolineSize) {
         return 0;
     }
+    std::unique_lock slab_lock(g_box64_hle_slab_mutex);
     if (!g_box64_hle_trampoline_slab) {
         g_box64_hle_trampoline_slab =
             mmap(nullptr, ExecutorBox64HleTrampolineSlabSize,
@@ -14011,7 +20252,6 @@ std::uint64_t AllocateUnityFrameProbeTrampoline(const std::size_t size) {
         }
         g_box64_hle_trampoline_used = 0;
     }
-    RegisterBox64HleTrampolineSlabWithFex();
     const std::size_t aligned = (size + 15u) & ~static_cast<std::size_t>(15u);
     if (g_box64_hle_trampoline_used + aligned > ExecutorBox64HleTrampolineSlabSize) {
         return 0;
@@ -14020,7 +20260,10 @@ std::uint64_t AllocateUnityFrameProbeTrampoline(const std::size_t size) {
                  g_box64_hle_trampoline_used;
     std::memset(code, 0xcc, aligned);
     g_box64_hle_trampoline_used += aligned;
-    return reinterpret_cast<std::uint64_t>(code);
+    const auto address = reinterpret_cast<std::uint64_t>(code);
+    slab_lock.unlock();
+    RegisterBox64HleTrampolineSlabWithFex();
+    return address;
 }
 
 void EmitAbsRipJmp(std::uint8_t* out, const std::uint64_t target) {
@@ -17356,6 +23599,17 @@ int LoadAndroidAppMediaModulesForLive(Core::Linker& linker, const std::filesyste
     }
     std::sort(candidates.begin(), candidates.end());
 
+
+
+
+    const auto mono_candidate = std::find_if(
+        candidates.begin(), candidates.end(),
+        [](const auto& path) { return IsMonoPs4ModulePath(path); });
+    if (mono_candidate != candidates.end()) {
+        const std::string mono_path = mono_candidate->string();
+        RequireFexHleSignalSafepoints("media-module-scan", mono_path.c_str());
+    }
+
     int loaded = 0;
     int failed = 0;
     for (const auto& path : candidates) {
@@ -17406,17 +23660,340 @@ bool BuildMappedEntryRequestFromModule(Core::Module& module,
                                        std::uint64_t override_stack_size = 0,
                                        std::uint64_t override_tcb_base = 0);
 
+constexpr std::uint32_t FexRangeMutationMaxAttempts = 4;
+
+int SnapshotFexExecutableRanges(
+    const Lsx4FexBackendApiV3& api,
+    std::vector<Lsx4FexExecutableRangeV5>& ranges,
+    std::uint64_t& generation) {
+    for (std::uint32_t attempt = 0;
+         attempt < FexRangeMutationMaxAttempts; ++attempt) {
+        Lsx4FexExecutableRangeSnapshotV5 query{};
+        query.struct_size = sizeof(query);
+        query.abi_version = LSX4_FEX_EXECUTABLE_RANGE_ABI_V5;
+        int status = api.snapshot_executable_ranges_v5(
+            api.backend_context, &query);
+        if (status != LSX4_FEX_STATUS_OK) {
+            return status;
+        }
+        ranges.resize(query.range_count);
+        Lsx4FexExecutableRangeSnapshotV5 copy = query;
+        copy.ranges = ranges.empty() ? nullptr : ranges.data();
+        copy.capacity = static_cast<std::uint32_t>(ranges.size());
+        status = api.snapshot_executable_ranges_v5(api.backend_context, &copy);
+        if (status == LSX4_FEX_STATUS_BUFFER_TOO_SMALL ||
+            (status == LSX4_FEX_STATUS_OK &&
+             copy.generation != query.generation)) {
+            continue;
+        }
+        if (status != LSX4_FEX_STATUS_OK) {
+            return status;
+        }
+        ranges.resize(copy.range_count);
+        generation = copy.generation;
+        return LSX4_FEX_STATUS_OK;
+    }
+    return LSX4_FEX_STATUS_INVALID_STATE;
+}
+
+extern "C" __attribute__((visibility("default"), used)) int
+executor_lsx4_android_fex_publish_dynamic_executable_range(
+    const std::uint64_t address, const std::uint64_t size,
+    const std::uint64_t range_cookie, const std::uint32_t protection,
+    const std::uint32_t range_flags) {
+    if (!RuntimeGuestFexActive()) {
+        return LSX4_FEX_STATUS_OK;
+    }
+    constexpr std::uint32_t KnownDynamicRangeFlags =
+        LSX4_FEX_RANGE_EXECUTABLE | LSX4_FEX_RANGE_WRITABLE |
+        LSX4_FEX_RANGE_SELF_MODIFYING;
+    std::uint32_t expected_range_flags = LSX4_FEX_RANGE_EXECUTABLE;
+    if ((protection & PROT_WRITE) != 0) {
+        expected_range_flags |= LSX4_FEX_RANGE_WRITABLE |
+                                LSX4_FEX_RANGE_SELF_MODIFYING;
+    }
+    if (size == 0 || size > UINT64_MAX - address || range_cookie == 0 ||
+        (protection & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0 ||
+        (protection & PROT_EXEC) == 0 ||
+        (range_flags & ~KnownDynamicRangeFlags) != 0 ||
+        range_flags != expected_range_flags) {
+        return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+    }
+    const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+    if (api == nullptr || api->snapshot_executable_ranges_v5 == nullptr ||
+        api->bulk_register_executable_ranges_v5 == nullptr) {
+        return LSX4_FEX_STATUS_INVALID_STATE;
+    }
+    const Lsx4FexExecutableRangeV5 range{
+        .address = address,
+        .size = size,
+        .range_cookie = range_cookie,
+        .protection = protection,
+        .range_flags = range_flags,
+    };
+    std::scoped_lock mutation_lock(g_fex_executable_range_mutation_mutex);
+    int status = LSX4_FEX_STATUS_INVALID_STATE;
+    std::uint64_t generation = 0;
+    std::uint32_t attempts_used = 0;
+    for (std::uint32_t attempt = 0;
+         attempt < FexRangeMutationMaxAttempts; ++attempt) {
+        attempts_used = attempt + 1;
+        Lsx4FexExecutableRangeSnapshotV5 current{};
+        current.struct_size = sizeof(current);
+        current.abi_version = LSX4_FEX_EXECUTABLE_RANGE_ABI_V5;
+        status = api->snapshot_executable_ranges_v5(api->backend_context,
+                                                    &current);
+        if (status != LSX4_FEX_STATUS_OK) {
+            break;
+        }
+        generation = current.generation;
+        status = api->bulk_register_executable_ranges_v5(
+            api->backend_context, &range, 1, current.generation, &generation);
+        if (status != LSX4_FEX_STATUS_INVALID_STATE) {
+            break;
+        }
+    }
+    NativeLog(status == LSX4_FEX_STATUS_OK ? ANDROID_LOG_INFO
+                                           : ANDROID_LOG_ERROR,
+              "[EXECUTOR_FEX_DYNAMIC_EXEC_BRIDGE] op=publish result=%d "
+              "addr=0x%llx size=0x%llx cookie=0x%llx generation=%llu "
+              "attempts=%u",
+              status, static_cast<unsigned long long>(address),
+              static_cast<unsigned long long>(size),
+              static_cast<unsigned long long>(range_cookie),
+              static_cast<unsigned long long>(generation), attempts_used);
+    if (status == LSX4_FEX_STATUS_OK) {
+        const auto existing = std::ranges::find_if(
+            g_fex_dynamic_executable_ranges,
+            [&](const Lsx4FexExecutableRangeV5& candidate) {
+                return candidate.range_cookie == range_cookie;
+            });
+        if (existing == g_fex_dynamic_executable_ranges.end()) {
+            g_fex_dynamic_executable_ranges.push_back(range);
+        } else {
+            *existing = range;
+        }
+    }
+    return status;
+}
+
+extern "C" __attribute__((visibility("default"), used)) int
+executor_lsx4_android_fex_invalidate_dynamic_executable_range(
+    const std::uint64_t address, const std::uint64_t size,
+    const std::uint64_t range_cookie,
+    const std::uint32_t invalidate_flags) {
+    if (!RuntimeGuestFexActive()) {
+        return LSX4_FEX_STATUS_OK;
+    }
+    constexpr std::uint32_t KnownInvalidateFlags =
+        LSX4_FEX_RANGE_INVALIDATE_TRANSLATIONS |
+        LSX4_FEX_RANGE_REMOVE_REGISTRATIONS;
+    if (size == 0 || size > UINT64_MAX - address || range_cookie == 0 ||
+        (invalidate_flags & LSX4_FEX_RANGE_INVALIDATE_TRANSLATIONS) == 0 ||
+        (invalidate_flags & ~KnownInvalidateFlags) != 0) {
+        return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+    }
+    const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+    if (api == nullptr || api->snapshot_executable_ranges_v5 == nullptr ||
+        api->invalidate_executable_ranges_v5 == nullptr) {
+        return LSX4_FEX_STATUS_INVALID_STATE;
+    }
+
+    std::scoped_lock mutation_lock(g_fex_executable_range_mutation_mutex);
+    Lsx4FexExecutableRangeV5 invalidation{
+        .address = address,
+        .size = size,
+        .range_cookie = range_cookie,
+        .protection = PROT_EXEC,
+        .range_flags = LSX4_FEX_RANGE_EXECUTABLE,
+    };
+    if ((invalidate_flags & LSX4_FEX_RANGE_REMOVE_REGISTRATIONS) != 0) {
+        std::vector<Lsx4FexExecutableRangeV5> registered;
+        std::uint64_t snapshot_generation = 0;
+        const int snapshot_status = SnapshotFexExecutableRanges(
+            *api, registered, snapshot_generation);
+        if (snapshot_status != LSX4_FEX_STATUS_OK) {
+            return snapshot_status;
+        }
+        const auto exact_it = std::find_if(
+            registered.begin(), registered.end(), [&](const auto& range) {
+                return range.range_cookie == range_cookie &&
+                       range.address == address && range.size == size;
+            });
+        if (exact_it == registered.end()) {
+            const bool conflicting_cookie = std::any_of(
+                registered.begin(), registered.end(), [&](const auto& range) {
+                    return range.range_cookie == range_cookie;
+                });
+            if (conflicting_cookie) {
+                return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+            }
+            return LSX4_FEX_STATUS_NOT_FOUND;
+        }
+        invalidation = *exact_it;
+    }
+
+    int status = LSX4_FEX_STATUS_INVALID_STATE;
+    std::uint64_t generation = 0;
+    std::uint32_t attempts_used = 0;
+    for (std::uint32_t attempt = 0;
+         attempt < FexRangeMutationMaxAttempts; ++attempt) {
+        attempts_used = attempt + 1;
+        Lsx4FexExecutableRangeSnapshotV5 current{};
+        current.struct_size = sizeof(current);
+        current.abi_version = LSX4_FEX_EXECUTABLE_RANGE_ABI_V5;
+        status = api->snapshot_executable_ranges_v5(api->backend_context,
+                                                    &current);
+        if (status != LSX4_FEX_STATUS_OK) {
+            break;
+        }
+        generation = current.generation;
+        status = api->invalidate_executable_ranges_v5(
+            api->backend_context, &invalidation, 1, invalidate_flags,
+            current.generation, &generation);
+        if (status != LSX4_FEX_STATUS_INVALID_STATE) {
+            break;
+        }
+    }
+    NativeLog(status == LSX4_FEX_STATUS_OK ? ANDROID_LOG_INFO
+                                           : ANDROID_LOG_ERROR,
+              "[EXECUTOR_FEX_DYNAMIC_EXEC_BRIDGE] op=invalidate result=%d "
+              "addr=0x%llx size=0x%llx cookie=0x%llx flags=0x%x "
+              "generation=%llu attempts=%u",
+              status, static_cast<unsigned long long>(address),
+              static_cast<unsigned long long>(size),
+              static_cast<unsigned long long>(range_cookie), invalidate_flags,
+              static_cast<unsigned long long>(generation), attempts_used);
+    if (status == LSX4_FEX_STATUS_OK &&
+        (invalidate_flags & LSX4_FEX_RANGE_REMOVE_REGISTRATIONS) != 0) {
+        std::erase_if(g_fex_dynamic_executable_ranges,
+                      [&](const Lsx4FexExecutableRangeV5& candidate) {
+                          return candidate.range_cookie == range_cookie;
+                      });
+    }
+    return status;
+}
+
 int RegisterBox64ModuleSegments(void* module_ptr) {
     auto* module = static_cast<Core::Module*>(module_ptr);
     if (!module) {
         NativeLog(ANDROID_LOG_INFO, "[EXECUTOR_BOX64_REGISTER_MODULE] result=null_module");
         return -1;
     }
-    if (!g_box64_register_mapped_entry_segments) {
+
+    if (IsMonoPs4ModulePath(module->file)) {
+        const std::string module_path = module->file.string();
+        RequireFexHleSignalSafepoints("module-registration", module_path.c_str());
+    }
+
+    if (RuntimeGuestFexActive() && Executor::Fex::ActiveApi() == nullptr) {
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_BOX64_REGISTER_MODULE] result=no_box64_register path=%s",
+                  "[EXECUTOR_FEX_REGISTER_MODULE] result=deferred_until_sealed_activation "
+                  "path=%s",
                   module->file.string().c_str());
-        return -2;
+        return LSX4_FEX_STATUS_OK;
+    }
+
+
+
+
+
+    if (RuntimeGuestJitActive()) {
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_JIT_REGISTER_MODULE] result=not_required path=%s",
+                  module->file.string().c_str());
+        return 0;
+    }
+
+    if (RuntimeGuestFexActive()) {
+        const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+        if (api == nullptr || api->bulk_register_executable_ranges_v5 == nullptr ||
+            api->snapshot_executable_ranges_v5 == nullptr) {
+            return LSX4_FEX_STATUS_INVALID_STATE;
+        }
+        std::vector<Lsx4FexExecutableRangeV5> base_ranges;
+        const auto module_info = module->GetModuleInfo();
+        base_ranges.reserve(module_info.num_segments);
+        for (std::uint32_t index = 0; index < module_info.num_segments; ++index) {
+            const auto& segment = module_info.segments[index];
+            if (segment.address == 0 || segment.size == 0 ||
+                (segment.prot & PF_EXEC) == 0 ||
+                segment.size > UINT64_MAX - segment.address) {
+                continue;
+            }
+            std::uint32_t protection = 0;
+            if ((segment.prot & PF_READ) != 0) {
+                protection |= PROT_READ;
+            }
+            if ((segment.prot & PF_WRITE) != 0) {
+                protection |= PROT_WRITE;
+            }
+            if ((segment.prot & PF_EXEC) != 0) {
+                protection |= PROT_EXEC;
+            }
+            std::uint32_t flags = LSX4_FEX_RANGE_EXECUTABLE;
+            if ((protection & PROT_WRITE) != 0) {
+                flags |= LSX4_FEX_RANGE_WRITABLE |
+                         LSX4_FEX_RANGE_SELF_MODIFYING;
+            }
+            base_ranges.push_back({
+                .address = segment.address,
+                .size = segment.size,
+                .range_cookie = StableModuleExecutableRangeCookie(
+                    segment.address, segment.size),
+                .protection = protection,
+                .range_flags = flags,
+            });
+        }
+        if (base_ranges.empty()) {
+            NativeLog(ANDROID_LOG_ERROR,
+                      "[EXECUTOR_FEX_REGISTER_MODULE] result=no_executable_ranges path=%s",
+                      module->file.string().c_str());
+            return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+        }
+
+
+
+
+
+
+        std::scoped_lock publication_lock(g_fex_executable_range_mutation_mutex);
+        constexpr std::uint32_t MaxGenerationAttempts = 4;
+        int status = LSX4_FEX_STATUS_INVALID_STATE;
+        std::uint64_t generation = 0;
+        std::uint32_t attempts_used = 0;
+        for (std::uint32_t attempt = 0; attempt < MaxGenerationAttempts;
+             ++attempt) {
+            attempts_used = attempt + 1;
+            Lsx4FexExecutableRangeSnapshotV5 current{};
+            current.struct_size = sizeof(current);
+            current.abi_version = LSX4_FEX_EXECUTABLE_RANGE_ABI_V5;
+            status = api->snapshot_executable_ranges_v5(
+                api->backend_context, &current);
+            if (status != LSX4_FEX_STATUS_OK) {
+                break;
+            }
+            generation = current.generation;
+            status = api->bulk_register_executable_ranges_v5(
+                api->backend_context, base_ranges.data(),
+                static_cast<std::uint32_t>(base_ranges.size()),
+                current.generation, &generation);
+            if (status != LSX4_FEX_STATUS_INVALID_STATE) {
+                break;
+            }
+            NativeLog(ANDROID_LOG_WARN,
+                      "[EXECUTOR_FEX_REGISTER_MODULE] result=stale_generation_retry "
+                      "path=%s attempt=%u expected=%llu",
+                      module->file.string().c_str(), attempt + 1,
+                      static_cast<unsigned long long>(current.generation));
+        }
+        NativeLog(status == LSX4_FEX_STATUS_OK ? ANDROID_LOG_INFO
+                                               : ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_REGISTER_MODULE] result=%d path=%s ranges=%zu "
+                  "generation=%llu attempts=%u activation=existing",
+                  status, module->file.string().c_str(), base_ranges.size(),
+                  static_cast<unsigned long long>(generation), attempts_used);
+        return status;
     }
 
     ExecutorBox64MappedEntryRequest request{};
@@ -17426,6 +24003,13 @@ int RegisterBox64ModuleSegments(void* module_ptr) {
                   "[EXECUTOR_BOX64_REGISTER_MODULE] result=request_failed path=%s error=%s",
                   module->file.string().c_str(), error.c_str());
         return -3;
+    }
+
+    if (!g_box64_register_mapped_entry_segments) {
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_BOX64_REGISTER_MODULE] result=no_box64_register path=%s",
+                  module->file.string().c_str());
+        return -2;
     }
 
     const std::string module_path = module->file.string();
@@ -17517,7 +24101,7 @@ int RegisterBox64ModuleSegments(void* module_ptr) {
     return rc;
 }
 
-bool ProcessPendingLoadExecLocked(std::unique_lock<std::mutex>& lock,
+bool ProcessPendingLoadExecLocked(std::unique_lock<RuntimeStatusMutex>& lock,
                                   std::string previous_mapped_entry_info) {
     LoadExecRequestSnapshot request = SnapshotLoadExecRequest();
     if (!request.requested) {
@@ -17687,6 +24271,7 @@ bool ProcessPendingLoadExecLocked(std::unique_lock<std::mutex>& lock,
         {
             auto* primary_guest_thread = Libraries::Kernel::g_curthread;
             std::thread guest_entry_thread([&]() {
+                ScopedAndroidGuestPauseRegistration pause_registration;
                 if (primary_guest_thread != nullptr) {
                     Libraries::Kernel::g_curthread = primary_guest_thread;
                     Common::SetCurrentThreadName(primary_guest_thread->name.c_str());
@@ -18758,16 +25343,28 @@ std::string JitCacheTitleId(const std::filesystem::path& app0_path,
 void ConfigureJitPersistentCacheForLaunch(
     const bool jit_launch, const std::filesystem::path& app0_path,
     const std::filesystem::path& executable_path) {
+    const auto cache_marker =
+        std::filesystem::path(g_root) / "run-jit-persistent-jit-cache";
+    const bool pipeline_cache_enabled = std::filesystem::is_regular_file(cache_marker);
+    const auto cpu_profile = Executor::CpuTuning::Get();
+    const bool cache_enabled =
+        cpu_profile.persistent_cache != Executor::CpuTuning::PersistentCacheMode::Off;
+
+
+
+    Config::setPipelineCacheEnabled(pipeline_cache_enabled);
+    Config::setPipelineCacheArchived(false);
     if (!jit_launch) {
         Lsx4::Translation::ConfigureArtifactStore({}, {}, 0, false);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_JIT_PERSISTENT_CACHE_CONFIG] enabled=0 marker=%s "
+                  "title=foreign-backend executableHash=0x0 fingerprintMs=0 "
+                  "fingerprintMemo=skip pipelineCache=%d executable=%s",
+                  cache_marker.string().c_str(), pipeline_cache_enabled ? 1 : 0,
+                  executable_path.string().c_str());
         return;
     }
 
-    const auto cache_marker =
-        std::filesystem::path(g_root) / "run-jit-persistent-jit-cache";
-    const bool cache_enabled = std::filesystem::is_regular_file(cache_marker);
-    Config::setPipelineCacheEnabled(cache_enabled);
-    Config::setPipelineCacheArchived(false);
     const auto fingerprint_begin = std::chrono::steady_clock::now();
     const std::string preliminary_title =
         JitCacheTitleId(app0_path, executable_path, 0);
@@ -18781,8 +25378,32 @@ void ConfigureJitPersistentCacheForLaunch(
         : 0;
     const std::string cache_title =
         JitCacheTitleId(app0_path, executable_path, executable_fingerprint);
+    const std::string effective_cache_title =
+        cache_title + "-cpu" +
+        Hex64(Executor::CpuTuning::TranslationCacheIdentity(cpu_profile));
+    if (cache_enabled &&
+        cpu_profile.persistent_cache ==
+            Executor::CpuTuning::PersistentCacheMode::Rebuild) {
+        const auto cache_root = std::filesystem::path(g_root) / "cache" / "jit";
+        const auto rebuild_target = cache_root / effective_cache_title;
+        std::error_code remove_error;
+
+
+        if (rebuild_target.parent_path().lexically_normal() ==
+            cache_root.lexically_normal()) {
+            std::filesystem::remove_all(rebuild_target, remove_error);
+        } else {
+            remove_error = std::make_error_code(std::errc::invalid_argument);
+        }
+        NativeLog(remove_error ? ANDROID_LOG_ERROR : ANDROID_LOG_INFO,
+                  "[EXECUTOR_JIT_PERSISTENT_CACHE_REBUILD] title=%s path=%s "
+                  "status=%s error=%s",
+                  effective_cache_title.c_str(), rebuild_target.string().c_str(),
+                  remove_error ? "failed" : "removed",
+                  remove_error ? remove_error.message().c_str() : "none");
+    }
     Lsx4::Translation::ConfigureArtifactStore(
-        g_root, cache_title, executable_fingerprint,
+        g_root, effective_cache_title, executable_fingerprint,
         cache_enabled && executable_fingerprint != 0);
     const auto fingerprint_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now() - fingerprint_begin)
@@ -18792,10 +25413,11 @@ void ConfigureJitPersistentCacheForLaunch(
               "title=%s executableHash=0x%llx fingerprintMs=%lld fingerprintMemo=%s "
               "pipelineCache=%d executable=%s",
               cache_enabled && executable_fingerprint != 0 ? 1 : 0,
-              cache_marker.string().c_str(), cache_title.c_str(),
+              cache_marker.string().c_str(), effective_cache_title.c_str(),
               static_cast<unsigned long long>(executable_fingerprint),
               static_cast<long long>(fingerprint_ms),
-              fingerprint_memo_hit ? "hit" : "miss", cache_enabled ? 1 : 0,
+              fingerprint_memo_hit ? "hit" : "miss",
+              pipeline_cache_enabled ? 1 : 0,
               executable_path.string().c_str());
 }
 
@@ -18956,8 +25578,9 @@ void* EnsureBox64InitialStack() {
         return nullptr;
     }
     g_box64_initial_stack = stack;
-    RegisterBox64GuestStackRange(g_box64_initial_stack, ExecutorBox64InitialStackSize,
-                                 "box64_initial_stack");
+    RegisterBox64ExternalGuestStackRange(
+        g_box64_initial_stack, ExecutorBox64InitialStackSize,
+        "box64_initial_stack");
     return g_box64_initial_stack;
 }
 
@@ -18989,8 +25612,9 @@ void* AllocateBox64LifecycleStack(const char* label, std::uint64_t& stack_base,
     }
 
     stack_base = reinterpret_cast<std::uint64_t>(stack);
-    RegisterBox64GuestStackRange(stack, stack_size,
-                                 label && *label ? label : "module_lifecycle_stack");
+    RegisterBox64ExternalGuestStackRange(
+        stack, stack_size,
+        label && *label ? label : "module_lifecycle_stack");
     NativeLog(ANDROID_LOG_INFO,
               "[EXECUTOR_MODULE_START_STACK] label=%s base=%p size=0x%llx",
               label && *label ? label : "module_lifecycle_stack", stack,
@@ -19036,20 +25660,28 @@ void PrepareEntryParamsForModule(Core::Module& module) {
     auto& params = Libraries::Kernel::entry_params;
     params = {};
     g_entry_arg_storage = {};
-    g_entry_arg_storage[0] = "eboot.bin";
+    const auto store_argument = [](const std::size_t index,
+                                   const std::string_view value) {
+        ASSERT(index < g_entry_arg_storage.size());
+        ASSERT(value.size() < ExecutorEntryArgumentCapacity);
+        auto& storage = g_entry_arg_storage[index];
+        std::memcpy(storage.data(), value.data(), value.size());
+        storage[value.size()] = '\0';
+    };
+    store_argument(0, "eboot.bin");
     params.argc = 1;
-    params.argv[0] = g_entry_arg_storage[0].c_str();
+    params.argv[0] = g_entry_arg_storage[0].data();
 
     std::int32_t ignored_mode = 0;
     std::string force_gfx_source;
     if (ReadUnityGfxThreadingModeSentinel(ignored_mode, force_gfx_source) && params.argc < 32) {
-        g_entry_arg_storage[params.argc] = "-force-gfx-direct";
-        params.argv[params.argc] = g_entry_arg_storage[params.argc].c_str();
+        store_argument(params.argc, "-force-gfx-direct");
+        params.argv[params.argc] = g_entry_arg_storage[params.argc].data();
         ++params.argc;
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_UNITY_GFX_ARGV] source=%s argc=%d argv=%s",
                   force_gfx_source.c_str(), params.argc,
-                  g_entry_arg_storage[params.argc - 1].c_str());
+                  g_entry_arg_storage[params.argc - 1].data());
     }
 
     if (IsPs4StoreModule(module)) {
@@ -19057,8 +25689,8 @@ void PrepareEntryParamsForModule(Core::Module& module) {
         g_store_launch_query_handoff_count = 0;
         const auto title_id = ConfiguredStoreLaunchQueryTitleId();
         if (!title_id.empty() && params.argc < 32) {
-            g_entry_arg_storage[params.argc] = title_id;
-            params.argv[params.argc] = g_entry_arg_storage[params.argc].c_str();
+            store_argument(params.argc, title_id);
+            params.argv[params.argc] = g_entry_arg_storage[params.argc].data();
             ++params.argc;
 
             const auto marker = InstalledTitleMarkerPath(title_id);
@@ -19067,6 +25699,25 @@ void PrepareEntryParamsForModule(Core::Module& module) {
             NativeLog(ANDROID_LOG_INFO,
                       "[EXECUTOR_STORE_LAUNCH_QUERY] title=%s argc=%d installed=%d marker=%s",
                       title_id.c_str(), params.argc, installed ? 1 : 0, marker.string().c_str());
+        }
+    }
+
+
+
+
+
+    RegisterBox64GuestReadableRange(&params, sizeof(params),
+                                    "mapped_entry_params");
+    for (int index = 0; index < params.argc; ++index) {
+        const char* const argument = params.argv[index];
+        if (argument != nullptr) {
+
+
+
+
+            RegisterBox64GuestReadableRange(
+                g_entry_arg_storage[index].data(),
+                g_entry_arg_storage[index].size(), "mapped_entry_argv");
         }
     }
     params.entry_addr = module.GetEntryAddress();
@@ -19322,6 +25973,16 @@ bool BuildMappedEntryRequestFromModule(Core::Module& module, ExecutorBox64Mapped
 #endif
     const std::uint64_t imt_dyn_slab_base = reinterpret_cast<std::uint64_t>(g_imt_dyn_slab);
     const std::uint64_t imt_dyn_slab_size = g_imt_dyn_slab ? kImtDynSlabSize : 0;
+    if (x64_stub_slab_base != 0 && x64_stub_slab_size != 0) {
+        RegisterBox64GuestReadableRange(
+            reinterpret_cast<const void*>(x64_stub_slab_base),
+            static_cast<std::size_t>(x64_stub_slab_size), "x64_stub_slab");
+    }
+    if (imt_dyn_slab_base != 0 && imt_dyn_slab_size != 0) {
+        RegisterBox64GuestReadableRange(
+            reinterpret_cast<const void*>(imt_dyn_slab_base),
+            static_cast<std::size_t>(imt_dyn_slab_size), "imt_dynamic_slab");
+    }
     const std::uint32_t extra_segments =
         (x64_stub_slab_base && x64_stub_slab_size ? 1u : 0u) +
         (imt_dyn_slab_base && imt_dyn_slab_size ? 1u : 0u);
@@ -19344,6 +26005,10 @@ bool BuildMappedEntryRequestFromModule(Core::Module& module, ExecutorBox64Mapped
         error = "cannot allocate Box64 guest exit stub";
         return false;
     }
+    const long raw_page_size = sysconf(_SC_PAGESIZE);
+    const std::size_t page_size =
+        raw_page_size > 0 ? static_cast<std::size_t>(raw_page_size) : 4096;
+    RegisterBox64GuestReadableRange(exit_stub, page_size, "guest_exit_stub");
 
     const std::uint64_t mapped_stack_size =
         override_stack_size ? override_stack_size : ExecutorBox64InitialStackSize;
@@ -19379,6 +26044,12 @@ bool BuildMappedEntryRequestFromModule(Core::Module& module, ExecutorBox64Mapped
         reinterpret_cast<std::uint64_t>(g_box64_hle_trampoline_slab);
     request.hle_trampoline_size =
         g_box64_hle_trampoline_slab ? ExecutorBox64HleTrampolineSlabSize : 0;
+    if (request.hle_trampoline_base != 0 && request.hle_trampoline_size != 0) {
+        RegisterBox64GuestReadableRange(
+            reinterpret_cast<const void*>(request.hle_trampoline_base),
+            static_cast<std::size_t>(request.hle_trampoline_size),
+            "box64_hle_trampoline_slab");
+    }
     request.timeout_ms = ExecutorBox64MappedEntryTimeoutMs;
     request.flags = ExecutorBox64MappedEntryFlagInProcess;
     request.segment_count = mapped_segment_count + extra_segments;
@@ -19406,7 +26077,7 @@ bool BuildMappedEntryRequestFromModule(Core::Module& module, ExecutorBox64Mapped
         auto& segment = request.segments[extra_index++];
         segment.address = imt_dyn_slab_base;
         segment.size = imt_dyn_slab_size;
-        segment.prot = PF_READ_EXEC;
+        segment.prot = PF_READ_WRITE_EXEC;
         if (trace_segments) {
             NativeLog(ANDROID_LOG_INFO,
                       "[EXECUTOR_MAPPED_ENTRY_SEGMENT] keepExtra kind=imt_dyn mapped=%u addr=%p size=0x%llx prot=%s",
@@ -19438,7 +26109,9 @@ bool EnsureBox64GuestThreadStack(Libraries::Kernel::Pthread* guest_thread, const
         const std::uint64_t end = base + size;
         if (end > 0x200000000ULL && base < 0x300000000ULL) return "sgen_mspace";
         const std::uint64_t slab = reinterpret_cast<std::uint64_t>(g_box64_hle_trampoline_slab);
-        const std::uint64_t slab_sz = g_box64_hle_trampoline_used ? g_box64_hle_trampoline_used : 0x400000ULL;
+        const std::uint64_t slab_sz = g_box64_hle_trampoline_used
+                                          ? g_box64_hle_trampoline_used
+                                          : ExecutorBox64HleTrampolineSlabSize;
         if (slab != 0 && end > slab && base < slab + slab_sz) return "hle_slab";
         return nullptr;
     };
@@ -19493,8 +26166,9 @@ bool EnsureBox64GuestThreadStack(Libraries::Kernel::Pthread* guest_thread, const
         return false;
     }
 
-    RegisterBox64GuestStackRange(stack, MinGuestThreadStack,
-                                 name ? name : "guest_thread_stack");
+    RegisterBox64ExternalGuestStackRange(
+        stack, MinGuestThreadStack,
+        name ? name : "guest_thread_stack");
 
     static std::atomic<std::uint32_t> replacement_stack_trace_count{0};
     if (replacement_stack_trace_count.fetch_add(1, std::memory_order_relaxed) < 4) {
@@ -19511,15 +26185,149 @@ bool EnsureBox64GuestThreadStack(Libraries::Kernel::Pthread* guest_thread, const
     return true;
 }
 
+const char* FexBootstrapLifecyclePhaseName(
+    const FexBootstrapLifecyclePhase phase) noexcept {
+    switch (phase) {
+    case FexBootstrapLifecyclePhase::Collecting:
+        return "collecting";
+    case FexBootstrapLifecyclePhase::Deferred:
+        return "deferred";
+    case FexBootstrapLifecyclePhase::Draining:
+        return "draining";
+    case FexBootstrapLifecyclePhase::Complete:
+        return "complete";
+    case FexBootstrapLifecyclePhase::Failed:
+        return "failed";
+    default:
+        return "inactive";
+    }
+}
+
+bool BeginFexBootstrapLifecycleCollection(std::string& error) {
+    if (!RuntimeGuestFexActive() ||
+        g_fault_signal_owner.load(std::memory_order_acquire) ==
+            FaultSignalOwner::Fex) {
+        return true;
+    }
+
+    bool started = false;
+    FexBootstrapLifecyclePhase phase{};
+    {
+        std::lock_guard collection_lock(g_fex_bootstrap_lifecycle_mutex);
+        phase = g_fex_bootstrap_lifecycle_phase.load(std::memory_order_relaxed);
+        if (phase == FexBootstrapLifecyclePhase::Inactive) {
+            g_fex_bootstrap_lifecycles.clear();
+            g_fex_bootstrap_lifecycle_phase.store(
+                FexBootstrapLifecyclePhase::Collecting,
+                std::memory_order_release);
+            phase = FexBootstrapLifecyclePhase::Collecting;
+            started = true;
+        }
+    }
+
+    if (phase == FexBootstrapLifecyclePhase::Failed ||
+        phase == FexBootstrapLifecyclePhase::Draining) {
+        error = std::string("FEX bootstrap lifecycle transaction is ") +
+                FexBootstrapLifecyclePhaseName(phase);
+        return false;
+    }
+    if (phase != FexBootstrapLifecyclePhase::Collecting &&
+        phase != FexBootstrapLifecyclePhase::Deferred &&
+        phase != FexBootstrapLifecyclePhase::Complete) {
+        error = std::string("unexpected FEX bootstrap lifecycle phase: ") +
+                FexBootstrapLifecyclePhaseName(phase);
+        return false;
+    }
+
+    if (started) {
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_FEX_BOOTSTRAP_LIFECYCLE] phase=collecting "
+                  "guestExecution=blocked_until_signal_owner_commit");
+    }
+    return true;
+}
+
+void PauseFexBootstrapLifecycleCollection(const char* const reason) {
+    if (!RuntimeGuestFexActive()) {
+        return;
+    }
+    std::size_t count = 0;
+    {
+        std::lock_guard collection_lock(g_fex_bootstrap_lifecycle_mutex);
+        const auto phase =
+            g_fex_bootstrap_lifecycle_phase.load(std::memory_order_relaxed);
+        if (phase != FexBootstrapLifecyclePhase::Collecting) {
+            return;
+        }
+        for (const auto& deferred : g_fex_bootstrap_lifecycles) {
+            if (deferred.module != nullptr) {
+                deferred.module->lifecycle_state.store(
+                    Core::Module::LifecycleState::Loaded,
+                    std::memory_order_release);
+            }
+        }
+        count = g_fex_bootstrap_lifecycles.size();
+    }
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_BOOTSTRAP_LIFECYCLE] phase=collecting "
+              "action=pause queued=%zu reason=%s",
+              count, reason != nullptr ? reason : "bootstrap-failure");
+}
+
+bool FinalizeFexBootstrapLifecycleCollection(std::string& error) {
+    if (!RuntimeGuestFexActive() ||
+        g_fault_signal_owner.load(std::memory_order_acquire) ==
+            FaultSignalOwner::Fex) {
+        return true;
+    }
+
+    std::size_t count = 0;
+    FexBootstrapLifecyclePhase phase{};
+    {
+        std::lock_guard collection_lock(g_fex_bootstrap_lifecycle_mutex);
+        phase = g_fex_bootstrap_lifecycle_phase.load(std::memory_order_relaxed);
+        if (phase == FexBootstrapLifecyclePhase::Collecting) {
+            for (const auto& deferred : g_fex_bootstrap_lifecycles) {
+                if (deferred.module != nullptr) {
+                    deferred.module->lifecycle_state.store(
+                        Core::Module::LifecycleState::Loaded,
+                        std::memory_order_release);
+                }
+            }
+            count = g_fex_bootstrap_lifecycles.size();
+            g_fex_bootstrap_lifecycle_phase.store(
+                FexBootstrapLifecyclePhase::Deferred,
+                std::memory_order_release);
+            phase = FexBootstrapLifecyclePhase::Deferred;
+        }
+    }
+
+    if (phase == FexBootstrapLifecyclePhase::Deferred ||
+        phase == FexBootstrapLifecyclePhase::Complete) {
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_FEX_BOOTSTRAP_LIFECYCLE] phase=%s queued=%zu "
+                  "mapRelocate=reused",
+                  FexBootstrapLifecyclePhaseName(phase), count);
+        return true;
+    }
+
+    error = std::string("cannot finalize FEX bootstrap lifecycle transaction in phase ") +
+            FexBootstrapLifecyclePhaseName(phase);
+    return false;
+}
+
+bool DrainDeferredFexBootstrapLifecycles(std::string& error);
+
 bool EnsureMappedEntryModulePreload(std::string& error) {
     if (Core::Memory::Instance()->GetTotalDirectSize() == 0) {
         error = "mapped-entry memory regions were not configured before module preload";
         return false;
     }
 
-    static std::atomic_bool done{false};
-    bool expected = false;
-    if (!done.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    static std::mutex preload_mutex;
+    static bool preload_done = false;
+    const std::lock_guard preload_lock(preload_mutex);
+    if (preload_done) {
         return true;
     }
 
@@ -19538,7 +26346,6 @@ bool EnsureMappedEntryModulePreload(std::string& error) {
                   "startResult=%d path=%s",
                   libc_handle, libc_start_result, libc_path.string().c_str());
         if (libc_handle < 0) {
-            done.store(false, std::memory_order_release);
             error = "selected guest libc allocator could not be loaded and started";
             return false;
         }
@@ -19549,86 +26356,194 @@ bool EnsureMappedEntryModulePreload(std::string& error) {
               "[EXECUTOR_MAPPED_ENTRY_BOOTSTRAP] preload_libkernel_modules_result=%d",
               preload_result);
     if (preload_result != 0) {
-        done.store(false, std::memory_order_release);
         error = "sceSysmodulePreloadModuleForLibkernel failed";
         return false;
     }
+    preload_done = true;
     return true;
 }
 
-bool EnsureMappedEntryProcessBootstrap(std::string& error) {
-    if (!EnsureMappedEntryModulePreload(error)) {
-        return false;
-    }
+enum class GnmDriverPhysicalPlacement : std::uint8_t {
+    FirstFit,
+    HighTail,
+};
 
-    static std::atomic_bool gnm_done{false};
-    bool expected = false;
-    if (!gnm_done.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+bool EnsureMappedEntryGnmDriverBootstrap(
+    std::string& error, const GnmDriverPhysicalPlacement placement) {
+    static std::mutex gnm_mutex;
+    static bool gnm_done = false;
+    const std::lock_guard gnm_lock(gnm_mutex);
+    if (gnm_done) {
         return true;
     }
 
+    constexpr u64 GnmDriverDmemSize = 0x10000;
+    constexpr u64 GnmDriverDmemAlignment = 0x10000;
+    const u64 total_direct_size =
+        Libraries::Kernel::sceKernelGetDirectMemorySize();
+    if (total_direct_size < GnmDriverDmemSize) {
+        error = "direct-memory arena is too small for SceGnmDriver";
+        return false;
+    }
+    const u64 search_start =
+        placement == GnmDriverPhysicalPlacement::HighTail
+            ? Common::AlignDown(total_direct_size - GnmDriverDmemSize,
+                                GnmDriverDmemAlignment)
+            : 0;
+    const u64 search_end =
+        placement == GnmDriverPhysicalPlacement::HighTail
+            ? search_start + GnmDriverDmemSize
+            : total_direct_size;
+
     s64 phys_addr = 0;
     const s32 alloc_result = Libraries::Kernel::sceKernelAllocateDirectMemory(
-        0, Libraries::Kernel::sceKernelGetDirectMemorySize(), 0x10000, 0x10000, 3, &phys_addr);
+        static_cast<s64>(search_start), static_cast<s64>(search_end),
+        GnmDriverDmemSize, GnmDriverDmemAlignment, 3, &phys_addr);
     NativeLog(ANDROID_LOG_INFO,
-              "[EXECUTOR_MAPPED_ENTRY_BOOTSTRAP] gnm_driver_alloc result=%d phys=0x%llx",
-              alloc_result, static_cast<unsigned long long>(phys_addr));
+              "[EXECUTOR_MAPPED_ENTRY_BOOTSTRAP] gnm_driver_alloc result=%d "
+              "placement=%s searchStart=0x%llx searchEnd=0x%llx phys=0x%llx",
+              alloc_result,
+              placement == GnmDriverPhysicalPlacement::HighTail ? "high-tail"
+                                                                 : "first-fit",
+              static_cast<unsigned long long>(search_start),
+              static_cast<unsigned long long>(search_end),
+              static_cast<unsigned long long>(phys_addr));
     if (alloc_result != 0) {
-        gnm_done.store(false, std::memory_order_release);
         error = "SceGnmDriver direct-memory allocation failed";
         return false;
     }
+    const auto release_failed_gnm_allocation = [&]() {
+        const s32 release_result =
+            Libraries::Kernel::sceKernelCheckedReleaseDirectMemory(
+                static_cast<u64>(phys_addr), GnmDriverDmemSize);
+        NativeLog(release_result == 0 ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR,
+                  "[EXECUTOR_MAPPED_ENTRY_BOOTSTRAP] "
+                  "gnm_driver_alloc_cleanup result=%d phys=0x%llx",
+                  release_result,
+                  static_cast<unsigned long long>(phys_addr));
+    };
+    if (placement == GnmDriverPhysicalPlacement::HighTail &&
+        static_cast<u64>(phys_addr) != search_start) {
+        release_failed_gnm_allocation();
+        error = "SceGnmDriver allocation escaped the requested high-tail slot";
+        return false;
+    }
 
-    void* addr = reinterpret_cast<void*>(0xfe0000000ULL);
+    constexpr std::uintptr_t GnmDriverVirtualAddress = 0xfe0000000ULL;
+    void* addr = reinterpret_cast<void*>(GnmDriverVirtualAddress);
     const s32 map_result = Libraries::Kernel::sceKernelMapNamedDirectMemory(
-        &addr, 0x10000, 0x13, 0, phys_addr, 0x10000, "SceGnmDriver");
+        &addr, GnmDriverDmemSize, 0x13, 0, phys_addr,
+        GnmDriverDmemAlignment, "SceGnmDriver");
     NativeLog(ANDROID_LOG_INFO,
               "[EXECUTOR_MAPPED_ENTRY_BOOTSTRAP] gnm_driver_map result=%d addr=%p",
               map_result, addr);
     if (map_result != 0) {
-        gnm_done.store(false, std::memory_order_release);
+        release_failed_gnm_allocation();
         error = "SceGnmDriver direct-memory map failed";
         return false;
     }
+    if (reinterpret_cast<std::uintptr_t>(addr) != GnmDriverVirtualAddress) {
+        const s32 unmap_result =
+            Libraries::Kernel::sceKernelMunmap(addr, GnmDriverDmemSize);
+        NativeLog(unmap_result == 0 ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR,
+                  "[EXECUTOR_MAPPED_ENTRY_BOOTSTRAP] "
+                  "gnm_driver_unexpected_va_cleanup result=%d addr=%p",
+                  unmap_result, addr);
+        if (unmap_result == 0) {
+            release_failed_gnm_allocation();
+        }
+        error = "SceGnmDriver mapping escaped the requested virtual address";
+        return false;
+    }
+    gnm_done = true;
     return true;
+}
+
+bool EnsureMappedEntryProcessBootstrap(std::string& error) {
+    if (!BeginFexBootstrapLifecycleCollection(error)) {
+        return false;
+    }
+    if (!EnsureMappedEntryModulePreload(error)) {
+        PauseFexBootstrapLifecycleCollection("module-preload-failed");
+        return false;
+    }
+
+
+
+
+
+
+    const bool preserve_deferred_guest_libc_first_fit =
+        RuntimeGuestFexActive() &&
+        g_fault_signal_owner.load(std::memory_order_acquire) !=
+            FaultSignalOwner::Fex &&
+        Core::AeroLib::ExecutorUseRealLibcAlloc();
+    const auto gnm_placement =
+        preserve_deferred_guest_libc_first_fit
+            ? GnmDriverPhysicalPlacement::HighTail
+            : GnmDriverPhysicalPlacement::FirstFit;
+    if (!EnsureMappedEntryGnmDriverBootstrap(error, gnm_placement)) {
+        PauseFexBootstrapLifecycleCollection("gnm-driver-bootstrap-failed");
+        return false;
+    }
+    return FinalizeFexBootstrapLifecycleCollection(error);
 }
 
 extern "C" int executor_lsx4_android_run_guest_once(void* once_control, void* init_routine) {
     const bool jit_active = RuntimeGuestJitActive();
+    const bool fex_active = RuntimeGuestFexActive();
     const bool box64_active = g_box64_guest_entry_active.load(std::memory_order_acquire);
-    if ((!jit_active && !box64_active) || init_routine == nullptr) {
+    if ((!jit_active && !fex_active && !box64_active) || init_routine == nullptr) {
         return 0;
     }
 
     const auto init_address = reinterpret_cast<std::uint64_t>(init_routine);
-    Core::Module* module = FindGuestModuleByAddress(init_address);
-    if (module == nullptr) {
+    Core::Module* module = nullptr;
+    if (!IsGuestExecutableAddress(init_address, &module)) {
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_GUEST_ONCE] guest init outside known module once=%p init=%p",
+                  "[EXECUTOR_GUEST_ONCE] init is not live guest executable once=%p init=%p",
                   once_control, init_routine);
         return -1;
+    }
+
+    const auto* guest_thread = Libraries::Kernel::g_curthread;
+    auto tcb_base =
+        guest_thread && guest_thread->tcb ? reinterpret_cast<std::uint64_t>(guest_thread->tcb)
+                                          : 0;
+
+    if (fex_active) {
+        std::uint64_t guest_result{};
+        const int status = RunFexGuestCallbackN(init_address, {}, 0,
+                                                &guest_result);
+        NativeLog(status == LSX4_FEX_STATUS_OK ? ANDROID_LOG_INFO
+                                               : ANDROID_LOG_ERROR,
+                  "[EXECUTOR_GUEST_ONCE] FEX pthread_once init status=%d "
+                  "result=0x%llx once=%p init=%p",
+                  status, static_cast<unsigned long long>(guest_result),
+                  once_control, init_routine);
+        return status == LSX4_FEX_STATUS_OK ? 1 : status;
     }
 
     std::uint64_t stack_base = 0;
     std::uint64_t stack_size = 0;
     if (!AllocateBox64LifecycleStack("module_lifecycle_stack", stack_base, stack_size)) {
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_MODULE_START_BRIDGE] result=stack_failed path=%s",
-                  module->file.string().c_str());
+                  "[EXECUTOR_GUEST_ONCE] result=stack_failed init=%p source=%s",
+                  init_routine,
+                  module != nullptr ? module->file.string().c_str()
+                                    : "dynamic-executable");
         return -4;
     }
-    const auto* guest_thread = Libraries::Kernel::g_curthread;
-    auto tcb_base =
-        guest_thread && guest_thread->tcb ? reinterpret_cast<std::uint64_t>(guest_thread->tcb)
-                                          : 0;
-
     if (jit_active) {
         try {
             NativeLog(ANDROID_LOG_INFO,
                       "[EXECUTOR_GUEST_ONCE] running guest pthread_once through JIT "
                       "once=%p init=%p offset=0x%llx stack=0x%llx size=0x%llx tcb=0x%llx",
                       once_control, init_routine,
-                      static_cast<unsigned long long>(GuestModuleOffset(*module, init_address)),
+                      static_cast<unsigned long long>(
+                          module != nullptr
+                              ? GuestModuleOffset(*module, init_address)
+                              : 0),
                       static_cast<unsigned long long>(stack_base),
                       static_cast<unsigned long long>(stack_size),
                       static_cast<unsigned long long>(tcb_base));
@@ -19656,6 +26571,14 @@ extern "C" int executor_lsx4_android_run_guest_once(void* once_control, void* in
     if (!g_box64_run_mapped_function) {
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_GUEST_ONCE] Box64 mapped-function ABI unavailable for once=%p init=%p",
+                  once_control, init_routine);
+        return -1;
+    }
+
+    if (module == nullptr) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_GUEST_ONCE] legacy backend cannot dispatch dynamic "
+                  "executable init once=%p init=%p",
                   once_control, init_routine);
         return -1;
     }
@@ -19699,8 +26622,8 @@ extern "C" int executor_lsx4_android_run_guest_callback(void* callback, void* ar
     }
 
     const auto callback_address = reinterpret_cast<std::uint64_t>(callback);
-    Core::Module* module = FindGuestModuleByAddress(callback_address);
-    if (module == nullptr) {
+    Core::Module* module = nullptr;
+    if (!IsGuestExecutableAddress(callback_address, &module)) {
         return 0;
     }
 
@@ -19709,8 +26632,13 @@ extern "C" int executor_lsx4_android_run_guest_callback(void* callback, void* ar
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_GUEST_CALLBACK] guest callback while entry inactive; still routing "
                   "through mapped-function reason=%s callback=%p arg=%p module=%s offset=0x%llx",
-                  reason ? reason : "<unknown>", callback, arg, module->file.string().c_str(),
-                  static_cast<unsigned long long>(GuestModuleOffset(*module, callback_address)));
+                  reason ? reason : "<unknown>", callback, arg,
+                  module != nullptr ? module->file.string().c_str()
+                                    : "<dynamic-executable>",
+                  static_cast<unsigned long long>(
+                      module != nullptr
+                          ? GuestModuleOffset(*module, callback_address)
+                          : 0));
     }
 
     auto* guest_thread = Libraries::Kernel::g_curthread;
@@ -19751,9 +26679,41 @@ extern "C" int executor_lsx4_android_run_guest_callback(void* callback, void* ar
         }
     }
 
+    if (RuntimeGuestFexActive()) {
+        std::uint64_t guest_result{};
+        const int status = RunFexGuestCallbackN(
+            callback_address,
+            {reinterpret_cast<std::uint64_t>(arg), 0, 0, 0, 0, 0}, 1,
+            &guest_result);
+        static std::atomic<std::uint64_t> completed_count{0};
+        const std::uint64_t completed =
+            status == LSX4_FEX_STATUS_OK
+                ? completed_count.fetch_add(1, std::memory_order_relaxed) + 1
+                : completed_count.load(std::memory_order_relaxed);
+        if (status != LSX4_FEX_STATUS_OK || completed <= 8 ||
+            (completed & (completed - 1)) == 0) {
+            NativeLog(status == LSX4_FEX_STATUS_OK ? ANDROID_LOG_INFO
+                                                   : ANDROID_LOG_ERROR,
+                      "[EXECUTOR_GUEST_CALLBACK] stage=fex_done count=%llu "
+                      "status=%d reason=%s callback=%p arg=%p result=0x%llx",
+                      static_cast<unsigned long long>(completed), status,
+                      reason ? reason : "<unknown>", callback, arg,
+                      static_cast<unsigned long long>(guest_result));
+        }
+        return status == LSX4_FEX_STATUS_OK ? 1 : status;
+    }
+
     if (!g_box64_run_mapped_function) {
         NativeLog(ANDROID_LOG_ERROR,
                   "[EXECUTOR_GUEST_CALLBACK] result=no_backend reason=%s callback=%p arg=%p",
+                  reason ? reason : "<unknown>", callback, arg);
+        return -1;
+    }
+
+    if (module == nullptr) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_GUEST_CALLBACK] result=legacy_dynamic_unsupported "
+                  "reason=%s callback=%p arg=%p",
                   reason ? reason : "<unknown>", callback, arg);
         return -1;
     }
@@ -19813,8 +26773,8 @@ executor_lsx4_android_run_guest_callback6(
     }
 
     const auto callback_address = reinterpret_cast<std::uint64_t>(callback);
-    Core::Module* module = FindGuestModuleByAddress(callback_address);
-    if (module == nullptr) {
+    Core::Module* module = nullptr;
+    if (!IsGuestExecutableAddress(callback_address, &module)) {
         return 0;
     }
     if (arg_count > 6) {
@@ -19831,7 +26791,8 @@ executor_lsx4_android_run_guest_callback6(
                   "[EXECUTOR_GUEST_CALLBACK6] result=no_thread reason=%s callback=%p "
                   "argCount=%u module=%s",
                   reason ? reason : "<unknown>", callback, arg_count,
-                  module->file.string().c_str());
+                  module != nullptr ? module->file.string().c_str()
+                                    : "<dynamic-executable>");
         return -1;
     }
 
@@ -19881,7 +26842,9 @@ executor_lsx4_android_run_guest_callback6(
                           static_cast<unsigned long long>(completed),
                           reason ? reason : "<unknown>", callback,
                           static_cast<unsigned long long>(
-                              GuestModuleOffset(*module, callback_address)),
+                              module != nullptr
+                                  ? GuestModuleOffset(*module, callback_address)
+                                  : 0),
                           arg_count, static_cast<unsigned long long>(result),
                           static_cast<const void*>(guest_thread), guest_thread->name.c_str());
             }
@@ -19901,6 +26864,33 @@ executor_lsx4_android_run_guest_callback6(
                        static_cast<const void*>(guest_thread), guest_thread->name.c_str());
             return -11;
         }
+    }
+
+    if (RuntimeGuestFexActive()) {
+        const std::array<std::uint64_t, 6> arguments{
+            arg0, arg1, arg2, arg3, arg4, arg5};
+        const int status = RunFexGuestCallbackN(
+            callback_address, arguments, arg_count, result_out);
+        static std::atomic<std::uint64_t> completed_count{0};
+        const std::uint64_t completed =
+            status == LSX4_FEX_STATUS_OK
+                ? completed_count.fetch_add(1, std::memory_order_relaxed) + 1
+                : completed_count.load(std::memory_order_relaxed);
+        if (status != LSX4_FEX_STATUS_OK || completed <= 8 ||
+            (completed & (completed - 1)) == 0) {
+            NativeLog(status == LSX4_FEX_STATUS_OK ? ANDROID_LOG_INFO
+                                                   : ANDROID_LOG_ERROR,
+                      "[EXECUTOR_GUEST_CALLBACK6] stage=fex_done count=%llu "
+                      "status=%d reason=%s callback=%p argCount=%u result=0x%llx "
+                      "thread=%p name=%s",
+                      static_cast<unsigned long long>(completed), status,
+                      reason ? reason : "<unknown>", callback, arg_count,
+                      static_cast<unsigned long long>(
+                          result_out != nullptr ? *result_out : 0),
+                      static_cast<const void*>(guest_thread),
+                      guest_thread->name.c_str());
+        }
+        return status == LSX4_FEX_STATUS_OK ? 1 : status;
     }
 
     if (arg_count <= 3 && g_box64_run_guest_signal_handler != nullptr) {
@@ -19924,7 +26914,8 @@ executor_lsx4_android_run_guest_callback4(void* callback, std::uint64_t arg0,
             *result_out = 0;
         }
         if (callback == nullptr ||
-            FindGuestModuleByAddress(reinterpret_cast<std::uint64_t>(callback)) == nullptr) {
+            !IsGuestExecutableAddress(
+                reinterpret_cast<std::uint64_t>(callback))) {
             return 0;
         }
         NativeLog(ANDROID_LOG_ERROR,
@@ -19938,10 +26929,8 @@ executor_lsx4_android_run_guest_callback4(void* callback, std::uint64_t arg0,
 }
 
 extern "C" bool executor_lsx4_android_is_guest_address(void* address) {
-    if (address == nullptr) {
-        return false;
-    }
-    return FindGuestModuleByAddress(reinterpret_cast<std::uint64_t>(address)) != nullptr;
+    return address != nullptr &&
+           IsGuestExecutableAddress(reinterpret_cast<std::uint64_t>(address));
 }
 
 static std::string InlineQwordAsciiPreview(const std::uint64_t value) {
@@ -20646,6 +27635,42 @@ static void LogUnityPreloadPcContractSnapshot(std::uint64_t arg_base, const char
     }
 }
 
+extern "C" __attribute__((visibility("default"), used)) int
+executor_lsx4_android_release_guest_thread(void* guest_thread,
+                                           std::uintptr_t pthread_handle) {
+    if (!RuntimeGuestFexActive()) {
+        return LSX4_FEX_STATUS_OK;
+    }
+    if (guest_thread == nullptr) {
+        return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+    }
+
+    const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+    if (api == nullptr || api->release_guest_thread == nullptr) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_THREAD_RELEASE] result=missing_api guest=%p "
+                  "pthread=0x%zx",
+                  guest_thread, static_cast<std::size_t>(pthread_handle));
+        return LSX4_FEX_STATUS_INVALID_STATE;
+    }
+
+    Lsx4FexThreadIdentityV3 identity =
+        MakeFexThreadIdentity(guest_thread, pthread_handle);
+
+
+
+    identity.host_tid = 0;
+    const int status = api->release_guest_thread(api->backend_context, &identity);
+    NativeLog(status == LSX4_FEX_STATUS_OK ? ANDROID_LOG_INFO
+                                           : ANDROID_LOG_ERROR,
+              "[EXECUTOR_FEX_THREAD_RELEASE] result=%s status=%d guest=%p "
+              "pthread=0x%llx",
+              status == LSX4_FEX_STATUS_OK ? "released" : "failed", status,
+              guest_thread,
+              static_cast<unsigned long long>(identity.pthread_handle));
+    return status;
+}
+
 extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
                                                            void* start_routine,
                                                            void* arg,
@@ -20661,10 +27686,10 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
     const bool trace_guest_thread =
         guest_thread_info_log_count.fetch_add(1, std::memory_order_relaxed) < 4;
     const auto start_address = reinterpret_cast<std::uint64_t>(start_routine);
-    Core::Module* module = FindGuestModuleByAddress(start_address);
-    if (!module) {
+    Core::Module* module = nullptr;
+    if (!IsGuestExecutableAddress(start_address, &module)) {
         NativeLog(ANDROID_LOG_ERROR,
-                  "[EXECUTOR_GUEST_THREAD_ROUTE_REJECT] start outside guest modules start=%p "
+                  "[EXECUTOR_GUEST_THREAD_ROUTE_REJECT] start is not live guest executable start=%p "
                   "arg=%p name=%s",
                   start_routine, arg, name ? name : "<unnamed>");
         return nullptr;
@@ -20674,11 +27699,17 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_GUEST_THREAD] module_resolved thread=%p start=%p offset=0x%llx arg=%p name=%s module=%s",
                   thread, start_routine,
-                  static_cast<unsigned long long>(GuestModuleOffset(*module, start_address)),
-                  arg, name ? name : "<unnamed>", module->file.string().c_str());
+                  static_cast<unsigned long long>(
+                      module != nullptr
+                          ? GuestModuleOffset(*module, start_address)
+                          : 0),
+                  arg, name ? name : "<unnamed>",
+                  module != nullptr ? module->file.string().c_str()
+                                    : "<dynamic-executable>");
     }
 
-    if (!RuntimeGuestJitActive() && !g_box64_run_mapped_function) {
+    if (!RuntimeGuestJitActive() && !RuntimeGuestFexActive() &&
+        !g_box64_run_mapped_function) {
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_GUEST_THREAD] Box64 mapped-function ABI unavailable; start=%p arg=%p name=%s",
                   start_routine, arg, name ? name : "<unnamed>");
@@ -20687,8 +27718,10 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
 
     const auto submit_done_sentinel =
         std::filesystem::path(g_root) / "run-live-suppress-submit-done-thread";
-    const auto module_offset = GuestModuleOffset(*module, start_address);
+    const auto module_offset =
+        module != nullptr ? GuestModuleOffset(*module, start_address) : 0;
     const bool is_submit_done_thread =
+        module != nullptr &&
         module->file.string().find("CUSA00754") != std::string::npos &&
         module->file.filename().string() == "eboot.bin" &&
         module_offset == 0x98f60 &&
@@ -20704,7 +27737,7 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
         return nullptr;
     }
 
-    if (IsPs4StoreModule(*module) &&
+    if (module != nullptr && IsPs4StoreModule(*module) &&
         !IsKnownStoreInstallWorkerThread(*module, start_address)) {
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_GUEST_THREAD] suppressing PS4 Store background pthread start=%p offset=0x%llx arg=%p name=%s; keeping main render loop alive",
@@ -20714,7 +27747,8 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
         return nullptr;
     }
 
-    if (IsKnownStoreInstallWorkerThread(*module, start_address)) {
+    if (module != nullptr &&
+        IsKnownStoreInstallWorkerThread(*module, start_address)) {
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_GUEST_THREAD] allowing PS4 Store install worker pthread start=%p offset=0x%llx arg=%p name=%s",
                   start_routine,
@@ -20722,7 +27756,8 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
                   name ? name : "<unnamed>");
     }
 
-    if (ShouldBypassKnownStoreHelperThread(*module, start_address)) {
+    if (module != nullptr &&
+        ShouldBypassKnownStoreHelperThread(*module, start_address)) {
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_GUEST_THREAD] bypassing PS4 Store helper pthread start=%p offset=0x%llx arg=%p name=%s",
                   start_routine,
@@ -20731,7 +27766,8 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
         return nullptr;
     }
 
-    if (ShouldBypassKnownItemzCoreUtilityThread(*module, start_address)) {
+    if (module != nullptr &&
+        ShouldBypassKnownItemzCoreUtilityThread(*module, start_address)) {
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_GUEST_THREAD] bypassing ItemzCore utility pthread start=%p offset=0x%llx arg=%p name=%s; preserving launcher render loop",
                   start_routine,
@@ -20756,16 +27792,28 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
         return nullptr;
     }
     ExecutorBox64MappedEntryRequest request{};
+    request.stack_base = stack_base;
+    request.stack_size = stack_size;
+    request.tcb_base = tcb_base;
     std::string error;
-    if (!BuildMappedEntryRequestFromModule(*module, request, error, stack_base, stack_size,
-                                           tcb_base)) {
+    if (module != nullptr &&
+        !BuildMappedEntryRequestFromModule(*module, request, error, stack_base,
+                                           stack_size, tcb_base)) {
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_GUEST_THREAD] cannot build mapped-function request: %s",
                   error.c_str());
         return nullptr;
     }
+    if (module == nullptr && !RuntimeGuestJitActive() && !RuntimeGuestFexActive()) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_GUEST_THREAD_ROUTE_REJECT] dynamic executable start=%p "
+                  "has no mapped callback backend name=%s",
+                  start_routine, name ? name : "<unnamed>");
+        return nullptr;
+    }
     const bool is_unity_pthread_wrapper =
-        module->file.filename().string() == "eboot.bin" && module_offset == 0x51c20;
+        module != nullptr && module->file.filename().string() == "eboot.bin" &&
+        module_offset == 0x51c20;
     std::uint64_t thread_arg_q1 = 0;
     std::uint64_t thread_arg_q2 = 0;
     std::uint64_t thread_arg_q3 = 0;
@@ -20856,8 +27904,13 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
                           "proc_param=%p stack=%p size=0x%llx tcb=%p threadArgQ1=0x%llx "
                           "threadArgQ3=0x%llx",
                           thread, start_routine,
-                          static_cast<unsigned long long>(GuestModuleOffset(*module, start_address)),
-                          arg, name ? name : "<unnamed>", module->file.string().c_str(),
+                          static_cast<unsigned long long>(
+                              module != nullptr
+                                  ? GuestModuleOffset(*module, start_address)
+                                  : 0),
+                          arg, name ? name : "<unnamed>",
+                          module != nullptr ? module->file.string().c_str()
+                                            : "<dynamic-executable>",
                           RuntimeGuestBackendName(),
                           is_unity_pthread_wrapper ? "thread-arg-entry-proc-wrapper" : "arg-entry-proc",
                           reinterpret_cast<void*>(request.entry_params),
@@ -20898,6 +27951,117 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
         }
     }
 
+    if (RuntimeGuestFexActive()) {
+        if (!ValidateFexHleAbiContract("guest-thread")) {
+            return nullptr;
+        }
+        const Lsx4FexBackendApiV3* const fex_api = Executor::Fex::ActiveApi();
+        if (fex_api == nullptr || fex_api->run_guest_callback == nullptr ||
+            fex_api->bind_host_thread == nullptr ||
+            fex_api->set_guest_tls == nullptr ||
+            fex_api->unbind_host_thread == nullptr) {
+            NativeLog(ANDROID_LOG_ERROR,
+                      "[EXECUTOR_GUEST_THREAD_FEX] active API incomplete start=%p",
+                      start_routine);
+            return nullptr;
+        }
+        const std::uint64_t stack_end = stack_base + stack_size;
+        const std::uint64_t aligned_stack_top = stack_end & ~UINT64_C(0xf);
+        if (stack_end < stack_base || stack_base > UINT64_MAX - 24 ||
+            aligned_stack_top < stack_base + 24) {
+            NativeLog(ANDROID_LOG_ERROR,
+                      "[EXECUTOR_GUEST_THREAD_FEX] invalid callback stack start=%p "
+                      "stack=%p+0x%llx exit=%p",
+                      start_routine, reinterpret_cast<void*>(stack_base),
+                      static_cast<unsigned long long>(stack_size),
+                      reinterpret_cast<void*>(request.exit_func));
+            return nullptr;
+        }
+
+
+        const std::uint64_t callback_rsp = aligned_stack_top - sizeof(std::uint64_t);
+
+        Lsx4FexThreadIdentityV3 identity{
+            .struct_size = sizeof(Lsx4FexThreadIdentityV3),
+            .abi_version = LSX4_FEX_BACKEND_ABI_V3,
+            .guest_thread = reinterpret_cast<std::uint64_t>(guest_thread),
+            .pthread_handle = static_cast<std::uint64_t>(
+                guest_thread->native_thr.GetHandle()),
+            .host_tid = static_cast<std::int64_t>(syscall(SYS_gettid)),
+            .backend_thread = 0,
+        };
+        int status = fex_api->bind_host_thread(fex_api->backend_context, &identity);
+        if (status != LSX4_FEX_STATUS_OK) {
+            return nullptr;
+        }
+        Lsx4FexGuestTlsStateV3 tls{
+            .struct_size = sizeof(Lsx4FexGuestTlsStateV3),
+            .abi_version = LSX4_FEX_BACKEND_ABI_V3,
+            .target = identity,
+            .fs_base = tcb_base,
+            .gs_base = tcb_base,
+            .tcb_base = tcb_base,
+            .tls_image_address = request.tls_image_addr,
+            .tls_image_size = request.tls_image_size,
+            .tls_module_id = request.tls_mod_id,
+            .tls_flags = 0,
+            .reserved = 0,
+        };
+        status = fex_api->set_guest_tls(fex_api->backend_context, &tls);
+
+        static std::atomic<std::uint64_t> next_callback_id{1};
+        Lsx4FexGuestCallbackRequestV3 callback{
+            .struct_size = sizeof(Lsx4FexGuestCallbackRequestV3),
+            .abi_version = LSX4_FEX_BACKEND_ABI_V3,
+            .callback_id = next_callback_id.fetch_add(1, std::memory_order_relaxed),
+            .guest_function = start_address,
+            .guest_rsp = callback_rsp,
+            .gpr = {reinterpret_cast<std::uint64_t>(arg), 0, 0, 0, 0, 0},
+            .xmm = {},
+            .sret_address = 0,
+            .sret_size = 0,
+            .return_class = {LSX4_FEX_SYSV_INTEGER, LSX4_FEX_SYSV_NO_CLASS},
+            .return_eightbyte_count = 1,
+            .sret_flags = 0,
+            .call_flags = 0,
+            .sysv_sse_arg_count = 0,
+            .abi_descriptor_id = 0,
+            .input_rax = 0,
+        };
+        if (is_unity_pthread_wrapper) {
+            callback.gpr[1] = request.entry_params;
+            callback.gpr[2] = request.proc_param;
+        }
+        Lsx4FexGuestCallbackResultV3 callback_result{};
+        callback_result.struct_size = sizeof(callback_result);
+        callback_result.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+        callback_result.call_id = callback.callback_id;
+        if (status == LSX4_FEX_STATUS_OK) {
+            status = fex_api->run_guest_callback(
+                fex_api->backend_context, &callback, &callback_result);
+        }
+        const int unbind_status =
+            fex_api->unbind_host_thread(fex_api->backend_context);
+        if (status == LSX4_FEX_STATUS_OK &&
+            unbind_status != LSX4_FEX_STATUS_OK) {
+            status = unbind_status;
+        }
+        NativeLog(status == LSX4_FEX_STATUS_OK ? ANDROID_LOG_INFO
+                                               : ANDROID_LOG_ERROR,
+                  "[EXECUTOR_GUEST_THREAD_FEX] status=%d result=%d start=%p "
+                  "rax=0x%llx name=%s",
+                  status, callback_result.status, start_routine,
+                  static_cast<unsigned long long>(callback_result.rax),
+                  name ? name : "<unnamed>");
+        if (status != LSX4_FEX_STATUS_OK ||
+            callback_result.status != LSX4_FEX_STATUS_OK ||
+            callback_result.call_id != callback.callback_id) {
+            return nullptr;
+        }
+        return reinterpret_cast<void*>(
+            static_cast<std::uintptr_t>(callback_result.rax));
+    }
+
     if (g_box64_note_current_guest_thread) {
         g_box64_note_current_guest_thread(reinterpret_cast<std::uint64_t>(guest_thread));
     }
@@ -20909,6 +28073,443 @@ extern "C" void* executor_lsx4_android_run_guest_thread(void* thread,
               "[EXECUTOR_GUEST_THREAD] Box64 guest pthread result=%d message=%s",
               result, run_message);
     return reinterpret_cast<void*>(static_cast<std::uintptr_t>(result < 0 ? 0 : result));
+}
+
+int RunFexGuestModuleLifecycle(Core::Module& module, const std::uint64_t args,
+                               const void* argp, void* param,
+                               int* const result_out) {
+    if (!ValidateFexHleAbiContract("module-lifecycle")) {
+        return LSX4_FEX_STATUS_UNSUPPORTED;
+    }
+    const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+    if (api == nullptr || api->get_guest_tls == nullptr ||
+        api->bind_host_thread == nullptr || api->unbind_host_thread == nullptr ||
+        api->set_guest_tls == nullptr || api->run_guest_callback == nullptr) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_MODULE_START_FEX] result=missing_api path=%s",
+                  module.file.string().c_str());
+        return LSX4_FEX_STATUS_INVALID_STATE;
+    }
+
+
+
+
+
+
+    ScopedFexCallbackBinding binding{api};
+    const int bind_status = binding.status();
+    if (bind_status != LSX4_FEX_STATUS_OK) {
+        const auto identity = MakeFexThreadIdentity();
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_MODULE_START_FEX] result=bind_failed path=%s "
+                  "status=%d guest=0x%llx hostTid=%lld",
+                  module.file.string().c_str(), bind_status,
+                  static_cast<unsigned long long>(identity.guest_thread),
+                  static_cast<long long>(identity.host_tid));
+        return bind_status;
+    }
+
+    auto* const current_thread = Libraries::Kernel::g_curthread;
+    const auto identity = MakeFexThreadIdentity(current_thread);
+    Lsx4FexGuestTlsStateV3 previous_tls{};
+    previous_tls.struct_size = sizeof(previous_tls);
+    previous_tls.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+    const int tls_snapshot_status = api->get_guest_tls(
+        api->backend_context, &identity, &previous_tls);
+    if (tls_snapshot_status != LSX4_FEX_STATUS_OK) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_MODULE_START_FEX] result=tls_snapshot_failed "
+                  "path=%s status=%d guest=0x%llx hostTid=%lld",
+                  module.file.string().c_str(), tls_snapshot_status,
+                  static_cast<unsigned long long>(identity.guest_thread),
+                  static_cast<long long>(identity.host_tid));
+        return tls_snapshot_status;
+    }
+    struct ScopedFexTlsRestore {
+        const Lsx4FexBackendApiV3* api{};
+        Lsx4FexGuestTlsStateV3 tls{};
+        std::string module_path;
+
+        ~ScopedFexTlsRestore() {
+            const int status = api->set_guest_tls(api->backend_context, &tls);
+            if (status != LSX4_FEX_STATUS_OK) {
+                NativeLog(ANDROID_LOG_ERROR,
+                          "[EXECUTOR_MODULE_START_FEX] "
+                          "result=tls_restore_failed path=%s status=%d",
+                          module_path.c_str(), status);
+            }
+        }
+    } tls_restore{api, previous_tls, module.file.string()};
+
+    const std::uint64_t tcb_base =
+        current_thread != nullptr && current_thread->tcb != nullptr
+            ? reinterpret_cast<std::uint64_t>(current_thread->tcb)
+            : 0;
+    Lsx4FexGuestTlsStateV3 tls{};
+    tls.struct_size = sizeof(tls);
+    tls.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+    tls.target = identity;
+    tls.fs_base = tcb_base;
+    tls.gs_base = tcb_base;
+    tls.tcb_base = tcb_base;
+    tls.tls_image_address = module.tls.image_virtual_addr;
+    tls.tls_image_size = module.tls.image_size;
+    tls.tls_module_id = module.tls.modid;
+    const int tls_status = api->set_guest_tls(api->backend_context, &tls);
+    if (tls_status != LSX4_FEX_STATUS_OK) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_MODULE_START_FEX] result=tls_failed path=%s "
+                  "status=%d tcb=%p",
+                  module.file.string().c_str(), tls_status,
+                  reinterpret_cast<void*>(tcb_base));
+        return tls_status;
+    }
+
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_MODULE_START_FEX] lifecycle path=%s hasDtInit=%d "
+              "dtInit=0x%llx entry=0x%llx entryExecutable=%d",
+              module.file.string().c_str(), module.dynamic_info.has_init ? 1 : 0,
+              static_cast<unsigned long long>(
+                  module.dynamic_info.init_virtual_addr),
+              static_cast<unsigned long long>(module.GetEntryAddress()),
+              ModuleContainsExecutableRange(module, module.GetEntryAddress(), 1)
+                  ? 1
+                  : 0);
+
+    std::uint64_t last_guest_result = 0;
+    auto run_function = [&](const std::uint64_t function,
+                            const std::uint64_t arg0,
+                            const std::uint64_t arg1,
+                            const std::uint64_t arg2,
+                            const char* const phase,
+                            const std::uint32_t index) -> int {
+        if (function == 0) {
+            return LSX4_FEX_STATUS_OK;
+        }
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_MODULE_START_FEX] run phase=%s index=%u path=%s "
+                  "function=%p off=0x%llx",
+                  phase != nullptr ? phase : "?", index,
+                  module.file.string().c_str(),
+                  reinterpret_cast<void*>(function),
+                  static_cast<unsigned long long>(
+                      GuestModuleOffset(module, function)));
+        const int status = RunFexGuestCallback3(
+            function, arg0, arg1, arg2, &last_guest_result);
+        NativeLog(status == LSX4_FEX_STATUS_OK ? ANDROID_LOG_INFO
+                                               : ANDROID_LOG_ERROR,
+                  "[EXECUTOR_MODULE_START_FEX] phase_result phase=%s "
+                  "index=%u path=%s status=%d rax=0x%llx",
+                  phase != nullptr ? phase : "?", index,
+                  module.file.string().c_str(), status,
+                  static_cast<unsigned long long>(last_guest_result));
+        return status;
+    };
+
+    auto run_array = [&](const std::uint64_t virtual_addr,
+                         const std::uint64_t size,
+                         const char* const phase,
+                         bool* const executed_any) -> int {
+        if (virtual_addr == 0 || size == 0) {
+            return LSX4_FEX_STATUS_OK;
+        }
+        const std::uint64_t array_addr = module.GetBaseAddress() + virtual_addr;
+        const std::uint32_t count =
+            static_cast<std::uint32_t>(size / sizeof(std::uint64_t));
+        for (std::uint32_t index = 0; index < count; ++index) {
+            std::uint64_t function = 0;
+            std::memcpy(&function,
+                        reinterpret_cast<const void*>(
+                            array_addr + index * sizeof(function)),
+                        sizeof(function));
+            if (function == 0 || function == UINT64_MAX) {
+                continue;
+            }
+            if (function < module.GetBaseAddress()) {
+                function += module.GetBaseAddress();
+            }
+            if (executed_any != nullptr) {
+                *executed_any = true;
+            }
+            const int status = run_function(function, 0, 0, 0, phase, index);
+            if (status != LSX4_FEX_STATUS_OK) {
+                return status;
+            }
+        }
+        return LSX4_FEX_STATUS_OK;
+    };
+
+    auto find_sce_module_start = [&]() -> std::uint64_t {
+        if (!module.dynamic_info.symbol_table ||
+            !module.dynamic_info.str_table ||
+            module.dynamic_info.symbol_table_total_size == 0) {
+            return 0;
+        }
+        for (auto* sym = module.dynamic_info.symbol_table;
+             reinterpret_cast<std::uint8_t*>(sym) <
+             reinterpret_cast<std::uint8_t*>(module.dynamic_info.symbol_table) +
+                 module.dynamic_info.symbol_table_total_size;
+             ++sym) {
+            if (sym->st_value == 0) {
+                continue;
+            }
+            const auto id =
+                std::string_view(module.dynamic_info.str_table + sym->st_name);
+            if (id.rfind("BaOKcng8g88#", 0) == 0 ||
+                id.rfind("aDYs9XYn2PY#", 0) == 0) {
+                return module.GetBaseAddress() + sym->st_value;
+            }
+        }
+        return 0;
+    };
+
+    ScopedBox64GuestEntryActive guest_entry_scope("module_lifecycle_fex");
+    bool ran_any = false;
+    int status = LSX4_FEX_STATUS_OK;
+
+
+
+
+
+
+
+
+    if (module.dynamic_info.has_init) {
+        const std::uint64_t canonical_start =
+            module.GetBaseAddress() + module.dynamic_info.init_virtual_addr;
+        if (!ModuleContainsExecutableRange(module, canonical_start, 1)) {
+            NativeLog(ANDROID_LOG_ERROR,
+                      "[EXECUTOR_MODULE_START_FEX] result=non_executable_dt_init "
+                      "path=%s function=%p off=0x%llx",
+                      module.file.string().c_str(),
+                      reinterpret_cast<void*>(canonical_start),
+                      static_cast<unsigned long long>(
+                          module.dynamic_info.init_virtual_addr));
+            return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+        }
+        status = run_function(
+            canonical_start, args, reinterpret_cast<std::uint64_t>(argp),
+            reinterpret_cast<std::uint64_t>(param), "dt_init", 0);
+        if (status != LSX4_FEX_STATUS_OK) {
+            return status;
+        }
+        ran_any = true;
+    } else {
+        status = run_array(module.dynamic_info.preinit_array_virtual_addr,
+                           module.dynamic_info.preinit_array_size,
+                           "preinit_array", &ran_any);
+        if (status != LSX4_FEX_STATUS_OK) {
+            return status;
+        }
+        status = run_array(module.dynamic_info.init_array_virtual_addr,
+                           module.dynamic_info.init_array_size, "init_array",
+                           &ran_any);
+        if (status != LSX4_FEX_STATUS_OK) {
+            return status;
+        }
+    }
+    if (!ran_any) {
+        const std::uint64_t module_start = find_sce_module_start();
+        if (module_start != 0) {
+            status = run_function(
+                module_start, args, reinterpret_cast<std::uint64_t>(argp),
+                reinterpret_cast<std::uint64_t>(param), "sce_module_start", 0);
+            if (status != LSX4_FEX_STATUS_OK) {
+                return status;
+            }
+            ran_any = true;
+        }
+    }
+
+    if (result_out != nullptr) {
+        *result_out = static_cast<std::int32_t>(last_guest_result);
+    }
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_MODULE_START_FEX] result=ok path=%s ranAny=%d "
+              "guestResult=0x%llx",
+              module.file.string().c_str(), ran_any ? 1 : 0,
+              static_cast<unsigned long long>(last_guest_result));
+    return 1;
+}
+
+int DeferFexBootstrapModuleLifecycle(Core::Module& module,
+                                     const std::uint64_t args,
+                                     const void* const argp,
+                                     void* const param) {
+    if (args != 0 || argp != nullptr) {
+        {
+            std::lock_guard collection_lock(g_fex_bootstrap_lifecycle_mutex);
+            for (const auto& deferred : g_fex_bootstrap_lifecycles) {
+                if (deferred.module != nullptr) {
+                    deferred.module->lifecycle_state.store(
+                        Core::Module::LifecycleState::Loaded,
+                        std::memory_order_release);
+                }
+            }
+            g_fex_bootstrap_lifecycle_phase.store(
+                FexBootstrapLifecyclePhase::Failed,
+                std::memory_order_release);
+        }
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_BOOTSTRAP_LIFECYCLE] action=reject path=%s "
+                  "reason=nonzero-bootstrap-arguments args=0x%llx argp=%p",
+                  module.file.string().c_str(),
+                  static_cast<unsigned long long>(args), argp);
+        return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+    }
+
+    std::size_t position = 0;
+    bool duplicate = false;
+    bool conflict = false;
+    FexBootstrapLifecyclePhase phase{};
+    {
+        std::lock_guard collection_lock(g_fex_bootstrap_lifecycle_mutex);
+        phase = g_fex_bootstrap_lifecycle_phase.load(std::memory_order_relaxed);
+        if (phase == FexBootstrapLifecyclePhase::Collecting) {
+            const auto it = std::find_if(
+                g_fex_bootstrap_lifecycles.begin(),
+                g_fex_bootstrap_lifecycles.end(),
+                [&](const DeferredFexBootstrapLifecycle& deferred) {
+                    return deferred.module == &module;
+                });
+            if (it == g_fex_bootstrap_lifecycles.end()) {
+                position = g_fex_bootstrap_lifecycles.size();
+                g_fex_bootstrap_lifecycles.push_back(
+                    DeferredFexBootstrapLifecycle{&module, args, argp, param});
+            } else {
+                position = static_cast<std::size_t>(
+                    std::distance(g_fex_bootstrap_lifecycles.begin(), it));
+                duplicate = true;
+                conflict = it->args != args || it->argp != argp ||
+                           it->param != param;
+                if (conflict) {
+                    for (const auto& deferred : g_fex_bootstrap_lifecycles) {
+                        if (deferred.module != nullptr) {
+                            deferred.module->lifecycle_state.store(
+                                Core::Module::LifecycleState::Loaded,
+                                std::memory_order_release);
+                        }
+                    }
+                    g_fex_bootstrap_lifecycle_phase.store(
+                        FexBootstrapLifecyclePhase::Failed,
+                        std::memory_order_release);
+                }
+            }
+        }
+    }
+
+    if (phase != FexBootstrapLifecyclePhase::Collecting || conflict) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_BOOTSTRAP_LIFECYCLE] action=reject path=%s "
+                  "phase=%s reason=%s",
+                  module.file.string().c_str(),
+                  FexBootstrapLifecyclePhaseName(phase),
+                  conflict ? "duplicate-argument-mismatch" :
+                             "collection-not-active");
+        return LSX4_FEX_STATUS_INVALID_STATE;
+    }
+
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_BOOTSTRAP_LIFECYCLE] action=defer path=%s "
+              "position=%zu duplicate=%d mapRelocate=reused",
+              module.file.string().c_str(), position, duplicate ? 1 : 0);
+    return 1;
+}
+
+bool DrainDeferredFexBootstrapLifecycles(std::string& error) {
+    std::vector<DeferredFexBootstrapLifecycle> deferred_lifecycles;
+    FexBootstrapLifecyclePhase phase{};
+    {
+        std::lock_guard collection_lock(g_fex_bootstrap_lifecycle_mutex);
+        phase = g_fex_bootstrap_lifecycle_phase.load(std::memory_order_relaxed);
+        if (phase == FexBootstrapLifecyclePhase::Inactive ||
+            phase == FexBootstrapLifecyclePhase::Complete) {
+            return true;
+        }
+        if (phase != FexBootstrapLifecyclePhase::Deferred) {
+            error = std::string("cannot drain FEX bootstrap lifecycles in phase ") +
+                    FexBootstrapLifecyclePhaseName(phase);
+            return false;
+        }
+        if (g_fault_signal_owner.load(std::memory_order_acquire) !=
+                FaultSignalOwner::Fex ||
+            Executor::Fex::ActiveApi() == nullptr) {
+            error = "FEX bootstrap lifecycle drain attempted before API and signal-owner commit";
+            return false;
+        }
+        deferred_lifecycles = g_fex_bootstrap_lifecycles;
+        g_fex_bootstrap_lifecycle_phase.store(
+            FexBootstrapLifecyclePhase::Draining,
+            std::memory_order_release);
+    }
+
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_BOOTSTRAP_LIFECYCLE] phase=draining queued=%zu "
+              "signalOwner=fex",
+              deferred_lifecycles.size());
+    for (std::size_t index = 0; index < deferred_lifecycles.size(); ++index) {
+        const auto& deferred = deferred_lifecycles[index];
+        if (deferred.module == nullptr) {
+            error = "FEX bootstrap lifecycle queue contains a null module";
+        } else {
+            deferred.module->lifecycle_state.store(
+                Core::Module::LifecycleState::Starting,
+                std::memory_order_release);
+            int guest_result = 0;
+            const int status = RunFexGuestModuleLifecycle(
+                *deferred.module, deferred.args, deferred.argp,
+                deferred.param, &guest_result);
+            if (status == 1) {
+                deferred.module->lifecycle_state.store(
+                    Core::Module::LifecycleState::Started,
+                    std::memory_order_release);
+                NativeLog(ANDROID_LOG_INFO,
+                          "[EXECUTOR_FEX_BOOTSTRAP_LIFECYCLE] action=drained "
+                          "position=%zu path=%s guestResult=0x%x",
+                          index, deferred.module->file.string().c_str(),
+                          static_cast<unsigned>(guest_result));
+                continue;
+            }
+            deferred.module->lifecycle_state.store(
+                Core::Module::LifecycleState::Loaded,
+                std::memory_order_release);
+            error = std::string("FEX bootstrap module lifecycle failed: ") +
+                    deferred.module->file.string() +
+                    " status=" + std::to_string(status);
+        }
+
+        for (std::size_t pending = index + 1;
+             pending < deferred_lifecycles.size(); ++pending) {
+            if (deferred_lifecycles[pending].module != nullptr) {
+                deferred_lifecycles[pending].module->lifecycle_state.store(
+                    Core::Module::LifecycleState::Loaded,
+                    std::memory_order_release);
+            }
+        }
+        {
+            std::lock_guard collection_lock(g_fex_bootstrap_lifecycle_mutex);
+            g_fex_bootstrap_lifecycle_phase.store(
+                FexBootstrapLifecyclePhase::Failed,
+                std::memory_order_release);
+        }
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_BOOTSTRAP_LIFECYCLE] phase=failed "
+                  "position=%zu error=%s",
+                  index, error.c_str());
+        return false;
+    }
+
+    {
+        std::lock_guard collection_lock(g_fex_bootstrap_lifecycle_mutex);
+        g_fex_bootstrap_lifecycles.clear();
+        g_fex_bootstrap_lifecycle_phase.store(
+            FexBootstrapLifecyclePhase::Complete,
+            std::memory_order_release);
+    }
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_BOOTSTRAP_LIFECYCLE] phase=complete drained=%zu",
+              deferred_lifecycles.size());
+    return true;
 }
 
 extern "C" int executor_lsx4_android_run_guest_module_start(void* module_ptr,
@@ -20992,6 +28593,35 @@ extern "C" int executor_lsx4_android_run_guest_module_start(void* module_ptr,
                       module->file.string().c_str(), reinterpret_cast<void*>(function));
             return -11;
         }
+    }
+
+    if (RuntimeGuestFexActive()) {
+        const FaultSignalOwner signal_owner =
+            g_fault_signal_owner.load(std::memory_order_acquire);
+        const FexBootstrapLifecyclePhase lifecycle_phase =
+            g_fex_bootstrap_lifecycle_phase.load(std::memory_order_acquire);
+        if (signal_owner != FaultSignalOwner::Fex) {
+            if (lifecycle_phase == FexBootstrapLifecyclePhase::Collecting) {
+                return DeferFexBootstrapModuleLifecycle(*module, args, argp,
+                                                        param);
+            }
+            NativeLog(ANDROID_LOG_ERROR,
+                      "[EXECUTOR_MODULE_START_FEX] result=blocked_before_commit "
+                      "path=%s signalOwner=%s lifecyclePhase=%s",
+                      module->file.string().c_str(),
+                      FaultSignalOwnerName(signal_owner),
+                      FexBootstrapLifecyclePhaseName(lifecycle_phase));
+            return LSX4_FEX_STATUS_INVALID_STATE;
+        }
+        if (lifecycle_phase == FexBootstrapLifecyclePhase::Deferred) {
+            NativeLog(ANDROID_LOG_ERROR,
+                      "[EXECUTOR_MODULE_START_FEX] result=blocked_before_bootstrap_drain "
+                      "path=%s",
+                      module->file.string().c_str());
+            return LSX4_FEX_STATUS_INVALID_STATE;
+        }
+        return RunFexGuestModuleLifecycle(*module, args, argp, param,
+                                          result_out);
     }
 
     if (!g_box64_run_mapped_function) {
@@ -21242,6 +28872,29 @@ executor_lsx4_android_register_guest_signal_handler(int signum,
                   signum, reinterpret_cast<void*>(handler), flags);
         return 0;
     }
+    if (RuntimeGuestFexActive()) {
+        const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+        if (api == nullptr || api->register_guest_signal_action == nullptr) {
+            return LSX4_FEX_STATUS_INVALID_STATE;
+        }
+        Lsx4FexGuestSignalActionV3 action{};
+        action.struct_size = sizeof(action);
+        action.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+        action.signum = signum;
+        action.action_flags = static_cast<std::uint32_t>(flags);
+        action.handler = handler;
+        const int status = api->register_guest_signal_action(
+            api->backend_context, &action);
+        if (status == LSX4_FEX_STATUS_OK && signum == OrbisSigUsr1 && handler > 1) {
+            RequireFexHleSignalSafepoints("signal-registration");
+        }
+        NativeLog(status == LSX4_FEX_STATUS_OK ? ANDROID_LOG_INFO
+                                               : ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_SIGNAL] stage=register signum=%d handler=%p "
+                  "flags=0x%x status=%d",
+                  signum, reinterpret_cast<void*>(handler), flags, status);
+        return status;
+    }
     if (!g_box64_register_guest_signal_handler) {
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_LIVE_SIGNAL_BRIDGE] stage=register_guest_signal result=no_box64 "
@@ -21258,6 +28911,41 @@ executor_lsx4_android_register_guest_signal_handler(int signum,
 }
 
 extern "C" __attribute__((visibility("default"), used)) int
+executor_lsx4_android_register_guest_signal_action_v3(
+    int signum, std::uint64_t handler, int flags, std::uint64_t restorer,
+    std::uint64_t mask_low, std::uint64_t mask_high) {
+    if (!RuntimeGuestFexActive()) {
+        return executor_lsx4_android_register_guest_signal_handler(signum, handler, flags);
+    }
+
+    const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+    if (api == nullptr || api->register_guest_signal_action == nullptr) {
+        return LSX4_FEX_STATUS_INVALID_STATE;
+    }
+
+    Lsx4FexGuestSignalActionV3 action{};
+    action.struct_size = sizeof(action);
+    action.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+    action.signum = signum;
+    action.action_flags = static_cast<std::uint32_t>(flags);
+    action.handler = handler;
+    action.restorer = restorer;
+    action.mask_low = mask_low;
+    action.mask_high = mask_high;
+    const int status = api->register_guest_signal_action(api->backend_context, &action);
+    if (status == LSX4_FEX_STATUS_OK && signum == OrbisSigUsr1 && handler > 1) {
+        RequireFexHleSignalSafepoints("signal-action-v3-registration");
+    }
+    NativeLog(status == LSX4_FEX_STATUS_OK ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR,
+              "[EXECUTOR_FEX_SIGNAL] stage=register_action_v3 signum=%d handler=%p "
+              "restorer=%p flags=0x%x mask=0x%016llx:0x%016llx status=%d",
+              signum, reinterpret_cast<void*>(handler), reinterpret_cast<void*>(restorer),
+              flags, static_cast<unsigned long long>(mask_high),
+              static_cast<unsigned long long>(mask_low), status);
+    return status;
+}
+
+extern "C" __attribute__((visibility("default"), used)) int
 executor_lsx4_android_queue_guest_signal(std::uintptr_t pthread_handle, int signum) {
     if (RuntimeGuestJitActive()) {
         NativeLog(ANDROID_LOG_INFO,
@@ -21265,6 +28953,20 @@ executor_lsx4_android_queue_guest_signal(std::uintptr_t pthread_handle, int sign
                   "result=jit_defer_to_safe_point pthread=0x%zx signum=%d",
                   static_cast<std::size_t>(pthread_handle), signum);
         return -11;
+    }
+    if (RuntimeGuestFexActive()) {
+        const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+        if (api == nullptr || api->queue_guest_signal == nullptr) {
+            return LSX4_FEX_STATUS_INVALID_STATE;
+        }
+        Lsx4FexGuestSignalDeliveryV3 delivery{};
+        delivery.struct_size = sizeof(delivery);
+        delivery.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+        delivery.target = MakeFexThreadIdentity(nullptr, pthread_handle);
+        delivery.target.guest_thread = 0;
+        delivery.target.host_tid = 0;
+        delivery.signum = signum;
+        return api->queue_guest_signal(api->backend_context, &delivery);
     }
     if (!g_box64_queue_guest_signal) {
         NativeLog(ANDROID_LOG_INFO,
@@ -21285,7 +28987,21 @@ extern "C" __attribute__((visibility("default"), used)) int
 executor_lsx4_android_queue_guest_signal_for_thread(void* guest_thread,
                                                        std::uintptr_t pthread_handle,
                                                        int signum) {
-    if (g_box64_queue_guest_signal_for_guest_thread) {
+    if (RuntimeGuestFexActive()) {
+        const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+        if (api == nullptr || api->queue_guest_signal == nullptr) {
+            return LSX4_FEX_STATUS_INVALID_STATE;
+        }
+        Lsx4FexGuestSignalDeliveryV3 delivery{};
+        delivery.struct_size = sizeof(delivery);
+        delivery.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+        delivery.target = MakeFexThreadIdentity(guest_thread, pthread_handle);
+        delivery.target.host_tid = 0;
+        delivery.signum = signum;
+        return api->queue_guest_signal(api->backend_context, &delivery);
+    }
+    if (!RuntimeGuestJitActive() &&
+        g_box64_queue_guest_signal_for_guest_thread) {
         const auto guest_thread_id = reinterpret_cast<std::uint64_t>(guest_thread);
         const int rc = g_box64_queue_guest_signal_for_guest_thread(guest_thread_id,
                                                                    pthread_handle, signum);
@@ -21306,12 +29022,56 @@ executor_lsx4_android_queue_guest_signal_for_thread(void* guest_thread,
 }
 
 extern "C" __attribute__((visibility("default"), used)) int
+executor_lsx4_android_queue_guest_signal_for_thread_flags(
+    void* guest_thread, std::uintptr_t pthread_handle, int signum,
+    std::uint32_t delivery_flags) {
+    if ((delivery_flags & ~LSX4_FEX_SIGNAL_CONTEXT_ARG1) != 0) {
+        return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+    }
+    if (!RuntimeGuestFexActive()) {
+        return delivery_flags == 0
+                   ? executor_lsx4_android_queue_guest_signal_for_thread(
+                         guest_thread, pthread_handle, signum)
+                   : LSX4_FEX_STATUS_UNSUPPORTED;
+    }
+    const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+    if (api == nullptr || api->queue_guest_signal == nullptr) {
+        return LSX4_FEX_STATUS_INVALID_STATE;
+    }
+    Lsx4FexGuestSignalDeliveryV3 delivery{};
+    delivery.struct_size = sizeof(delivery);
+    delivery.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+    delivery.target = MakeFexThreadIdentity(guest_thread, pthread_handle);
+    delivery.target.host_tid = 0;
+    delivery.signum = signum;
+    delivery.delivery_flags = delivery_flags;
+    return api->queue_guest_signal(api->backend_context, &delivery);
+}
+
+extern "C" __attribute__((visibility("default"), used)) int
 executor_lsx4_android_queue_guest_signal_for_thread_context(void* guest_thread,
                                                                std::uintptr_t pthread_handle,
                                                                int signum,
                                                                std::uint64_t rip,
                                                                std::uint64_t rsp) {
-    if (g_box64_queue_guest_signal_for_guest_thread_context) {
+    if (RuntimeGuestFexActive()) {
+        const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+        if (api == nullptr || api->queue_guest_signal == nullptr) {
+            return LSX4_FEX_STATUS_INVALID_STATE;
+        }
+        Lsx4FexGuestSignalDeliveryV3 delivery{};
+        delivery.struct_size = sizeof(delivery);
+        delivery.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+        delivery.target = MakeFexThreadIdentity(guest_thread, pthread_handle);
+        delivery.target.host_tid = 0;
+        delivery.signum = signum;
+        delivery.delivery_flags = LSX4_FEX_SIGNAL_USE_EXPLICIT_CONTEXT;
+        delivery.explicit_rip = rip;
+        delivery.explicit_rsp = rsp;
+        return api->queue_guest_signal(api->backend_context, &delivery);
+    }
+    if (!RuntimeGuestJitActive() &&
+        g_box64_queue_guest_signal_for_guest_thread_context) {
         const auto guest_thread_id = reinterpret_cast<std::uint64_t>(guest_thread);
         const int rc = g_box64_queue_guest_signal_for_guest_thread_context(
             guest_thread_id, pthread_handle, signum, rip, rsp);
@@ -21341,6 +29101,10 @@ executor_lsx4_android_run_guest_signal_handler(std::uint64_t handler,
                                                   std::uint64_t arg1,
                                                   std::uint64_t arg2,
                                                   std::uint64_t* guest_result) {
+
+
+
+
     if (RuntimeGuestJitActive()) {
         if (handler == 0) {
             NativeLog(ANDROID_LOG_INFO,
@@ -21403,6 +29167,17 @@ executor_lsx4_android_run_guest_signal_handler(std::uint64_t handler,
             return -11;
         }
     }
+    if (RuntimeGuestFexActive()) {
+        const int status = RunFexGuestCallback3(
+            handler, arg0, arg1, arg2, guest_result);
+        NativeLog(status == LSX4_FEX_STATUS_OK ? ANDROID_LOG_INFO
+                                               : ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_SIGNAL] stage=run_handler handler=%p "
+                  "status=%d result=0x%llx",
+                  reinterpret_cast<void*>(handler), status,
+                  static_cast<unsigned long long>(guest_result ? *guest_result : 0));
+        return status;
+    }
     if (!g_box64_run_guest_signal_handler) {
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_LIVE_SIGNAL_BRIDGE] stage=run_guest_signal result=no_backend "
@@ -21430,6 +29205,9 @@ executor_lsx4_android_run_guest_comparator(std::uint64_t func, std::uint64_t arg
                                               std::uint64_t arg1, std::uint64_t* result_lo) {
     if (result_lo != nullptr) {
         *result_lo = 0;
+    }
+    if (!IsGuestExecutableAddress(func)) {
+        return -2;
     }
     if (RuntimeGuestJitActive()) {
         if (func == 0) {
@@ -21460,6 +29238,9 @@ executor_lsx4_android_run_guest_comparator(std::uint64_t func, std::uint64_t arg
             return -11;
         }
     }
+    if (RuntimeGuestFexActive()) {
+        return RunFexGuestCallback3(func, arg0, arg1, 0, result_lo);
+    }
     if (!g_box64_run_guest_callback) {
         if (!g_box64_run_guest_signal_handler) {
             return -1;
@@ -21474,10 +29255,30 @@ executor_lsx4_android_get_current_guest_regs(void* out, std::size_t out_size) {
     if (out == nullptr || out_size < sizeof(ExecutorBox64GuestRegsSnapshot)) {
         return -2;
     }
-    ExecutorBox64GuestRegsSnapshot snapshot{};
-    const int rc = TryGetCurrentGuestRegsSnapshot(snapshot);
-    if (rc == 0) {
+    if (RuntimeGuestFexActive() &&
+        out_size >= sizeof(ExecutorGuestContextSnapshotV2)) {
+        const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+        if (api == nullptr || api->get_guest_context == nullptr) {
+            return LSX4_FEX_STATUS_INVALID_STATE;
+        }
+        Lsx4FexGuestContextV3 context{};
+        context.struct_size = sizeof(context);
+        context.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+        const auto identity = MakeFexThreadIdentity();
+        const int rc = api->get_guest_context(
+            api->backend_context, &identity, &context);
+        if (rc != LSX4_FEX_STATUS_OK) {
+            return rc;
+        }
+        ExecutorGuestContextSnapshotV2 snapshot{};
+        FillExtendedGuestContextFromFexContext(context, snapshot);
         std::memcpy(out, &snapshot, sizeof(snapshot));
+        return 0;
+    }
+    ExecutorBox64GuestRegsSnapshot legacy{};
+    const int rc = TryGetCurrentGuestRegsSnapshot(legacy);
+    if (rc == 0) {
+        std::memcpy(out, &legacy, sizeof(legacy));
     }
     return rc;
 }
@@ -21498,10 +29299,33 @@ executor_lsx4_android_set_current_guest_regs(const void* regs, std::size_t regs_
         RestoreJitStateFromBox64Regs(state, snapshot);
         return live.ReplaceWith(state) ? 0 : -1;
     }
+    if (RuntimeGuestFexActive()) {
+        if (regs == nullptr || regs_size < sizeof(ExecutorBox64GuestRegsSnapshot)) {
+            return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+        }
+        const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+        if (api == nullptr || api->set_guest_context == nullptr) {
+            return LSX4_FEX_STATUS_INVALID_STATE;
+        }
+        Lsx4FexGuestContextV3 context{};
+        if (IsExtendedGuestContextSnapshot(regs, regs_size)) {
+            FillFexContextFromExtendedGuestContext(
+                *static_cast<const ExecutorGuestContextSnapshotV2*>(regs),
+                context);
+        } else {
+            ExecutorBox64GuestRegsSnapshot snapshot{};
+            std::memcpy(&snapshot, regs, sizeof(snapshot));
+            FillFexContextFromBox64Regs(snapshot, context);
+        }
+        const auto identity = MakeFexThreadIdentity();
+        return api->set_guest_context(
+            api->backend_context, &identity, &context);
+    }
     if (!g_box64_set_current_guest_regs) {
         return -1;
     }
-    return g_box64_set_current_guest_regs(regs, regs_size);
+    return g_box64_set_current_guest_regs(
+        regs, sizeof(ExecutorBox64GuestRegsSnapshot));
 }
 
 extern "C" void executor_jit_dump_thread_states(const char* reason);
@@ -21517,9 +29341,130 @@ executor_lsx4_android_dump_box64_emu_states(const char* reason) {
         return;
     }
     if (!g_box64_dump_guest_threads) {
+        const Lsx4FexBackendApiV3* const api = Executor::Fex::ActiveApi();
+        if (api == nullptr || api->get_guest_context == nullptr) {
+            NativeLog(ANDROID_LOG_INFO,
+                      "[EXECUTOR_FEX_THREAD_DUMP_BRIDGE] reason=%s result=no_backend",
+                      reason ? reason : "<none>");
+            return;
+        }
+        std::vector<Lsx4FexThreadIdentityV3> identities;
+        {
+            std::scoped_lock lock(g_fex_live_thread_identity_mutex);
+            identities.reserve(g_fex_live_thread_identities.size());
+            for (const auto& [guest_thread, identity] : g_fex_live_thread_identities) {
+                (void)guest_thread;
+                identities.push_back(identity);
+            }
+        }
+        std::ofstream diagnostic_file(
+            std::filesystem::path(g_root) / "diagnostic-fex-thread-context.txt",
+            std::ios::app);
+        int captured = 0;
+        for (const auto& identity : identities) {
+            Lsx4FexGuestContextV3 context{};
+            context.struct_size = sizeof(context);
+            context.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+            int status = api->get_guest_context(
+                api->backend_context, &identity, &context);
+            const char* context_source = "backend-api";
+            long snapshot_host_tid = 0;
+            char snapshot_host_name[64]{};
+            if (status != LSX4_FEX_STATUS_OK) {
+                std::uint64_t rip = 0;
+                std::uint64_t rsp = 0;
+                std::uint64_t rbp = 0;
+                int snapshot_status =
+                    identity.pthread_handle != 0 &&
+                            executor_jit_get_guest_thread_regs_by_pthread != nullptr
+                        ? executor_jit_get_guest_thread_regs_by_pthread(
+                              identity.pthread_handle, &rip, &rsp, &rbp,
+                              &snapshot_host_tid, snapshot_host_name,
+                              sizeof(snapshot_host_name))
+                        : -1;
+                if (snapshot_status != 0 && identity.host_tid > 0 &&
+                    executor_jit_get_guest_thread_regs_by_tid != nullptr) {
+                    snapshot_status = executor_jit_get_guest_thread_regs_by_tid(
+                        static_cast<long>(identity.host_tid), &rip, &rsp, &rbp,
+                        &snapshot_host_tid, snapshot_host_name,
+                        sizeof(snapshot_host_name));
+                }
+                if (snapshot_status == 0) {
+                    context.rip = rip;
+                    context.gpr[4] = rsp;
+                    context.gpr[5] = rbp;
+                    status = LSX4_FEX_STATUS_OK;
+                    context_source = "jit-thread-snapshot";
+                }
+            }
+            std::string guest_name{"<unavailable>"};
+            std::uint64_t guest_wchan = 0;
+            std::uint64_t guest_mutex = 0;
+            unsigned guest_state = 0;
+            bool guest_will_sleep = false;
+            bool guest_snapshot_available = false;
+            if (identity.guest_thread != 0) {
+                auto* const guest_thread =
+                    reinterpret_cast<Libraries::Kernel::Pthread*>(identity.guest_thread);
+                if (guest_thread->lock.try_lock()) {
+                    guest_name = guest_thread->name;
+                    guest_wchan = reinterpret_cast<std::uint64_t>(guest_thread->wchan);
+                    guest_mutex = reinterpret_cast<std::uint64_t>(guest_thread->mutex_obj);
+                    guest_state = static_cast<unsigned>(guest_thread->state);
+                    guest_will_sleep = guest_thread->will_sleep;
+                    guest_snapshot_available = true;
+                    guest_thread->lock.unlock();
+                }
+            }
+            NativeLog(ANDROID_LOG_WARN,
+                      "[EXECUTOR_FEX_THREAD_CONTEXT] reason=%s status=%d guest=0x%llx "
+                      "name=%s threadState=%u wchan=0x%llx mutex=0x%llx willSleep=%u "
+                      "snapshot=%u contextSource=%s hostTid=%lld snapshotTid=%ld "
+                      "snapshotName=%s backend=0x%llx rip=0x%llx rsp=0x%llx rbp=0x%llx",
+                      reason ? reason : "<none>", status,
+                      static_cast<unsigned long long>(identity.guest_thread),
+                      guest_name.c_str(), guest_state,
+                      static_cast<unsigned long long>(guest_wchan),
+                      static_cast<unsigned long long>(guest_mutex),
+                      guest_will_sleep ? 1u : 0u,
+                      guest_snapshot_available ? 1u : 0u,
+                      context_source,
+                      static_cast<long long>(identity.host_tid),
+                      snapshot_host_tid,
+                      snapshot_host_name[0] != '\0' ? snapshot_host_name : "<unknown>",
+                      static_cast<unsigned long long>(identity.backend_thread),
+                      static_cast<unsigned long long>(context.rip),
+                      static_cast<unsigned long long>(context.gpr[4]),
+                      static_cast<unsigned long long>(context.gpr[5]));
+            if (diagnostic_file) {
+                diagnostic_file << "reason=" << (reason ? reason : "<none>")
+                                << " status=" << status
+                                << " guest=0x" << std::hex << identity.guest_thread
+                                << " name=" << guest_name
+                                << " threadState=" << std::dec << guest_state
+                                << " wchan=0x" << std::hex << guest_wchan
+                                << " mutex=0x" << guest_mutex
+                                << " willSleep=" << std::dec
+                                << (guest_will_sleep ? 1 : 0)
+                                << " snapshot="
+                                << (guest_snapshot_available ? 1 : 0)
+                                << " contextSource=" << context_source
+                                << " hostTid=" << std::dec << identity.host_tid
+                                << " snapshotTid=" << snapshot_host_tid
+                                << " snapshotName="
+                                << (snapshot_host_name[0] != '\0'
+                                        ? snapshot_host_name
+                                        : "<unknown>")
+                                << " backend=0x" << std::hex << identity.backend_thread
+                                << " rip=0x" << context.rip
+                                << " rsp=0x" << context.gpr[4]
+                                << " rbp=0x" << context.gpr[5] << '\n';
+            }
+            captured += status == LSX4_FEX_STATUS_OK ? 1 : 0;
+        }
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_FEX_THREAD_DUMP_BRIDGE] reason=%s result=no_backend",
-                  reason ? reason : "<none>");
+                  "[EXECUTOR_FEX_THREAD_DUMP_BRIDGE] reason=%s result=%d candidates=%zu",
+                  reason ? reason : "<none>", captured, identities.size());
         return;
     }
     const int count = g_box64_dump_guest_threads(reason ? reason : "<none>");
@@ -21609,20 +29554,1284 @@ extern "C" const char* executor_lsx4_runtime_abi() {
 
 extern "C" const char* executor_lsx4_runtime_version() {
     return "lsx4-native-android-shared-probe | upstream v0.15.0 | "
-           "build=lsx4-android-r233-generic-address-policy";
+           "build=lsx4-android-r250-packed-word-multiply-neon";
 }
 
 extern "C" const char* executor_lsx4_runtime_system_info() {
     return R"({"host":"android-arm64","guest":"ps4-x86_64","core":"lsx4-native","mode":"shared-library-probe"})";
 }
 
+namespace {
+
+std::string NormalizeGuestBackendTitleId(std::string_view value) {
+    if (value.size() != 9) {
+        return {};
+    }
+    std::string normalized{value};
+    for (char& character : normalized) {
+        character = static_cast<char>(std::toupper(static_cast<unsigned char>(character)));
+    }
+    const bool known_prefix = normalized.starts_with("CUSA") ||
+                              normalized.starts_with("PPSA");
+    if (!known_prefix ||
+        !std::all_of(normalized.begin() + 4, normalized.end(),
+                     [](const unsigned char character) { return std::isdigit(character); })) {
+        return {};
+    }
+    return normalized;
+}
+
+std::string NormalizeGuestBackendAxis(std::string_view value,
+                                      std::initializer_list<std::string_view> allowed,
+                                      std::string_view fallback) {
+    for (const auto candidate : allowed) {
+        if (value == candidate) {
+            return std::string{candidate};
+        }
+    }
+    return std::string{fallback};
+}
+
+std::string NormalizeGuestBackendDriverVersion(std::string_view value) {
+    std::string normalized;
+    normalized.reserve(std::min<std::size_t>(value.size(), 160));
+    for (const unsigned char character : value.substr(0, 160)) {
+        if (character >= 0x20 && character != 0x7f) {
+            normalized.push_back(static_cast<char>(character));
+        }
+    }
+    return normalized;
+}
+
+void SelectGuestOptimizationProfileLocked() {
+
+
+
+    if (Common::IsSnapdragon8Gen3Host()) {
+        g_guest_cpu_backend_hardware_profile = "adreno-750";
+    }
+
+    const bool bloodborne = g_guest_cpu_backend_launch_title_id == "CUSA03173";
+    g_guest_cpu_backend_inherited_profile = "shared-semantics-v1";
+    g_guest_cpu_backend_workload_profile = bloodborne
+                                               ? "bloodborne-heavy-render-v1"
+                                               : "generic-v1";
+    g_guest_cpu_backend_optimization_profile_eligible =
+        g_guest_cpu_backend_hardware_profile != "unknown" &&
+        g_guest_cpu_backend_driver_family != "system-unknown";
+    g_guest_cpu_backend_optimization_profile_requested = false;
+
+    if (g_guest_cpu_backend_hardware_profile == "adreno-750") {
+        g_guest_cpu_backend_device_profile = "sm8650-a750-sync-memory-v1";
+        g_guest_cpu_backend_excluded_profiles =
+            "a840-sve128,a840-turnip-completion";
+    } else if (g_guest_cpu_backend_hardware_profile == "adreno-840") {
+        g_guest_cpu_backend_device_profile = "sm8850-a840-sve128-v1";
+        g_guest_cpu_backend_excluded_profiles = "a750-sync-memory,a750-qcom-quirks";
+    } else if (g_guest_cpu_backend_hardware_profile == "mali") {
+        g_guest_cpu_backend_device_profile = "mali-portable-v1";
+        g_guest_cpu_backend_excluded_profiles =
+            "adreno-qcom-quirks,adreno-turnip-quirks";
+    } else {
+        g_guest_cpu_backend_device_profile = "portable-v1";
+        g_guest_cpu_backend_excluded_profiles =
+            "device-specific-optimizations";
+    }
+
+    if (g_guest_cpu_backend_driver_family == "qualcomm-proprietary") {
+        g_guest_cpu_backend_driver_profile = "qualcomm-proprietary-v1";
+    } else if (g_guest_cpu_backend_driver_family == "mesa-turnip") {
+        g_guest_cpu_backend_driver_profile = "mesa-turnip-v1";
+    } else if (g_guest_cpu_backend_driver_family == "arm-proprietary") {
+        g_guest_cpu_backend_driver_profile = "arm-proprietary-v1";
+    } else {
+        g_guest_cpu_backend_driver_profile = "system-unknown-v1";
+    }
+
+    g_guest_cpu_backend_optimization_profile =
+        g_guest_cpu_backend_hardware_profile + "/" +
+        g_guest_cpu_backend_driver_family + "/" +
+        (bloodborne ? std::string{"bloodborne"} : std::string{"generic"}) +
+        "/v1";
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_OPTIMIZATION_PROFILE_AXIS] profile=%s hardware=%s "
+              "driver=%s driverVersion=%s title=%s inherited=%s device=%s "
+              "driverProfile=%s workload=%s excluded=%s eligible=%d",
+              g_guest_cpu_backend_optimization_profile.c_str(),
+              g_guest_cpu_backend_hardware_profile.c_str(),
+              g_guest_cpu_backend_driver_family.c_str(),
+              g_guest_cpu_backend_driver_version.c_str(),
+              g_guest_cpu_backend_launch_title_id.c_str(),
+              g_guest_cpu_backend_inherited_profile.c_str(),
+              g_guest_cpu_backend_device_profile.c_str(),
+              g_guest_cpu_backend_driver_profile.c_str(),
+              g_guest_cpu_backend_workload_profile.c_str(),
+              g_guest_cpu_backend_excluded_profiles.c_str(),
+              g_guest_cpu_backend_optimization_profile_eligible ? 1 : 0);
+}
+
+void RefreshGuestCpuBackendStatusLocked() {
+    const auto requested =
+        g_requested_guest_backend.load(std::memory_order_acquire);
+    const auto effective =
+        g_runtime_guest_backend.load(std::memory_order_acquire);
+    const auto signal_owner =
+        g_fault_signal_owner.load(std::memory_order_acquire);
+    const auto& host_isa = Executor::Jit::GetHostIsaProfile();
+    std::ostringstream status;
+    status << "{"
+           << R"("schema":"lsx4.guest-cpu-backend.v1",)"
+           << R"("platform":"ps4",)"
+           << R"("requested":")" << Executor::GuestCpuBackendName(requested) << R"(",)"
+           << R"("effective":")" << Executor::GuestCpuBackendName(effective) << R"(",)"
+           << R"("supported":)" << (g_guest_cpu_backend_supported ? "true" : "false") << ","
+           << R"("fallbackReason":")" << JsonEscape(g_guest_cpu_backend_fallback_reason) << R"(",)"
+           << R"("adapterAbi":")" << JsonEscape(g_guest_cpu_backend_adapter_abi) << R"(",)"
+           << R"("mappedEntryAbi":")" << JsonEscape(g_guest_cpu_backend_mapped_entry_abi) << R"(",)"
+           << R"("cacheNamespace":")" << JsonEscape(g_guest_cpu_backend_cache_namespace) << R"(",)"
+           << R"("configureFlags":)" << g_guest_cpu_backend_configure_flags << ","
+           << R"("providedCapabilities":)"
+           << g_guest_cpu_backend_provided_capabilities << ","
+           << R"("requiredCapabilities":)"
+           << g_guest_cpu_backend_required_capabilities << ","
+           << R"("forbiddenCapabilities":)"
+           << g_guest_cpu_backend_forbidden_capabilities << ","
+           << R"("strongMemoryModel":")"
+           << JsonEscape(g_guest_cpu_backend_strong_memory_model) << R"(",)"
+           << R"("launchTitleId":")"
+           << JsonEscape(g_guest_cpu_backend_launch_title_id) << R"(",)"
+           << R"("hardwareProfile":")"
+           << JsonEscape(g_guest_cpu_backend_hardware_profile) << R"(",)"
+           << R"("driverFamily":")"
+           << JsonEscape(g_guest_cpu_backend_driver_family) << R"(",)"
+           << R"("driverVersion":")"
+           << JsonEscape(g_guest_cpu_backend_driver_version) << R"(",)"
+           << R"("optimizationProfile":")"
+           << JsonEscape(g_guest_cpu_backend_optimization_profile) << R"(",)"
+           << R"("inheritedProfile":")"
+           << JsonEscape(g_guest_cpu_backend_inherited_profile) << R"(",)"
+           << R"("deviceProfile":")"
+           << JsonEscape(g_guest_cpu_backend_device_profile) << R"(",)"
+           << R"("driverProfile":")"
+           << JsonEscape(g_guest_cpu_backend_driver_profile) << R"(",)"
+           << R"("workloadProfile":")"
+           << JsonEscape(g_guest_cpu_backend_workload_profile) << R"(",)"
+           << R"("excludedProfiles":")"
+           << JsonEscape(g_guest_cpu_backend_excluded_profiles) << R"(",)"
+           << R"("optimizationProfileRequested":)"
+           << (g_guest_cpu_backend_optimization_profile_requested ? "true" : "false") << ","
+           << R"("optimizationProfileEligible":)"
+           << (g_guest_cpu_backend_optimization_profile_eligible ? "true" : "false") << ","
+           << R"("faultSignalOwner":")" << FaultSignalOwnerName(signal_owner) << R"(",)"
+           << R"("hostIsaFeatures":)" << host_isa.features << ","
+           << R"("hostOsFeatures":)" << host_isa.os_features << ","
+           << R"("hostSveVectorBytes":)" << host_isa.sve_vector_bytes << ","
+           << R"("selectionLocked":)"
+           << (g_guest_cpu_backend_selection_locked.load(std::memory_order_acquire) ? "true"
+                                                                                    : "false")
+           << "}";
+    g_guest_cpu_backend_status = status.str();
+}
+
+void SelectCurrentGuestCpuBackendLocked(const char* const reason, const bool supported) {
+    g_runtime_guest_backend.store(Executor::GuestCpuBackend::Current, std::memory_order_release);
+    g_fex_persistent_rip_seed_enabled.store(false, std::memory_order_release);
+    g_guest_cpu_backend_supported = supported;
+    g_guest_cpu_backend_fallback_reason = reason ? reason : "none";
+    g_guest_cpu_backend_adapter_abi.clear();
+    g_guest_cpu_backend_mapped_entry_abi.clear();
+    g_guest_cpu_backend_cache_namespace = "current-v5";
+    g_guest_cpu_backend_configure_flags = 0;
+    g_guest_cpu_backend_provided_capabilities = 0;
+    g_guest_cpu_backend_required_capabilities = 0;
+    g_guest_cpu_backend_forbidden_capabilities = 0;
+    g_guest_cpu_backend_strong_memory_model.clear();
+    RefreshGuestCpuBackendStatusLocked();
+}
+
+void SelectStrandedFexGuestCpuBackendLocked(
+    const Executor::Fex::LoaderStatus& status,
+    const char* const fallback_reason) {
+
+
+
+
+    g_runtime_guest_backend.store(
+        Executor::GuestCpuBackend::FexExperimental, std::memory_order_release);
+    g_guest_cpu_backend_supported = false;
+    g_guest_cpu_backend_fallback_reason =
+        fallback_reason != nullptr && *fallback_reason != '\0'
+            ? fallback_reason
+            : "fex-activation-stranded-restart-required";
+    g_guest_cpu_backend_adapter_abi =
+        status.adapter_name.empty() ? std::string{} : status.adapter_name + "/v3";
+    g_guest_cpu_backend_mapped_entry_abi = "v5";
+    g_guest_cpu_backend_cache_namespace = status.cache_namespace;
+    g_guest_cpu_backend_configure_flags = status.configure_flags;
+    g_guest_cpu_backend_provided_capabilities = status.provided_capabilities;
+    g_guest_cpu_backend_required_capabilities = status.required_capabilities;
+    g_guest_cpu_backend_forbidden_capabilities = status.forbidden_capabilities;
+    g_guest_cpu_backend_strong_memory_model = status.strong_memory_model;
+    RefreshGuestCpuBackendStatusLocked();
+}
+
+bool PublishFaultSignalOwnerLocked(const FaultSignalOwner owner) {
+    FaultSignalOwner expected = FaultSignalOwner::Unselected;
+    if (g_fault_signal_owner.compare_exchange_strong(expected, owner, std::memory_order_acq_rel,
+                                                     std::memory_order_acquire)) {
+        return true;
+    }
+    return expected == owner;
+}
+
+bool ReserveFexFaultSignalOwnerLocked() {
+    FaultSignalOwner expected = FaultSignalOwner::Unselected;
+    if (g_fault_signal_owner.compare_exchange_strong(
+            expected, FaultSignalOwner::FexActivationStaged, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return true;
+    }
+    return expected == FaultSignalOwner::Fex;
+}
+
+bool ReleaseFexFaultSignalOwnerReservationLocked() {
+    FaultSignalOwner expected = FaultSignalOwner::FexActivationStaged;
+    if (g_fault_signal_owner.compare_exchange_strong(expected, FaultSignalOwner::Unselected,
+                                                     std::memory_order_acq_rel,
+                                                     std::memory_order_acquire)) {
+        return true;
+    }
+    return expected == FaultSignalOwner::Unselected;
+}
+
+bool CommitFexFaultSignalOwnerLocked() {
+    FaultSignalOwner expected = FaultSignalOwner::FexActivationStaged;
+    if (g_fault_signal_owner.compare_exchange_strong(expected, FaultSignalOwner::Fex,
+                                                     std::memory_order_acq_rel,
+                                                     std::memory_order_acquire)) {
+        return true;
+    }
+    return expected == FaultSignalOwner::Fex;
+}
+
+}
+
+namespace {
+
+std::atomic<bool> g_fex_exact_store_watch_poller_started{};
+std::atomic<bool> g_fex_guest_store_trace_poller_started{};
+
+bool FexExactStoreWatchMarkerExists() {
+    constexpr const char* markers[] = {
+        "/data/data/app.lsx4.android/files/lsx4-home/diag-fex-exact-store-watch",
+        "/data/user/0/app.lsx4.android/files/lsx4-home/diag-fex-exact-store-watch",
+
+
+        "/data/data/app.lsx4.android/files/lsx4-home/diag-pm4-resource-write-watch",
+        "/data/user/0/app.lsx4.android/files/lsx4-home/diag-pm4-resource-write-watch",
+        "/data/data/app.lsx4.android/files/lsx4-home/diag-fex-pm4-header-store-watch",
+        "/data/user/0/app.lsx4.android/files/lsx4-home/diag-fex-pm4-header-store-watch",
+    };
+    for (const char* const marker : markers) {
+        if (FILE* const file = std::fopen(marker, "rb")) {
+            std::fclose(file);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FexPm4HeaderStoreWatchMarkerExists() {
+    constexpr const char* markers[] = {
+        "/data/data/app.lsx4.android/files/lsx4-home/diag-pm4-resource-write-watch",
+        "/data/user/0/app.lsx4.android/files/lsx4-home/diag-pm4-resource-write-watch",
+        "/data/data/app.lsx4.android/files/lsx4-home/diag-fex-pm4-header-store-watch",
+        "/data/user/0/app.lsx4.android/files/lsx4-home/diag-fex-pm4-header-store-watch",
+    };
+    for (const char* const marker : markers) {
+        if (FILE* const file = std::fopen(marker, "rb")) {
+            std::fclose(file);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FexGuestStoreTraceMarkerExists() {
+    constexpr const char* markers[] = {
+        "/data/data/app.lsx4.android/files/lsx4-home/diag-fex-bloodborne-ladder",
+        "/data/user/0/app.lsx4.android/files/lsx4-home/diag-fex-bloodborne-ladder",
+    };
+    for (const char* const marker : markers) {
+        if (FILE* const file = std::fopen(marker, "rb")) {
+            std::fclose(file);
+            return true;
+        }
+    }
+    return false;
+}
+
+void StartFexGuestStoreTracePoller() {
+    bool expected = false;
+    if (!g_fex_guest_store_trace_poller_started.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+    std::thread([] {
+        FILE* const trace_file = std::fopen(
+            "/data/user/0/app.lsx4.android/files/lsx4-home/diag-fex-guest-store-trace.log",
+            "wb");
+        if (trace_file != nullptr) {
+            std::setvbuf(trace_file, nullptr, _IOLBF, 0);
+        }
+        for (;;) {
+            Executor::Fex::GuestStoreTraceHit hit{};
+            const int status = Executor::Fex::TakeGuestStoreTraceHit(hit);
+            if (status > 0) {
+                if (trace_file != nullptr) {
+                    std::fprintf(
+                        trace_file,
+                        "seq=%llu tid=%llu rip=0x%llx block=0x%llx rax=0x%llx rbx=0x%llx r8=0x%llx r9=0x%llx rsi=0x%llx rdi=0x%llx r12=0x%llx r13=0x%llx r14=0x%llx r15=0x%llx rcx=0x%llx rdx=0x%llx addr=0x%llx v0=0x%llx v1=0x%llx v2=0x%llx v3=0x%llx v4=0x%llx v5=0x%llx v6=0x%llx v7=0x%llx\n",
+                        static_cast<unsigned long long>(hit.sequence),
+                        static_cast<unsigned long long>(hit.host_tid),
+                        static_cast<unsigned long long>(hit.guest_rip),
+                        static_cast<unsigned long long>(hit.block_entry_rip),
+                        static_cast<unsigned long long>(hit.gpr_rax),
+                        static_cast<unsigned long long>(hit.gpr_rbx),
+                        static_cast<unsigned long long>(hit.gpr_r8),
+                        static_cast<unsigned long long>(hit.gpr_r9),
+                        static_cast<unsigned long long>(hit.gpr_rsi),
+                        static_cast<unsigned long long>(hit.gpr_rdi),
+                        static_cast<unsigned long long>(hit.gpr_r12),
+                        static_cast<unsigned long long>(hit.gpr_r13),
+                        static_cast<unsigned long long>(hit.gpr_r14),
+                        static_cast<unsigned long long>(hit.gpr_r15),
+                        static_cast<unsigned long long>(hit.gpr_rcx),
+                        static_cast<unsigned long long>(hit.gpr_rdx),
+                        static_cast<unsigned long long>(hit.address_base),
+                        static_cast<unsigned long long>(hit.value[0]),
+                        static_cast<unsigned long long>(hit.value[1]),
+                        static_cast<unsigned long long>(hit.value[2]),
+                        static_cast<unsigned long long>(hit.value[3]),
+                        static_cast<unsigned long long>(hit.value2[0]),
+                        static_cast<unsigned long long>(hit.value2[1]),
+                        static_cast<unsigned long long>(hit.value2[2]),
+                        static_cast<unsigned long long>(hit.value2[3]));
+                }
+                NativeLog(ANDROID_LOG_INFO,
+                          "[EXECUTOR_FEX_LIGHTING_LADDER] seq=%llu tid=%llu flags=0x%x "
+                          "rip=0x%llx block=0x%llx rbx=0x%llx r8=0x%llx "
+                          "r9=0x%llx rsi=0x%llx rdi=0x%llx r14=0x%llx "
+                          "r15=0x%llx rcx=0x%llx rdx=0x%llx "
+                          "xmm0=%016llx:%016llx xmm1=%016llx:%016llx "
+                          "xmm2=%016llx:%016llx xmm3=%016llx:%016llx "
+                          "addr=0x%llx+0x%llx value=%016llx:%016llx:%016llx:%016llx "
+                          "value2=%016llx:%016llx:%016llx:%016llx size=%u class=%u",
+                          static_cast<unsigned long long>(hit.sequence),
+                          static_cast<unsigned long long>(hit.host_tid), hit.flags,
+                          static_cast<unsigned long long>(hit.guest_rip),
+                          static_cast<unsigned long long>(hit.block_entry_rip),
+                          static_cast<unsigned long long>(hit.gpr_rbx),
+                          static_cast<unsigned long long>(hit.gpr_r8),
+                          static_cast<unsigned long long>(hit.gpr_r9),
+                          static_cast<unsigned long long>(hit.gpr_rsi),
+                          static_cast<unsigned long long>(hit.gpr_rdi),
+                          static_cast<unsigned long long>(hit.gpr_r14),
+                          static_cast<unsigned long long>(hit.gpr_r15),
+                          static_cast<unsigned long long>(hit.gpr_rcx),
+                          static_cast<unsigned long long>(hit.gpr_rdx),
+                          static_cast<unsigned long long>(hit.xmm0[1]),
+                          static_cast<unsigned long long>(hit.xmm0[0]),
+                          static_cast<unsigned long long>(hit.xmm1[1]),
+                          static_cast<unsigned long long>(hit.xmm1[0]),
+                          static_cast<unsigned long long>(hit.xmm2[1]),
+                          static_cast<unsigned long long>(hit.xmm2[0]),
+                          static_cast<unsigned long long>(hit.xmm3[1]),
+                          static_cast<unsigned long long>(hit.xmm3[0]),
+                          static_cast<unsigned long long>(hit.address_base),
+                          static_cast<unsigned long long>(hit.address_offset),
+                          static_cast<unsigned long long>(hit.value[3]),
+                          static_cast<unsigned long long>(hit.value[2]),
+                          static_cast<unsigned long long>(hit.value[1]),
+                          static_cast<unsigned long long>(hit.value[0]),
+                          static_cast<unsigned long long>(hit.value2[3]),
+                          static_cast<unsigned long long>(hit.value2[2]),
+                          static_cast<unsigned long long>(hit.value2[1]),
+                          static_cast<unsigned long long>(hit.value2[0]),
+                          hit.access_size, hit.store_class);
+                continue;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }).detach();
+}
+
+void StartFexExactStoreWatchPoller() {
+    bool expected = false;
+    if (!g_fex_exact_store_watch_poller_started.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+    std::thread([] {
+        for (;;) {
+            Executor::Fex::ExactStoreWatchHit hit{};
+            const int status = Executor::Fex::TakeExactStoreWatchHit(hit);
+            if (status > 0) {
+                NativeLog(ANDROID_LOG_INFO,
+                          "[EXECUTOR_FEX_EXACT_STORE_WATCH] seq=%u "
+                          "guestRip=0x%llx addr=0x%llx size=%u",
+                          hit.sequence,
+                          static_cast<unsigned long long>(hit.guest_rip),
+                          static_cast<unsigned long long>(
+                              hit.effective_address),
+                          hit.access_size);
+                continue;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }).detach();
+}
+
+bool EnableFexExactStoreWatchFromMarker() {
+    if (!FexExactStoreWatchMarkerExists()) {
+        return false;
+    }
+
+
+
+
+    constexpr std::uint64_t kPm4DiagnosticBegin = UINT64_C(0x300000000);
+    constexpr std::uint64_t kPm4DiagnosticEnd = UINT64_C(0x310000000);
+    const bool pm4_header_watch = FexPm4HeaderStoreWatchMarkerExists();
+    std::uint64_t begin = pm4_header_watch ? kPm4DiagnosticBegin : 0;
+    std::uint64_t end = pm4_header_watch ? kPm4DiagnosticEnd : 0;
+    if (!pm4_header_watch) {
+        constexpr const char* range_markers[] = {
+            "/data/data/app.lsx4.android/files/lsx4-home/diag-fex-exact-store-watch",
+            "/data/user/0/app.lsx4.android/files/lsx4-home/diag-fex-exact-store-watch",
+        };
+        for (const char* const marker : range_markers) {
+            if (FILE* const file = std::fopen(marker, "rb")) {
+                unsigned long long parsed_begin = 0;
+                unsigned long long parsed_end = 0;
+                if (std::fscanf(file, "%llx %llx", &parsed_begin,
+                                &parsed_end) == 2 &&
+                    parsed_begin != 0 && parsed_end > parsed_begin) {
+                    begin = static_cast<std::uint64_t>(parsed_begin);
+                    end = static_cast<std::uint64_t>(parsed_end);
+                }
+                std::fclose(file);
+                break;
+            }
+        }
+    }
+    const bool has_startup_range = begin != 0 && end > begin;
+    const std::uint32_t flags =
+        Executor::Fex::ExactStoreWatchEnableInstrumentation |
+        Executor::Fex::ExactStoreWatchClearHit |
+        (has_startup_range ? Executor::Fex::ExactStoreWatchArmRange : 0);
+    const bool enabled =
+        Executor::Fex::ConfigureExactStoreWatch(begin, end, flags);
+    NativeLog(enabled ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR,
+              "[EXECUTOR_FEX_EXACT_STORE_WATCH_ENABLE] marker=1 result=%s "
+              "mode=%s begin=0x%llx end=0x%llx",
+              enabled ? "ok" : "failed",
+              pm4_header_watch ? "pm4-gpu-va-arena"
+                               : (has_startup_range ? "marker-range"
+                                                    : "runtime-range"),
+              static_cast<unsigned long long>(begin),
+              static_cast<unsigned long long>(end));
+    if (enabled) {
+        StartFexExactStoreWatchPoller();
+    }
+    return enabled;
+}
+
+}
+
+extern "C" bool executor_lsx4_android_fex_exact_store_watch_arm(
+    const std::uint64_t begin, const std::uint64_t end) {
+    if (!FexExactStoreWatchMarkerExists()) {
+        return false;
+    }
+    return Executor::Fex::ConfigureExactStoreWatch(
+        begin, end, Executor::Fex::ExactStoreWatchArmRange);
+}
+
+extern "C" int executor_lsx4_android_fex_exact_store_watch_take(
+    Executor::Fex::ExactStoreWatchHit* const hit) {
+    if (hit == nullptr || !FexExactStoreWatchMarkerExists()) {
+        return -1;
+    }
+    return Executor::Fex::TakeExactStoreWatchHit(*hit);
+}
+
+extern "C" int executor_lsx4_runtime_set_vulkan_driver_axis(
+    const int requested_turnip, const char* const native_library_dir,
+    const char* const report_path, const char* const turnip_sha256) {
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    return Vulkan::DriverAxis::Configure(requested_turnip != 0, native_library_dir,
+                                         native_library_dir, report_path, turnip_sha256);
+#else
+    return 0;
+#endif
+}
+
+extern "C" int executor_lsx4_runtime_set_vulkan_driver_axis_v2(
+    const int requested_turnip, const char* const native_library_dir,
+    const char* const turnip_library_dir, const char* const report_path,
+    const char* const turnip_sha256) {
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    return Vulkan::DriverAxis::Configure(requested_turnip != 0, native_library_dir,
+                                         turnip_library_dir, report_path, turnip_sha256);
+#else
+    return 0;
+#endif
+}
+
+extern "C" const char* executor_lsx4_runtime_probe_vulkan_driver_axis_v2(
+    const int requested_turnip, const char* const native_library_dir,
+    const char* const turnip_library_dir, const char* const report_path,
+    const char* const turnip_sha256) {
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    Vulkan::DriverAxis::Configure(requested_turnip != 0, native_library_dir,
+                                  turnip_library_dir, report_path, turnip_sha256);
+
+
+
+    static void* system_vulkan = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+    const auto system_gipa = system_vulkan == nullptr
+                                 ? nullptr
+                                 : reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+                                       dlsym(system_vulkan, "vkGetInstanceProcAddr"));
+    Vulkan::DriverAxis::SelectGetInstanceProcAddr(system_gipa, true);
+    return Vulkan::DriverAxis::StatusJson();
+#else
+    return R"({"schema":"lsx4.vulkan-driver-axis.v1","requested":"turnip","effective":"system","fallbackReason":"historical-funnel","selectionLocked":true})";
+#endif
+}
+
+extern "C" const char* executor_lsx4_runtime_vulkan_driver_status() {
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    return Vulkan::DriverAxis::StatusJson();
+#else
+    return R"({"schema":"lsx4.vulkan-driver-axis.v1","requested":"system","effective":"system","fallbackReason":"historical-funnel"})";
+#endif
+}
+
+int SetGuestCpuBackend(const int requested_backend, const char* const adapter_path,
+                       const char* const runtime_root, const char* const launch_title_id,
+                       const char* const hardware_profile,
+                       const char* const driver_family,
+                       const char* const driver_version) {
+    const auto requested = Executor::SanitizeGuestCpuBackend(requested_backend);
+    std::lock_guard lock(g_lock);
+    g_requested_guest_backend.store(requested, std::memory_order_release);
+    const std::filesystem::path root = runtime_root ? runtime_root : "";
+    std::string cpu_tuning_error;
+    if (root.empty() || !Executor::CpuTuning::ConfigureFromRuntimeRoot(
+                            root, &cpu_tuning_error)) {
+        auto fallback_profile = Executor::CpuTuning::PresetProfile(
+            Executor::CpuTuning::Preset::Balanced);
+        Executor::CpuTuning::ResolveAutomaticRuntimePolicy(fallback_profile);
+        Executor::CpuTuning::SetForTesting(fallback_profile);
+        NativeLog(ANDROID_LOG_WARN,
+                  "[EXECUTOR_CPU_TUNING] source=default reason=%s root=%s",
+                  cpu_tuning_error.empty() ? "missing-runtime-root"
+                                           : cpu_tuning_error.c_str(),
+                  root.string().c_str());
+    } else {
+        const auto profile = Executor::CpuTuning::Get();
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_CPU_TUNING] source=android-v1 identity=0x%llx "
+                  "preset=%u execution=%u memory=%u scheduler=%u clock=%u",
+                  static_cast<unsigned long long>(profile.identity),
+                  static_cast<unsigned>(profile.preset),
+                  static_cast<unsigned>(profile.execution_mode),
+                  static_cast<unsigned>(profile.memory_manager),
+                  static_cast<unsigned>(profile.scheduler),
+                  profile.guest_clock_percent);
+    }
+    const auto effective_cpu_profile = Executor::CpuTuning::Get();
+    Common::ConfigureAndroidThreadScheduler(
+        static_cast<std::uint32_t>(effective_cpu_profile.scheduler),
+        effective_cpu_profile.preferred_heavy_threads);
+    Common::ConfigureCpuTuningPolicy({
+        .function_replacements = static_cast<std::uint32_t>(
+            effective_cpu_profile.function_replacements),
+        .guest_clock_percent = effective_cpu_profile.guest_clock_percent,
+        .cycle_skip = static_cast<std::uint32_t>(effective_cpu_profile.cycle_skip),
+        .idle_loop_skip = static_cast<std::uint32_t>(effective_cpu_profile.idle_loop_skip),
+        .wait_loop_detection = static_cast<std::uint32_t>(
+            effective_cpu_profile.wait_loop_detection),
+        .spin_loop_detection = static_cast<std::uint32_t>(
+            effective_cpu_profile.spin_loop_detection),
+        .fast_event_timing = effective_cpu_profile.fast_event_timing,
+        .accurate_dma_timing = effective_cpu_profile.accurate_dma_timing,
+        .memory_exceptions = effective_cpu_profile.memory_exceptions,
+        .ignore_bad_accesses = effective_cpu_profile.ignore_bad_accesses,
+        .cpu_gpu_dual_thread = effective_cpu_profile.cpu_gpu_dual_thread,
+        .subsystem_multithreading = effective_cpu_profile.subsystem_multithreading,
+        .separate_io_thread = effective_cpu_profile.separate_io_thread,
+        .separate_audio_hle_thread = effective_cpu_profile.separate_audio_hle_thread,
+        .sync_on_idle_skip = effective_cpu_profile.sync_on_idle_skip,
+        .cpu_gpu_sync = static_cast<std::uint32_t>(effective_cpu_profile.cpu_gpu_sync),
+        .force_real_clock_sync = effective_cpu_profile.force_real_clock_sync,
+        .hle_mode = static_cast<std::uint32_t>(effective_cpu_profile.hle_mode),
+        .hle_fast_timers = effective_cpu_profile.hle_fast_timers,
+    });
+    Executor::Jit::ConfigureFastGuestMemory(
+        effective_cpu_profile.fast_memory !=
+            Executor::CpuTuning::FastMemoryMode::Safe &&
+        effective_cpu_profile.memory_manager !=
+            Executor::CpuTuning::MemoryManagerMode::Software &&
+        effective_cpu_profile.memory_manager !=
+            Executor::CpuTuning::MemoryManagerMode::HostMappedSafe &&
+        effective_cpu_profile.atomics !=
+            Executor::CpuTuning::AtomicMode::Strict &&
+        effective_cpu_profile.accurate_cache_line_stores == 0);
+    Executor::Jit::ConfigureRelaxedFpFusion(
+        effective_cpu_profile.fp_accuracy ==
+        Executor::CpuTuning::FpAccuracyMode::Relaxed);
+    Executor::Jit::ConfigureGuestSpinWaitEvent(
+        effective_cpu_profile.wait_loop_detection !=
+        Executor::CpuTuning::Aggressiveness::Off);
+    Executor::Jit::ConfigureHostFeatureDisableMask(
+        Executor::CpuTuning::EffectiveJitDisableMask(effective_cpu_profile));
+    if (effective_cpu_profile.execution_mode ==
+            Executor::CpuTuning::ExecutionMode::CachedInterpreter ||
+        effective_cpu_profile.execution_mode ==
+            Executor::CpuTuning::ExecutionMode::Interpreter) {
+        Executor::Jit::ConfigureTieredJit(false, false);
+    }
+    g_guest_cpu_backend_launch_title_id = NormalizeGuestBackendTitleId(
+        launch_title_id != nullptr ? std::string_view{launch_title_id} : std::string_view{});
+    g_guest_cpu_backend_hardware_profile = NormalizeGuestBackendAxis(
+        hardware_profile != nullptr ? std::string_view{hardware_profile} : std::string_view{},
+        {"adreno-750", "adreno-840", "mali"}, "unknown");
+    g_guest_cpu_backend_driver_family = NormalizeGuestBackendAxis(
+        driver_family != nullptr ? std::string_view{driver_family} : std::string_view{},
+        {"qualcomm-proprietary", "mesa-turnip", "arm-proprietary"},
+        "system-unknown");
+    g_guest_cpu_backend_driver_version = NormalizeGuestBackendDriverVersion(
+        driver_version != nullptr ? std::string_view{driver_version} : std::string_view{});
+    SelectGuestOptimizationProfileLocked();
+
+    const auto entry_loader_status = Executor::Fex::Status();
+    if (entry_loader_status.state ==
+        Executor::Fex::LoaderState::ActivationStranded) {
+        SelectStrandedFexGuestCpuBackendLocked(
+            entry_loader_status,
+            entry_loader_status.error.empty()
+                ? "fex-activation-stranded-restart-required"
+                : entry_loader_status.error.c_str());
+        return static_cast<int>(Executor::GuestCpuBackend::FexExperimental);
+    }
+
+    const auto effective = g_runtime_guest_backend.load(std::memory_order_acquire);
+    if (g_guest_cpu_backend_selection_locked.load(std::memory_order_acquire)) {
+        if (requested != effective) {
+            g_guest_cpu_backend_supported = false;
+            g_guest_cpu_backend_fallback_reason = "late-change";
+        }
+        RefreshGuestCpuBackendStatusLocked();
+        return static_cast<int>(effective);
+    }
+
+    if (requested == Executor::GuestCpuBackend::Current) {
+        SelectCurrentGuestCpuBackendLocked("none", true);
+        return static_cast<int>(Executor::GuestCpuBackend::Current);
+    }
+
+    const std::filesystem::path adapter = adapter_path ? adapter_path : "";
+    if (adapter.empty() || !std::filesystem::is_regular_file(adapter)) {
+        SelectCurrentGuestCpuBackendLocked("adapter-missing", false);
+        return static_cast<int>(Executor::GuestCpuBackend::Current);
+    }
+    if (root.empty()) {
+        SelectCurrentGuestCpuBackendLocked("invalid-request", false);
+        return static_cast<int>(Executor::GuestCpuBackend::Current);
+    }
+
+    Executor::Fex::PreflightRequest preflight{};
+    const auto cpu_profile = Executor::CpuTuning::Get();
+    preflight.cpu_tuning = {
+        .struct_size = sizeof(Lsx4FexCpuTuningV1),
+        .abi_version = LSX4_FEX_CPU_TUNING_ABI_V1,
+        .preset = static_cast<std::uint32_t>(cpu_profile.preset),
+        .execution_mode = static_cast<std::uint32_t>(cpu_profile.execution_mode),
+        .fast_memory = static_cast<std::uint32_t>(cpu_profile.fast_memory),
+        .memory_manager = static_cast<std::uint32_t>(cpu_profile.memory_manager),
+        .block_linking = cpu_profile.block_linking,
+        .persistent_cache = static_cast<std::uint32_t>(cpu_profile.persistent_cache),
+        .function_replacements = static_cast<std::uint32_t>(cpu_profile.function_replacements),
+        .guest_clock_percent = cpu_profile.guest_clock_percent,
+        .cycle_skip = static_cast<std::uint32_t>(cpu_profile.cycle_skip),
+        .idle_loop_skip = static_cast<std::uint32_t>(cpu_profile.idle_loop_skip),
+        .wait_loop_detection = static_cast<std::uint32_t>(cpu_profile.wait_loop_detection),
+        .spin_loop_detection = static_cast<std::uint32_t>(cpu_profile.spin_loop_detection),
+        .max_guest_workers = cpu_profile.max_guest_workers,
+        .fast_event_timing = cpu_profile.fast_event_timing,
+        .jit_block_size = static_cast<std::uint32_t>(cpu_profile.jit_block_size),
+        .fp_accuracy = static_cast<std::uint32_t>(cpu_profile.fp_accuracy),
+        .atomics = static_cast<std::uint32_t>(cpu_profile.atomics),
+        .accurate_cache_line_stores = cpu_profile.accurate_cache_line_stores,
+        .accurate_dma_timing = cpu_profile.accurate_dma_timing,
+        .memory_exceptions = cpu_profile.memory_exceptions,
+        .icache_accuracy = cpu_profile.icache_accuracy,
+        .ignore_bad_accesses = cpu_profile.ignore_bad_accesses,
+        .jit_feature_mask = static_cast<std::uint32_t>(cpu_profile.jit_feature_mask),
+        .jit_disable_mask = cpu_profile.jit_disable_mask,
+        .cpu_gpu_dual_thread = cpu_profile.cpu_gpu_dual_thread,
+        .scheduler = static_cast<std::uint32_t>(cpu_profile.scheduler),
+        .preferred_heavy_threads = cpu_profile.preferred_heavy_threads,
+        .subsystem_multithreading = cpu_profile.subsystem_multithreading,
+        .separate_io_thread = cpu_profile.separate_io_thread,
+        .separate_audio_hle_thread = cpu_profile.separate_audio_hle_thread,
+        .guest_thread_delay_mode = cpu_profile.guest_thread_delay_mode,
+        .guest_thread_delay_us = cpu_profile.guest_thread_delay_us,
+        .sync_on_idle_skip = cpu_profile.sync_on_idle_skip,
+        .cpu_gpu_sync = static_cast<std::uint32_t>(cpu_profile.cpu_gpu_sync),
+        .force_real_clock_sync = cpu_profile.force_real_clock_sync,
+        .hle_mode = static_cast<std::uint32_t>(cpu_profile.hle_mode),
+        .hle_fast_timers = cpu_profile.hle_fast_timers,
+        .per_game_profile = cpu_profile.per_game_profile,
+        .auto_game_db = cpu_profile.auto_game_db,
+        .reserved0 = 0,
+        .identity = cpu_profile.identity,
+    };
+
+
+
+
+
+    const auto full_smc_validation_marker =
+        root / "run-enable-fex-full-smc-validation-ab";
+    const bool full_smc_validation_requested =
+        std::filesystem::is_regular_file(full_smc_validation_marker);
+    if (full_smc_validation_requested) {
+        preflight.cpu_tuning.icache_accuracy = 1;
+        auto diagnostic_profile = cpu_profile;
+        diagnostic_profile.icache_accuracy = 1;
+        diagnostic_profile.identity =
+            Executor::CpuTuning::HashProfile(diagnostic_profile);
+        preflight.cpu_tuning.identity = diagnostic_profile.identity;
+    }
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_FULL_SMC_AB] requested=%d icacheAccuracy=%u "
+              "marker=%s",
+              full_smc_validation_requested ? 1 : 0,
+              preflight.cpu_tuning.icache_accuracy,
+              full_smc_validation_marker.string().c_str());
+    preflight.adapter_path = adapter.string();
+    preflight.runtime_root = root.string();
+    preflight.host_build_id = ExecutorNativeBuildMarker;
+    preflight.platform_mask = LSX4_FEX_PLATFORM_PS4;
+    if (!Executor::Jit::HostFlagMEnabled()) {
+        preflight.host_isa_feature_mask &=
+            ~(LSX4_FEX_HOST_ISA_FLAGM | LSX4_FEX_HOST_ISA_FLAGM2);
+    }
+    if (!Executor::Jit::HostRcpcEnabled()) {
+        preflight.host_isa_feature_mask &=
+            ~(LSX4_FEX_HOST_ISA_LRCPC | LSX4_FEX_HOST_ISA_ILRCPC |
+              LSX4_FEX_HOST_ISA_LRCPC3);
+    }
+    const std::uint64_t cpu_disabled_isa =
+        Executor::CpuTuning::EffectiveJitDisableMask(cpu_profile);
+    preflight.host_isa_feature_mask &= ~cpu_disabled_isa;
+
+
+
+
+
+    const auto disable_fex_lse_atomics_marker =
+        root / "run-disable-fex-lse-atomics-ab";
+    const bool disable_fex_lse_atomics_requested =
+        std::filesystem::is_regular_file(disable_fex_lse_atomics_marker);
+    if (disable_fex_lse_atomics_requested) {
+        preflight.host_isa_feature_mask &= ~LSX4_FEX_HOST_ISA_LSE;
+    }
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_LSE_ATOMICS_AB] requested=%d lseAllowed=%d "
+              "memoryModel=strict marker=%s",
+              disable_fex_lse_atomics_requested ? 1 : 0,
+              (preflight.host_isa_feature_mask & LSX4_FEX_HOST_ISA_LSE) != 0
+                  ? 1
+                  : 0,
+              disable_fex_lse_atomics_marker.string().c_str());
+    if ((cpu_disabled_isa &
+         (LSX4_FEX_HOST_ISA_SVE | LSX4_FEX_HOST_ISA_SVE2)) != 0) {
+        preflight.host_os_feature_mask &= ~LSX4_FEX_HOST_OS_SVE_CONTEXT;
+        preflight.max_sve_vector_bytes = 0;
+    }
+
+
+
+
+    if (!Executor::Jit::HostSve2EnabledForWidth(16)) {
+        preflight.host_isa_feature_mask &=
+            ~(LSX4_FEX_HOST_ISA_SVE | LSX4_FEX_HOST_ISA_SVE2);
+        preflight.host_os_feature_mask &= ~LSX4_FEX_HOST_OS_SVE_CONTEXT;
+        preflight.max_sve_vector_bytes = 0;
+    } else {
+        preflight.max_sve_vector_bytes =
+            Executor::Jit::GetHostIsaProfile().sve_vector_bytes;
+    }
+    constexpr std::uint64_t sm8650_extended_fex_isa =
+        LSX4_FEX_HOST_ISA_FCMA | LSX4_FEX_HOST_ISA_FRINTTS |
+        LSX4_FEX_HOST_ISA_ECV;
+    const bool sm8650_extended_fex_isa_requested = std::filesystem::is_regular_file(
+        root / "run-enable-sm8650-fex-extended-isa-ab");
+    const bool sm8650_extended_fex_isa_enabled =
+        (Common::IsSnapdragon8Gen3Host() &&
+         sm8650_extended_fex_isa_requested);
+    if (!sm8650_extended_fex_isa_enabled) {
+        preflight.host_isa_feature_mask &= ~sm8650_extended_fex_isa;
+    }
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_SM8650_CODEGEN_ISA] exactSm8650=%d "
+              "extendedMask=0x%llx requested=%d enabled=%d",
+              Common::IsSnapdragon8Gen3Host() ? 1 : 0,
+              static_cast<unsigned long long>(sm8650_extended_fex_isa),
+              sm8650_extended_fex_isa_requested ? 1 : 0,
+              sm8650_extended_fex_isa_enabled ? 1 : 0);
+    const bool fex_rpres_requested = std::filesystem::is_regular_file(
+        root / "run-enable-fex-rpres-codegen-ab");
+    const bool fex_rpres_supported = Executor::Jit::GetHostIsaProfile().Has(
+        Executor::Jit::HostIsaFeature::Rpres);
+    const bool fex_rpres_enabled = fex_rpres_requested && fex_rpres_supported;
+    if (!fex_rpres_enabled) {
+        preflight.host_isa_feature_mask &= ~LSX4_FEX_HOST_ISA_RPRES;
+    }
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_RPRES_CODEGEN] requested=%d supported=%d "
+              "enabled=%d defaultOff=1",
+              fex_rpres_requested ? 1 : 0, fex_rpres_supported ? 1 : 0,
+              fex_rpres_enabled ? 1 : 0);
+    const bool proof_metrics_static = std::filesystem::is_regular_file(
+        root / "diag-fex-proof-metrics-static");
+    const bool proof_metrics_dynamic = std::filesystem::is_regular_file(
+        root / "diag-fex-proof-metrics-dynamic");
+    if (proof_metrics_static && proof_metrics_dynamic) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_PROOF_METRICS] requested=conflict "
+                  "effective=disabled reason=two-markers");
+        SelectCurrentGuestCpuBackendLocked(
+            "fex-proof-metrics-markers-conflict", false);
+        return static_cast<int>(Executor::GuestCpuBackend::Current);
+    }
+    const char* const proof_metrics_mode =
+        proof_metrics_dynamic ? "dynamic" : (proof_metrics_static ? "static" : nullptr);
+    const int proof_metrics_env_status =
+        proof_metrics_mode != nullptr
+            ? ::setenv("LSX4_FEX2608_DIAG_PROOF_METRICS", proof_metrics_mode, 1)
+            : ::unsetenv("LSX4_FEX2608_DIAG_PROOF_METRICS");
+    if (proof_metrics_env_status != 0) {
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_FEX_PROOF_METRICS] requested=%s "
+                  "effective=unknown setenvErrno=%d",
+                  proof_metrics_mode != nullptr ? proof_metrics_mode : "disabled", errno);
+        SelectCurrentGuestCpuBackendLocked(
+            "fex-proof-metrics-environment-failed", false);
+        return static_cast<int>(Executor::GuestCpuBackend::Current);
+    }
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_PROOF_METRICS] requested=%s effective=%s "
+              "productionEligible=%d",
+              proof_metrics_mode != nullptr ? proof_metrics_mode : "disabled",
+              proof_metrics_mode != nullptr ? proof_metrics_mode : "disabled",
+              proof_metrics_mode == nullptr ? 1 : 0);
+    const bool legacy_relax_vector_tso_marker = std::filesystem::is_regular_file(
+        root / "run-enable-fex-relaxed-vector-tso-ab");
+    const bool legacy_relax_memcpy_tso_marker = std::filesystem::is_regular_file(
+        root / "run-enable-fex-relaxed-memcpyset-tso-ab");
+    const bool sm8650_gamehub_stable_memory_requested =
+        std::filesystem::is_regular_file(
+            root / "run-sm8650-fex-gamehub-stable-memory-ab");
+    const bool cpu_fast_atomics =
+        cpu_profile.atomics == Executor::CpuTuning::AtomicMode::Fast &&
+        cpu_profile.accurate_cache_line_stores == 0;
+    if (cpu_fast_atomics) {
+        preflight.configure_flags |=
+            LSX4_FEX_CONFIG_RELAX_VECTOR_TSO_AB |
+            LSX4_FEX_CONFIG_RELAX_MEMCPY_SET_TSO_AB;
+    }
+    const char* const memory_model_ab_mode =
+        cpu_fast_atomics ? "cpu-profile-fast" : "cpu-profile-strong";
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_MEMORY_MODEL_AB] mode=%s flags=0x%x "
+              "strongExpected=%d exactSm8650=%d requestedStable=%d",
+              memory_model_ab_mode, preflight.configure_flags,
+              preflight.configure_flags == 0 ? 1 : 0,
+              Common::IsSnapdragon8Gen3Host() ? 1 : 0,
+              sm8650_gamehub_stable_memory_requested ? 1 : 0);
+    if (sm8650_gamehub_stable_memory_requested) {
+        NativeLog(ANDROID_LOG_WARN,
+                  "[EXECUTOR_FEX_MEMORY_MODEL_AB] legacyStableMarkerIgnored=1 "
+                  "reason=cpu-profile-authoritative");
+    }
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_LEGACY_MEMORY_MARKERS] vector=%d memcpy=%d "
+              "authoritative=cpu-profile",
+              legacy_relax_vector_tso_marker ? 1 : 0,
+              legacy_relax_memcpy_tso_marker ? 1 : 0);
+
+
+    const bool exact_multiblock_requested = cpu_profile.block_linking != 0;
+    if (exact_multiblock_requested) {
+        preflight.configure_flags |= LSX4_FEX_CONFIG_EXACT_MULTIBLOCK_AB;
+    }
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_EXACT_MULTIBLOCK] requested=%d configured=%d "
+              "metadata=immutable-v1 source=cpu-profile",
+              exact_multiblock_requested ? 1 : 0,
+              (preflight.configure_flags &
+               LSX4_FEX_CONFIG_EXACT_MULTIBLOCK_AB) != 0
+                  ? 1
+                  : 0);
+
+
+
+    const auto persistent_rip_seed_marker =
+        root / "run-enable-fex-persistent-rip-seed";
+    const bool persistent_rip_seed_requested =
+        cpu_profile.persistent_cache !=
+            Executor::CpuTuning::PersistentCacheMode::Off &&
+        std::filesystem::is_regular_file(persistent_rip_seed_marker);
+    if (persistent_rip_seed_requested) {
+        preflight.configure_flags |=
+            LSX4_FEX_CONFIG_PERSISTENT_RIP_SEED_AB;
+    }
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_PERSISTENT_RIP_SEED] requested=%d configured=%d "
+              "nativeCodePersisted=0 currentGuestBytesRecompiled=1 "
+              "source=explicit-default-off-marker marker=%s",
+              persistent_rip_seed_requested ? 1 : 0,
+              (preflight.configure_flags &
+               LSX4_FEX_CONFIG_PERSISTENT_RIP_SEED_AB) != 0
+                  ? 1
+                  : 0,
+              persistent_rip_seed_marker.string().c_str());
+
+
+
+
+
+
+    const auto enable_terminal_thunk_dynamic_reg_elision_marker =
+        root / "run-enable-fex-terminal-thunk-dynamic-reg-elision";
+    const bool terminal_thunk_dynamic_reg_elision_requested =
+        std::filesystem::is_regular_file(
+            enable_terminal_thunk_dynamic_reg_elision_marker);
+    const bool preserve_terminal_thunk_dynamic_regs =
+        !terminal_thunk_dynamic_reg_elision_requested;
+    if (preserve_terminal_thunk_dynamic_regs) {
+        preflight.configure_flags |=
+            LSX4_FEX_CONFIG_PRESERVE_TERMINAL_THUNK_DYNAMIC_REGS_AB;
+    }
+    NativeLog(
+        ANDROID_LOG_INFO,
+        "[EXECUTOR_FEX_TERMINAL_THUNK_DYNAMIC_REGS] preserve=%d elide=%d "
+        "scope=generic-safe-default source=%s marker=%s",
+        preserve_terminal_thunk_dynamic_regs ? 1 : 0,
+        preserve_terminal_thunk_dynamic_regs ? 0 : 1,
+        terminal_thunk_dynamic_reg_elision_requested
+            ? "explicit-experimental-opt-in"
+            : "abi-correctness-default",
+        enable_terminal_thunk_dynamic_reg_elision_marker.string().c_str());
+    const auto preserve_typed_time_common_frame_marker =
+        root / "run-preserve-fex-typed-time-common-frame";
+    const bool preserve_typed_time_common_frame =
+        std::filesystem::is_regular_file(
+            preserve_typed_time_common_frame_marker);
+    if (preserve_typed_time_common_frame) {
+        preflight.configure_flags |=
+            LSX4_FEX_CONFIG_PRESERVE_TYPED_TIME_COMMON_FRAME_AB;
+    }
+    NativeLog(
+        ANDROID_LOG_INFO,
+        "[EXECUTOR_FEX_TYPED_TIME_COMMON_FRAME] preserve=%d outline=%d "
+        "scope=exact-typed-time marker=%s",
+        preserve_typed_time_common_frame ? 1 : 0,
+        preserve_typed_time_common_frame ? 0 : 1,
+        preserve_typed_time_common_frame_marker.string().c_str());
+    const auto preserve_zero_deferred_promotion_rmw_marker =
+        root / "run-preserve-fex-zero-deferred-promotion-rmw";
+    const bool preserve_zero_deferred_promotion_rmw =
+        std::filesystem::is_regular_file(
+            preserve_zero_deferred_promotion_rmw_marker);
+    if (preserve_zero_deferred_promotion_rmw) {
+        preflight.configure_flags |=
+            LSX4_FEX_CONFIG_PRESERVE_ZERO_DEFERRED_PROMOTION_RMW_AB;
+    }
+    NativeLog(
+        ANDROID_LOG_INFO,
+        "[EXECUTOR_FEX_ZERO_DEFERRED_PROMOTION_RMW] preserve=%d skipZero=%d "
+        "nonzeroCounterExact=1 marker=%s",
+        preserve_zero_deferred_promotion_rmw ? 1 : 0,
+        preserve_zero_deferred_promotion_rmw ? 0 : 1,
+        preserve_zero_deferred_promotion_rmw_marker.string().c_str());
+    const auto preserve_hle_dispatch_exclusive_lock_marker =
+        root / "run-preserve-fex-hle-dispatch-exclusive-lock";
+    const bool hle_dispatch_shared_lock_eligible =
+        g_guest_cpu_backend_hardware_profile == "adreno-840" &&
+        Common::IsSnapdragon8Gen5Host();
+    const bool preserve_hle_dispatch_exclusive_lock =
+        hle_dispatch_shared_lock_eligible && std::filesystem::is_regular_file(
+                                                 preserve_hle_dispatch_exclusive_lock_marker);
+    const bool hle_dispatch_shared_lock_enabled =
+        hle_dispatch_shared_lock_eligible &&
+        !preserve_hle_dispatch_exclusive_lock;
+    const int hle_dispatch_lock_env_status =
+        hle_dispatch_shared_lock_enabled
+            ? ::setenv("EXECUTOR_FEX_HLE_DISPATCH_SHARED_LOCK", "1", 1)
+            : ::unsetenv("EXECUTOR_FEX_HLE_DISPATCH_SHARED_LOCK");
+    NativeLog(
+        hle_dispatch_lock_env_status == 0 ? ANDROID_LOG_INFO
+                                          : ANDROID_LOG_ERROR,
+        "[EXECUTOR_FEX_HLE_DISPATCH_LOCK] eligible=%d shared=%d preserve=%d "
+        "scope=sm8850-a840 signalMutators=exclusive envStatus=%d marker=%s",
+        hle_dispatch_shared_lock_eligible ? 1 : 0,
+        hle_dispatch_shared_lock_enabled ? 1 : 0,
+        preserve_hle_dispatch_exclusive_lock ? 1 : 0,
+        hle_dispatch_lock_env_status,
+        preserve_hle_dispatch_exclusive_lock_marker.string().c_str());
+    const auto preserve_hle_global_state_lock_marker =
+        root / "run-preserve-fex-hle-global-state-lock";
+    const bool preserve_hle_global_state_lock =
+        hle_dispatch_shared_lock_enabled && std::filesystem::is_regular_file(
+                                                preserve_hle_global_state_lock_marker);
+    const bool hle_per_thread_state_lock_enabled =
+        hle_dispatch_shared_lock_enabled && !preserve_hle_global_state_lock;
+    const int hle_per_thread_state_lock_env_status =
+        hle_per_thread_state_lock_enabled
+            ? ::setenv("EXECUTOR_FEX_HLE_PER_THREAD_STATE_LOCK", "1", 1)
+            : ::unsetenv("EXECUTOR_FEX_HLE_PER_THREAD_STATE_LOCK");
+    NativeLog(
+        hle_per_thread_state_lock_env_status == 0 ? ANDROID_LOG_INFO
+                                                  : ANDROID_LOG_ERROR,
+        "[EXECUTOR_FEX_HLE_STATE_LOCK] eligible=%d perThread=%d preserveGlobal=%d "
+        "scope=sm8850-a840 setMutation=global-then-target envStatus=%d marker=%s",
+        hle_dispatch_shared_lock_enabled ? 1 : 0,
+        hle_per_thread_state_lock_enabled ? 1 : 0,
+        preserve_hle_global_state_lock ? 1 : 0,
+        hle_per_thread_state_lock_env_status,
+        preserve_hle_global_state_lock_marker.string().c_str());
+    const auto preserve_hle_target_mutex_marker =
+        root / "run-preserve-fex-hle-target-mutex";
+    const bool preserve_hle_target_mutex =
+        hle_per_thread_state_lock_enabled && std::filesystem::is_regular_file(
+                                                 preserve_hle_target_mutex_marker);
+    const bool hle_atomic_state_enabled =
+        hle_per_thread_state_lock_enabled && !preserve_hle_target_mutex;
+    const int hle_atomic_state_env_status =
+        hle_atomic_state_enabled
+            ? ::setenv("EXECUTOR_FEX_HLE_ATOMIC_STATE", "1", 1)
+            : ::unsetenv("EXECUTOR_FEX_HLE_ATOMIC_STATE");
+    NativeLog(
+        hle_atomic_state_env_status == 0 ? ANDROID_LOG_INFO
+                                         : ANDROID_LOG_ERROR,
+        "[EXECUTOR_FEX_HLE_ATOMIC_STATE] eligible=%d atomic=%d preserveMutex=%d "
+        "scope=sm8850-a840 canonicalSet=exclusive envStatus=%d marker=%s",
+        hle_per_thread_state_lock_enabled ? 1 : 0,
+        hle_atomic_state_enabled ? 1 : 0,
+        preserve_hle_target_mutex ? 1 : 0,
+        hle_atomic_state_env_status,
+        preserve_hle_target_mutex_marker.string().c_str());
+    const auto preserve_hle_pending_set_lookup_marker =
+        root / "run-preserve-fex-hle-pending-set-lookup";
+    const bool preserve_hle_pending_set_lookup =
+        hle_dispatch_shared_lock_enabled && std::filesystem::is_regular_file(
+                                                preserve_hle_pending_set_lookup_marker);
+    const bool hle_pending_mirror_enabled =
+        hle_dispatch_shared_lock_enabled && !preserve_hle_pending_set_lookup;
+    const int hle_pending_mirror_env_status =
+        hle_pending_mirror_enabled
+            ? ::setenv("EXECUTOR_FEX_HLE_PENDING_MIRROR", "1", 1)
+            : ::unsetenv("EXECUTOR_FEX_HLE_PENDING_MIRROR");
+    NativeLog(
+        hle_pending_mirror_env_status == 0 ? ANDROID_LOG_INFO
+                                           : ANDROID_LOG_ERROR,
+        "[EXECUTOR_FEX_HLE_PENDING_LOOKUP] eligible=%d mirror=%d preserve=%d "
+        "setMutation=exclusive envStatus=%d marker=%s",
+        hle_dispatch_shared_lock_enabled ? 1 : 0,
+        hle_pending_mirror_enabled ? 1 : 0,
+        preserve_hle_pending_set_lookup ? 1 : 0,
+        hle_pending_mirror_env_status,
+        preserve_hle_pending_set_lookup_marker.string().c_str());
+    const bool maxinst_512_requested =
+        cpu_profile.jit_block_size == Executor::CpuTuning::BlockSizeMode::Mega;
+
+
+
+    const bool maxinst_256_requested =
+        cpu_profile.jit_block_size == Executor::CpuTuning::BlockSizeMode::Safe;
+    if (exact_multiblock_requested && maxinst_512_requested) {
+        preflight.configure_flags |= LSX4_FEX_CONFIG_MAXINST_512_AB;
+    } else if (exact_multiblock_requested && maxinst_256_requested) {
+        preflight.configure_flags |= LSX4_FEX_CONFIG_MAXINST_256_AB;
+    }
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_MAXINST_GEOMETRY] requested512=%d requested256=%d "
+              "exactMultiblock=%d configured512=%d configured256=%d "
+              "source=cpu-profile effectiveCandidate=%d",
+              maxinst_512_requested ? 1 : 0,
+              maxinst_256_requested ? 1 : 0,
+              exact_multiblock_requested ? 1 : 0,
+              (preflight.configure_flags & LSX4_FEX_CONFIG_MAXINST_512_AB) != 0
+                  ? 1
+                  : 0,
+              (preflight.configure_flags & LSX4_FEX_CONFIG_MAXINST_256_AB) != 0
+                  ? 1
+                  : 0,
+              cpu_profile.jit_block_size == Executor::CpuTuning::BlockSizeMode::Safe
+                  ? 256
+                  : (maxinst_512_requested ? 512 : 5000));
+    const bool force_software_tso = std::filesystem::is_regular_file(
+        root / "run-force-fex-software-tso");
+    if (force_software_tso) {
+        preflight.host_os_feature_mask &=
+            ~LSX4_FEX_HOST_OS_HARDWARE_TSO_ENABLED;
+    }
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_STRONG_MEMORY_PREFLIGHT] forceSoftware=%d",
+              force_software_tso ? 1 : 0);
+
+
+
+
+
+
+    const bool relaxed_adpf_target = std::filesystem::is_regular_file(
+        root / "run-disable-adpf-60hz-target") ||
+        std::filesystem::is_regular_file(root / "run-disable-adpf-40hz-target");
+    const bool full_rate_adpf_target = !relaxed_adpf_target;
+    Executor::AndroidPerformanceHint::SetFullRate60HzTarget(
+        full_rate_adpf_target);
+    const bool low_memory_cache_marker = std::filesystem::is_regular_file(
+        root / "run-enable-fex-low-memory-cache");
+    if (low_memory_cache_marker) {
+        if (::setenv("LSX4_FEX_LOW_MEMORY_CACHE", "1", 1) != 0) {
+            NativeLog(ANDROID_LOG_WARN,
+                      "[EXECUTOR_FEX_LOOKUP_CACHE] requestedLowMemory=1 "
+                      "effectiveLowMemory=0 setenvErrno=%d",
+                      errno);
+        }
+    } else if (::unsetenv("LSX4_FEX_LOW_MEMORY_CACHE") != 0) {
+        NativeLog(ANDROID_LOG_WARN,
+                  "[EXECUTOR_FEX_LOOKUP_CACHE] requestedLowMemory=0 "
+                  "effectiveLowMemory=unknown unsetenvErrno=%d",
+                  errno);
+    }
+    const char* const low_memory_cache_env =
+        std::getenv("LSX4_FEX_LOW_MEMORY_CACHE");
+    const bool low_memory_cache =
+        low_memory_cache_env != nullptr &&
+        std::strcmp(low_memory_cache_env, "1") == 0;
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_FEX_LOOKUP_CACHE] requestedLowMemory=%d "
+              "effectiveLowMemory=%d requestedDynamicL1=%d "
+              "requestedDisableL2=%d effectivePolicy=bridge",
+              low_memory_cache_marker ? 1 : 0, low_memory_cache ? 1 : 0,
+              low_memory_cache ? 1 : 0, low_memory_cache ? 1 : 0);
+    const std::uint64_t effective_fex_isa =
+        Executor::Jit::GetHostIsaProfile().features &
+        preflight.host_isa_feature_mask;
+    preflight.cache_namespace =
+        "fex-2608-ps4-v3-cpu-61e82729ec820a6c-f0e351bb9bbb26d1-isa" +
+        Hex64(effective_fex_isa) + "-vl" +
+        std::to_string(preflight.max_sve_vector_bytes) +
+        "-tune" +
+        Hex64(Executor::CpuTuning::TranslationCacheIdentity(cpu_profile)) +
+        (low_memory_cache ? "-lookup-lowmem" : "-lookup-throughput");
+    if (!Executor::Fex::Preflight(preflight)) {
+        const auto status = Executor::Fex::Status();
+        if (status.state == Executor::Fex::LoaderState::ActivationStranded) {
+
+
+
+            SelectStrandedFexGuestCpuBackendLocked(
+                status,
+                status.error.empty()
+                    ? "fex-preflight-stranded-restart-required"
+                    : status.error.c_str());
+            return static_cast<int>(
+                Executor::GuestCpuBackend::FexExperimental);
+        }
+        SelectCurrentGuestCpuBackendLocked(
+            status.error.empty() ? "adapter-preflight-failed" : status.error.c_str(), false);
+        return static_cast<int>(Executor::GuestCpuBackend::Current);
+    }
+
+    const auto status = Executor::Fex::Status();
+    g_fex_persistent_rip_seed_enabled.store(persistent_rip_seed_requested,
+                                            std::memory_order_release);
+    g_runtime_guest_backend.store(
+        Executor::GuestCpuBackend::FexExperimental, std::memory_order_release);
+    g_guest_cpu_backend_supported = true;
+    g_guest_cpu_backend_fallback_reason = "none";
+    g_guest_cpu_backend_adapter_abi = status.adapter_name + "/v3";
+    g_guest_cpu_backend_mapped_entry_abi = "v5";
+    g_guest_cpu_backend_cache_namespace = status.cache_namespace.empty()
+                                              ? preflight.cache_namespace
+                                              : status.cache_namespace;
+    g_guest_cpu_backend_configure_flags = status.configure_flags;
+    g_guest_cpu_backend_provided_capabilities = status.provided_capabilities;
+    g_guest_cpu_backend_required_capabilities = status.required_capabilities;
+    g_guest_cpu_backend_forbidden_capabilities =
+        status.forbidden_capabilities;
+    g_guest_cpu_backend_strong_memory_model = status.strong_memory_model;
+    RefreshGuestCpuBackendStatusLocked();
+    return static_cast<int>(Executor::GuestCpuBackend::FexExperimental);
+}
+
+extern "C" int executor_lsx4_runtime_set_guest_cpu_backend(
+    const int requested_backend, const char* const adapter_path,
+    const char* const runtime_root) {
+    return SetGuestCpuBackend(requested_backend, adapter_path, runtime_root, nullptr,
+                              nullptr, nullptr, nullptr);
+}
+
+extern "C" int executor_lsx4_runtime_set_guest_cpu_backend_v2(
+    const int requested_backend, const char* const adapter_path,
+    const char* const runtime_root, const char* const launch_title_id) {
+    return SetGuestCpuBackend(requested_backend, adapter_path, runtime_root,
+                              launch_title_id, nullptr, nullptr, nullptr);
+}
+
+extern "C" int executor_lsx4_runtime_set_guest_cpu_backend_v3(
+    const int requested_backend, const char* const adapter_path,
+    const char* const runtime_root, const char* const launch_title_id,
+    const char* const hardware_profile, const char* const driver_family,
+    const char* const driver_version) {
+    return SetGuestCpuBackend(requested_backend, adapter_path, runtime_root,
+                              launch_title_id, hardware_profile, driver_family,
+                              driver_version);
+}
+
+extern "C" const char* executor_lsx4_runtime_guest_cpu_backend_status() {
+    static thread_local std::string snapshot;
+    std::lock_guard lock(g_lock);
+    RefreshGuestCpuBackendStatusLocked();
+    snapshot = g_guest_cpu_backend_status;
+    return snapshot.c_str();
+}
+
 extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char*) {
+
+
+
+
+    Libraries::AudioOut::ResetForTitleSession();
+    Libraries::Ajm::ResetForTitleSession();
     std::lock_guard lock(g_lock);
 #if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
     Common::InitializeAndroidThreadAffinity();
 #endif
     NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_NATIVE_BUILD_MARKER] id=%s "
+              "[EXECUTOR_NATIVE_BUILD_MARKER] id=%s "
               "date=\"%s\" time=\"%s\" file=%s",
               ExecutorNativeBuildMarker, __DATE__, __TIME__, __FILE__);
     g_root = root_dir ? root_dir : "";
@@ -21632,6 +30841,48 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
             R"({"state":"initialize_failed","core":"lsx4-native","root":"","firmware":{"enabled":false,"reason":"runtime root is empty"}})";
         return -1;
     }
+    g_guest_cpu_backend_selection_locked.store(true, std::memory_order_release);
+    const auto entry_fex_status = Executor::Fex::Status();
+    if (entry_fex_status.state ==
+        Executor::Fex::LoaderState::ActivationStranded) {
+        SelectStrandedFexGuestCpuBackendLocked(
+            entry_fex_status,
+            "fex-activation-stranded-restart-required");
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_GUEST_BACKEND] initialize rejected: FEX "
+                  "activation is stranded; process restart required");
+        return -2;
+    }
+    auto selected_backend = g_runtime_guest_backend.load(std::memory_order_acquire);
+    if (selected_backend == Executor::GuestCpuBackend::FexExperimental) {
+        const auto fex_status = Executor::Fex::Status();
+        if (fex_status.state != Executor::Fex::LoaderState::Configured) {
+            g_guest_cpu_backend_supported = false;
+            g_guest_cpu_backend_fallback_reason = "fex-loader-not-configured-at-initialize";
+            RefreshGuestCpuBackendStatusLocked();
+            NativeLog(ANDROID_LOG_ERROR,
+                      "[EXECUTOR_GUEST_BACKEND] initialize rejected: FEX "
+                      "loader state=%u is not safely configured",
+                      static_cast<unsigned>(fex_status.state));
+            return -2;
+        }
+
+
+
+        NativeLog(ANDROID_LOG_INFO, "[EXECUTOR_GUEST_BACKEND] FEX configured; immutable "
+                                    "fault-signal owner deferred until activation commit");
+    } else if (!PublishFaultSignalOwnerLocked(FaultSignalOwner::Current)) {
+        g_guest_cpu_backend_supported = false;
+        g_guest_cpu_backend_fallback_reason = "signal-owner-conflict";
+        RefreshGuestCpuBackendStatusLocked();
+        NativeLog(ANDROID_LOG_ERROR,
+                  "[EXECUTOR_GUEST_BACKEND] initialize rejected: immutable "
+                  "fault-signal owner conflict requested=%s owner=%d",
+                  Executor::GuestCpuBackendName(selected_backend),
+                  executor_lsx4_android_fault_signal_owner());
+        return -2;
+    }
+    RefreshGuestCpuBackendStatusLocked();
 
     ConfigureAndroidRuntimeUserPathsAndBaseConfig();
 
@@ -21693,6 +30944,26 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                   "faultSignals=1 traceMaps=1",
                   live_host_fault_catch_sentinel.string().c_str());
     }
+    const auto hle_generic_coverage_sentinel =
+        std::filesystem::path(g_root) / "run-diag-hle-generic-coverage";
+    if (std::filesystem::exists(hle_generic_coverage_sentinel)) {
+        setenv("EXECUTOR_TRACE_HLE_GENERIC_COVERAGE", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_HLE_GENERIC_COVERAGE] source=sentinel path=%s enabled=1",
+                  hle_generic_coverage_sentinel.string().c_str());
+    }
+    const auto fex_hle_thunk_admission_sentinel =
+        std::filesystem::path(g_root) / "run-diag-fex-hle-thunk-admission";
+    if (std::filesystem::exists(fex_hle_thunk_admission_sentinel)) {
+        setenv("EXECUTOR_DIAG_FEX_HLE_THUNK_ADMISSION", "1", 1);
+        NativeLog(
+            ANDROID_LOG_INFO,
+            "[EXECUTOR_FEX_HLE_THUNK_ADMISSION] source=sentinel path=%s "
+            "enabled=1 diagnosticOnly=1 fpsVerdictAllowed=0",
+            fex_hle_thunk_admission_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_DIAG_FEX_HLE_THUNK_ADMISSION");
+    }
     const auto mono_safepoint_sentinel =
         std::filesystem::path(g_root) / "run-live-mono-safepoint";
     if (std::filesystem::exists(mono_safepoint_sentinel)) {
@@ -21742,11 +31013,18 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
     apply_guest_libc_strings_trace();
     const auto fast_guest_libc_strings_sentinel =
         std::filesystem::path(g_root) / "run-live-fast-guest-libc-strings";
-    if (std::filesystem::exists(fast_guest_libc_strings_sentinel)) {
+    const bool aggressive_function_replacements =
+        Executor::CpuTuning::Get().function_replacements ==
+        Executor::CpuTuning::Aggressiveness::Aggressive;
+    if (aggressive_function_replacements ||
+        std::filesystem::exists(fast_guest_libc_strings_sentinel)) {
         setenv("EXECUTOR_FAST_GUEST_LIBC_STRINGS", "1", 1);
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_FAST_GUEST_LIBC_STRINGS] source=sentinel path=%s enabled=1",
+                  "[EXECUTOR_FAST_GUEST_LIBC_STRINGS] source=%s path=%s enabled=1",
+                  aggressive_function_replacements ? "cpu-profile" : "sentinel",
                   fast_guest_libc_strings_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_FAST_GUEST_LIBC_STRINGS");
     }
     const auto live_eboot_libc_split_sentinel =
         std::filesystem::path(g_root) / "run-live-eboot-libc-compare-split";
@@ -21884,6 +31162,11 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                   "[EXECUTOR_DISABLE_AUDIO_OUTPUT] source=sentinel path=%s enabled=1 "
                   "(MIUI AudioTrack crash escape)",
                   disable_audio_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_DISABLE_AUDIO_OUTPUT");
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_DISABLE_AUDIO_OUTPUT] source=sentinel path=%s enabled=0",
+                  disable_audio_sentinel.string().c_str());
     }
     const auto park_all_sentinel = std::filesystem::path(g_root) / "run-park-all-on-fault";
     if (std::filesystem::exists(park_all_sentinel)) {
@@ -22009,17 +31292,20 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
         const std::string spec = probe_spec.str();
         if (!spec.empty()) {
             setenv("EXECUTOR_DIAG_JIT_RIP_PROBE", spec.c_str(), 1);
+            Executor::Jit::ConfigureJitRipProbesForDiagnostics(spec);
             NativeLog(ANDROID_LOG_INFO,
                       "[EXECUTOR_DIAG_JIT_RIP_PROBE] source=%s bytes=%zu",
                       jit_rip_probe_sentinel.string().c_str(), spec.size());
         } else {
             unsetenv("EXECUTOR_DIAG_JIT_RIP_PROBE");
+            Executor::Jit::ConfigureJitRipProbesForDiagnostics({});
             NativeLog(ANDROID_LOG_ERROR,
                       "[EXECUTOR_DIAG_JIT_RIP_PROBE] empty source=%s",
                       jit_rip_probe_sentinel.string().c_str());
         }
     } else {
         unsetenv("EXECUTOR_DIAG_JIT_RIP_PROBE");
+        Executor::Jit::ConfigureJitRipProbesForDiagnostics({});
     }
     const auto fiber_transition_sentinel =
         std::filesystem::path(g_root) / "diag-fiber-transitions";
@@ -22078,13 +31364,194 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
     }
     const auto fast_bulk_guest_write_sentinel =
         std::filesystem::path(g_root) / "run-fast-bulk-guest-write";
-    if (std::filesystem::exists(fast_bulk_guest_write_sentinel)) {
+    const bool fast_bulk_guest_write_requested =
+        std::filesystem::exists(fast_bulk_guest_write_sentinel);
+    const bool strong_snapdragon_cpu_bundle =
+        ExecutorBloodborneSnapdragonStrongCpuBundleDefault();
+    if (fast_bulk_guest_write_requested || strong_snapdragon_cpu_bundle) {
         setenv("EXECUTOR_FAST_BULK_GUEST_WRITE", "1", 1);
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_FAST_BULK_GUEST_WRITE] source=sentinel path=%s enabled=1",
+                  "[EXECUTOR_FAST_BULK_GUEST_WRITE] enabled=1 requested=%d "
+                  "bloodborneSnapdragonDefault=%d path=%s",
+                  fast_bulk_guest_write_requested ? 1 : 0,
+                  strong_snapdragon_cpu_bundle ? 1 : 0,
                   fast_bulk_guest_write_sentinel.string().c_str());
     } else {
         unsetenv("EXECUTOR_FAST_BULK_GUEST_WRITE");
+    }
+    const auto fused_fast_bulk_guest_write_lease_sentinel =
+        std::filesystem::path(g_root) /
+        "run-enable-fused-fast-bulk-guest-write-lease";
+    const bool fused_fast_bulk_guest_write_lease_requested =
+        std::filesystem::exists(fused_fast_bulk_guest_write_lease_sentinel);
+    if (fused_fast_bulk_guest_write_lease_requested ||
+        strong_snapdragon_cpu_bundle) {
+        setenv("EXECUTOR_FUSED_FAST_BULK_GUEST_WRITE_LEASE", "1", 1);
+        NativeLog(
+            ANDROID_LOG_INFO,
+            "[EXECUTOR_FUSED_FAST_BULK_LEASE] requested=%d configured=1 "
+            "bloodborneSnapdragonDefault=%d requiresFastBulk=1 "
+            "allWritableRangeLock=1 "
+            "fallback=legacy-two-step default=off path=%s",
+            fused_fast_bulk_guest_write_lease_requested ? 1 : 0,
+            strong_snapdragon_cpu_bundle ? 1 : 0,
+            fused_fast_bulk_guest_write_lease_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_FUSED_FAST_BULK_GUEST_WRITE_LEASE");
+    }
+    const auto immutable_snapshot_plan_sentinel =
+        std::filesystem::path(g_root) /
+        "run-enable-immutable-snapshot-plan";
+    if (std::filesystem::exists(immutable_snapshot_plan_sentinel)) {
+        setenv("EXECUTOR_IMMUTABLE_SNAPSHOT_PLAN", "1", 1);
+        NativeLog(
+            ANDROID_LOG_INFO,
+            "[EXECUTOR_IMMUTABLE_SNAPSHOT_PLAN] source=sentinel path=%s "
+            "enabled=1 key=manager+vmaGeneration+va+size replay=excluded "
+            "materializeOnHit=0 default=off",
+            immutable_snapshot_plan_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_IMMUTABLE_SNAPSHOT_PLAN");
+    }
+    const auto deferred_driver_cheap_first_pipeline_sentinel =
+        std::filesystem::path(g_root) /
+        "run-enable-deferred-driver-cheap-first-pipeline";
+    if (std::filesystem::exists(
+            deferred_driver_cheap_first_pipeline_sentinel)) {
+        setenv("EXECUTOR_DEFERRED_DRIVER_CHEAP_FIRST_PIPELINE", "1", 1);
+        NativeLog(
+            ANDROID_LOG_INFO,
+            "[EXECUTOR_DEFERRED_DRIVER_CHEAP_FIRST_PIPELINE] "
+            "source=sentinel path=%s enabled=1 firstObject=disableOptimization "
+            "optimizedPublication=nextLaunch default=off",
+            deferred_driver_cheap_first_pipeline_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_DEFERRED_DRIVER_CHEAP_FIRST_PIPELINE");
+    }
+    const auto sm8650_force_watcher_pte_transitions_sentinel =
+        std::filesystem::path(g_root) /
+        "run-sm8650-force-watcher-pte-transitions-ab";
+    const bool sm8650_force_watcher_pte_transitions =
+        Common::IsSnapdragon8Gen3Host() &&
+        std::filesystem::exists(
+            sm8650_force_watcher_pte_transitions_sentinel);
+    if (sm8650_force_watcher_pte_transitions) {
+        setenv("EXECUTOR_SM8650_FORCE_WATCHER_PTE_TRANSITIONS", "1", 1);
+        NativeLog(
+            ANDROID_LOG_INFO,
+            "[EXECUTOR_SM8650_WATCHER_PTE_TRANSITIONS] source=sentinel "
+            "path=%s enabled=1",
+            sm8650_force_watcher_pte_transitions_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_SM8650_FORCE_WATCHER_PTE_TRANSITIONS");
+    }
+    const auto guest_invalidation_source_profile_sentinel =
+        std::filesystem::path(g_root) /
+        "run-profile-guest-invalidation-sources";
+    const auto guest_invalidation_overlap_profile_sentinel =
+        std::filesystem::path(g_root) /
+        "run-profile-guest-invalidation-overlap";
+    const auto guest_invalidation_overlap_control_directory =
+        std::filesystem::path(g_root) / "runtime" /
+        "invalidation-overlap-control";
+    const bool guest_invalidation_source_profile_requested =
+        std::filesystem::exists(guest_invalidation_source_profile_sentinel);
+    const bool guest_invalidation_overlap_profile_requested =
+        std::filesystem::exists(guest_invalidation_overlap_profile_sentinel);
+    if (guest_invalidation_source_profile_requested) {
+        setenv("EXECUTOR_PROFILE_GUEST_INVALIDATION_SOURCES", "1", 1);
+        NativeLog(
+            ANDROID_LOG_INFO,
+            "[EXECUTOR_GUEST_INVALIDATION_SOURCES] source=sentinel path=%s "
+            "enabled=1 behavior=observe-only",
+            guest_invalidation_source_profile_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_PROFILE_GUEST_INVALIDATION_SOURCES");
+    }
+    if (guest_invalidation_overlap_profile_requested &&
+        !guest_invalidation_source_profile_requested) {
+        setenv("EXECUTOR_PROFILE_GUEST_INVALIDATION_OVERLAP", "1", 1);
+        setenv("EXECUTOR_GUEST_INVALIDATION_OVERLAP_CONTROL_DIR",
+               guest_invalidation_overlap_control_directory.string().c_str(), 1);
+        NativeLog(
+            ANDROID_LOG_INFO,
+            "[EXECUTOR_GUEST_INVALIDATION_OVERLAP] source=sentinel path=%s "
+            "controller=waiting enabled=0 armed=0 behavior=observe-only "
+            "mapping=wait-drain-only controlDir=%s",
+            guest_invalidation_overlap_profile_sentinel.string().c_str(),
+            guest_invalidation_overlap_control_directory.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_PROFILE_GUEST_INVALIDATION_OVERLAP");
+        unsetenv("EXECUTOR_GUEST_INVALIDATION_OVERLAP_CONTROL_DIR");
+        if (guest_invalidation_overlap_profile_requested) {
+            NativeLog(
+                ANDROID_LOG_ERROR,
+                "[EXECUTOR_GUEST_INVALIDATION_OVERLAP] source=sentinel "
+                "path=%s enabled=0 reason=source-profiler-conflict",
+                guest_invalidation_overlap_profile_sentinel.string().c_str());
+        }
+    }
+    const auto bounded_guest_invalidation_drain_sentinel =
+        std::filesystem::path(g_root) /
+        "run-enable-bounded-guest-invalidation-drain";
+    if (std::filesystem::exists(
+            bounded_guest_invalidation_drain_sentinel)) {
+        setenv("EXECUTOR_BOUNDED_GUEST_INVALIDATION_DRAIN", "1", 1);
+        NativeLog(
+            ANDROID_LOG_INFO,
+            "[EXECUTOR_BOUNDED_GUEST_INVALIDATION_DRAIN] source=sentinel "
+            "path=%s enabled=1 rounds=8 requests=64 budgetUs=250",
+            bounded_guest_invalidation_drain_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_BOUNDED_GUEST_INVALIDATION_DRAIN");
+    }
+    const auto disable_async_shader_retranslation_sentinel =
+        std::filesystem::path(g_root) /
+        "run-disable-async-shader-retranslation";
+    const bool async_shader_retranslation_disabled = std::filesystem::exists(
+        disable_async_shader_retranslation_sentinel);
+    if (async_shader_retranslation_disabled) {
+        setenv("EXECUTOR_DISABLE_ASYNC_SHADER_RETRANSLATION", "1", 1);
+        NativeLog(
+            ANDROID_LOG_INFO,
+            "[EXECUTOR_ASYNC_SHADER_RETRANSLATION] source=sentinel path=%s "
+            "enabled=0 disabled=1",
+            disable_async_shader_retranslation_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_DISABLE_ASYNC_SHADER_RETRANSLATION");
+    }
+    const auto hle_clean_buffer_fastpath_sentinel =
+        std::filesystem::path(g_root) /
+        "run-enable-hle-clean-buffer-fastpath";
+    const bool hle_clean_buffer_fastpath_requested = std::filesystem::exists(
+        hle_clean_buffer_fastpath_sentinel);
+    if (aggressive_function_replacements || hle_clean_buffer_fastpath_requested) {
+        setenv("EXECUTOR_HLE_CLEAN_BUFFER_FASTPATH", "1", 1);
+        NativeLog(
+            ANDROID_LOG_INFO,
+            "[EXECUTOR_HLE_CLEAN_BUFFER_FASTPATH] source=%s path=%s "
+            "enabled=1 scope=memset-only maxPages=16 default=off "
+            "asyncShaderRetranslation=%s ownedSnapshot=1",
+            aggressive_function_replacements ? "cpu-profile" : "sentinel",
+            hle_clean_buffer_fastpath_sentinel.string().c_str(),
+            async_shader_retranslation_disabled ? "disabled" : "async");
+    } else {
+        unsetenv("EXECUTOR_HLE_CLEAN_BUFFER_FASTPATH");
+    }
+    const auto unwatched_bulk_guest_write_fastpath_sentinel =
+        std::filesystem::path(g_root) /
+        "run-enable-unwatched-bulk-guest-write-fastpath";
+    if (std::filesystem::exists(
+            unwatched_bulk_guest_write_fastpath_sentinel)) {
+        setenv("EXECUTOR_ENABLE_UNWATCHED_BULK_GUEST_WRITE_FAST_PATH", "1", 1);
+        NativeLog(
+            ANDROID_LOG_INFO,
+            "[EXECUTOR_UNWATCHED_BULK_WRITE] source=sentinel path=%s "
+            "enabled=1 scope=steady-state-unwatched default=off "
+            "mappingCutoff=1 watcherHazardGate=1 trackedWriterGate=1",
+            unwatched_bulk_guest_write_fastpath_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_ENABLE_UNWATCHED_BULK_GUEST_WRITE_FAST_PATH");
     }
     const auto suballocate_bda_buffers_sentinel =
         std::filesystem::path(g_root) / "run-suballocate-bda-buffers";
@@ -22177,13 +31644,44 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
         NativeLog(ANDROID_LOG_INFO, "[EXECUTOR_PATCH_SHADERS] source=sentinel path=%s",
                   patch_shaders_sentinel.string().c_str());
     }
-    const auto readback_contract_trace_sentinel =
+
+
+
+
+
+    unsetenv("EXECUTOR_READBACK_CONTRACT_TRACE");
+    const auto legacy_readback_contract_trace_sentinel =
         std::filesystem::path(g_root) / "run-readback-contract-trace";
-    if (std::filesystem::exists(readback_contract_trace_sentinel)) {
+    std::error_code legacy_readback_cleanup_error;
+    const bool legacy_readback_trace_removed = std::filesystem::remove(
+        legacy_readback_contract_trace_sentinel, legacy_readback_cleanup_error);
+    if (legacy_readback_trace_removed) {
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_READBACK_CONTRACT_INIT] source=legacy-cleanup removed=1 path=%s",
+                  legacy_readback_contract_trace_sentinel.string().c_str());
+    } else if (legacy_readback_cleanup_error) {
+        NativeLog(ANDROID_LOG_WARN,
+                  "[EXECUTOR_READBACK_CONTRACT_INIT] source=legacy-cleanup removed=0 error=%d path=%s",
+                  legacy_readback_cleanup_error.value(),
+                  legacy_readback_contract_trace_sentinel.string().c_str());
+    }
+
+    const auto readback_contract_trace_once_sentinel =
+        std::filesystem::path(g_root) / "run-readback-contract-trace-once";
+    std::error_code readback_trace_once_error;
+    const bool readback_trace_once_consumed =
+        std::filesystem::remove(readback_contract_trace_once_sentinel,
+                                readback_trace_once_error);
+    if (readback_trace_once_consumed) {
         setenv("EXECUTOR_READBACK_CONTRACT_TRACE", "1", 1);
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_READBACK_CONTRACT_INIT] source=sentinel path=%s",
-                  readback_contract_trace_sentinel.string().c_str());
+                  "[EXECUTOR_READBACK_CONTRACT_INIT] source=one-shot consumed=1 path=%s",
+                  readback_contract_trace_once_sentinel.string().c_str());
+    } else if (readback_trace_once_error) {
+        NativeLog(ANDROID_LOG_WARN,
+                  "[EXECUTOR_READBACK_CONTRACT_INIT] source=one-shot consumed=0 enabled=0 error=%d path=%s",
+                  readback_trace_once_error.value(),
+                  readback_contract_trace_once_sentinel.string().c_str());
     }
     const auto shader_identity_cache_sentinel =
         std::filesystem::path(g_root) / "run-shader-identity-cache";
@@ -22208,7 +31706,10 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
     }
     const auto immutable_srt_snapshot_cache_sentinel =
         std::filesystem::path(g_root) / "run-immutable-srt-snapshot-cache";
-    if (std::filesystem::exists(immutable_srt_snapshot_cache_sentinel)) {
+    const bool sm8650_requires_gpu_dirty_srt_validation =
+        Common::IsSnapdragon8Gen3Host();
+    if (std::filesystem::exists(immutable_srt_snapshot_cache_sentinel) &&
+        !sm8650_requires_gpu_dirty_srt_validation) {
         setenv("EXECUTOR_IMMUTABLE_SRT_SNAPSHOT_CACHE", "1", 1);
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_SRT_CACHE_CONFIG] source=sentinel path=%s "
@@ -22216,6 +31717,13 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                   immutable_srt_snapshot_cache_sentinel.string().c_str());
     } else {
         unsetenv("EXECUTOR_IMMUTABLE_SRT_SNAPSHOT_CACHE");
+        if (std::filesystem::exists(immutable_srt_snapshot_cache_sentinel) &&
+            sm8650_requires_gpu_dirty_srt_validation) {
+            NativeLog(ANDROID_LOG_INFO,
+                      "[EXECUTOR_SRT_CACHE_CONFIG] source=sm8650-policy path=%s "
+                      "immutableBackingValidation=0 reason=gpu-dirty-srt-required",
+                      immutable_srt_snapshot_cache_sentinel.string().c_str());
+        }
     }
     const auto srt_cache_trace_sentinel =
         std::filesystem::path(g_root) / "run-trace-srt-cache";
@@ -22226,6 +31734,17 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                   srt_cache_trace_sentinel.string().c_str());
     } else {
         unsetenv("EXECUTOR_TRACE_SRT_CACHE");
+    }
+    const auto live_srt_walker_trace_sentinel =
+        std::filesystem::path(g_root) / "run-live-srt-walker-trace";
+    if (std::filesystem::exists(live_srt_walker_trace_sentinel)) {
+        setenv("EXECUTOR_TRACE_SRT_WALKER", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_SRT_WALKER_TRACE] source=sentinel path=%s "
+                  "enabled=1 bounded=1",
+                  live_srt_walker_trace_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_TRACE_SRT_WALKER");
     }
     const auto aligned_ssbo_scratch_sentinel =
         std::filesystem::path(g_root) / "run-aligned-ssbo-scratch";
@@ -22250,6 +31769,7 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
             ProbeConfigKey{"budget", "EXECUTOR_GPU_CONTENT_PROBE_BUDGET", 1, 32},
             ProbeConfigKey{"maxBytes", "EXECUTOR_GPU_CONTENT_PROBE_MAX_BYTES", 4096,
                            64ull * 1024 * 1024},
+            ProbeConfigKey{"buffers", "EXECUTOR_GPU_CONTENT_PROBE_BUFFERS", 0, 1},
             ProbeConfigKey{"drawFirst", "EXECUTOR_GPU_CONTENT_PROBE_DRAW_FIRST", 1,
                            1'000'000'000},
             ProbeConfigKey{"drawCount", "EXECUTOR_GPU_CONTENT_PROBE_DRAW_COUNT", 0,
@@ -22353,12 +31873,13 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
         NativeLog(
             ANDROID_LOG_INFO,
             "[EXECUTOR_GPU_CONTENT_PROBE_CONFIG] source=sentinel path=%s status=enabled "
-            "budget=%s maxBytes=%s drawFirst=%s drawCount=%s drawStride=%s drawHash=%s "
+            "budget=%s maxBytes=%s buffers=%s drawFirst=%s drawCount=%s drawStride=%s drawHash=%s "
             "drawHash1=%s drawHash2=%s drawHash3=%s drawTriggerHash=%s dispatchFirst=%s "
             "dispatchCount=%s",
             gpu_content_probe_sentinel.string().c_str(),
             configured_or_default("EXECUTOR_GPU_CONTENT_PROBE_BUDGET"),
             configured_or_default("EXECUTOR_GPU_CONTENT_PROBE_MAX_BYTES"),
+            configured_or_default("EXECUTOR_GPU_CONTENT_PROBE_BUFFERS"),
             configured_or_default("EXECUTOR_GPU_CONTENT_PROBE_DRAW_FIRST"),
             configured_or_default("EXECUTOR_GPU_CONTENT_PROBE_DRAW_COUNT"),
             configured_or_default("EXECUTOR_GPU_CONTENT_PROBE_DRAW_STRIDE"),
@@ -22382,6 +31903,122 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
         setenv("EXECUTOR_BISECT_NO_FLOATCTRL", "1", 1);
         NativeLog(ANDROID_LOG_INFO, "[EXECUTOR_BISECT_NO_FLOATCTRL] source=sentinel path=%s",
                   bisect_no_floatctrl_sentinel.string().c_str());
+    }
+    const auto bisect_scalar_image_coords_sentinel =
+        std::filesystem::path(g_root) / "run-bisect-scalar-image-coords";
+    if (std::filesystem::exists(bisect_scalar_image_coords_sentinel)) {
+        setenv("EXECUTOR_BISECT_SCALAR_IMAGE_COORDS", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_BISECT_SCALAR_IMAGE_COORDS] source=sentinel path=%s",
+                  bisect_scalar_image_coords_sentinel.string().c_str());
+    }
+    const auto diagnostic_fs_image_coords_sentinel =
+        std::filesystem::path(g_root) / "run-diagnostic-fs-image-coords";
+    if (std::filesystem::exists(diagnostic_fs_image_coords_sentinel)) {
+        setenv("EXECUTOR_DIAGNOSTIC_FS_IMAGE_COORDS", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_DIAGNOSTIC_FS_IMAGE_COORDS] source=sentinel path=%s",
+                  diagnostic_fs_image_coords_sentinel.string().c_str());
+    }
+    const auto diagnostic_fs_query_size_sentinel =
+        std::filesystem::path(g_root) / "run-diagnostic-fs-query-size";
+    if (std::filesystem::exists(diagnostic_fs_query_size_sentinel)) {
+        setenv("EXECUTOR_DIAGNOSTIC_FS_QUERY_SIZE", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_DIAGNOSTIC_FS_QUERY_SIZE] source=sentinel path=%s",
+                  diagnostic_fs_query_size_sentinel.string().c_str());
+    }
+    const auto diagnostic_fs_texel_fetch_sentinel =
+        std::filesystem::path(g_root) / "run-diagnostic-fs-texel-fetch";
+    if (std::filesystem::exists(diagnostic_fs_texel_fetch_sentinel)) {
+        setenv("EXECUTOR_DIAGNOSTIC_FS_TEXEL_FETCH", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_DIAGNOSTIC_FS_TEXEL_FETCH] source=sentinel path=%s",
+                  diagnostic_fs_texel_fetch_sentinel.string().c_str());
+    }
+    const auto bisect_fs_explicit_lod0_sentinel =
+        std::filesystem::path(g_root) / "run-bisect-fs-explicit-lod0";
+    if (std::filesystem::exists(bisect_fs_explicit_lod0_sentinel)) {
+        setenv("EXECUTOR_BISECT_FS_EXPLICIT_LOD0", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_BISECT_FS_EXPLICIT_LOD0] source=sentinel path=%s",
+                  bisect_fs_explicit_lod0_sentinel.string().c_str());
+    }
+    const auto bisect_force_ssbo_align64_sentinel =
+        std::filesystem::path(g_root) / "run-bisect-force-ssbo-align64";
+    if (std::filesystem::exists(bisect_force_ssbo_align64_sentinel)) {
+        setenv("EXECUTOR_BISECT_FORCE_SSBO_ALIGNMENT", "64", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_BISECT_FORCE_SSBO_ALIGNMENT] value=64 source=sentinel path=%s",
+                  bisect_force_ssbo_align64_sentinel.string().c_str());
+    }
+    const auto diagnostic_fs_raw_input0_sentinel =
+        std::filesystem::path(g_root) / "run-diagnostic-fs-raw-input0";
+    if (std::filesystem::exists(diagnostic_fs_raw_input0_sentinel)) {
+        setenv("EXECUTOR_DIAGNOSTIC_FS_RAW_INPUT0", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_DIAGNOSTIC_FS_RAW_INPUT0] source=sentinel path=%s",
+                  diagnostic_fs_raw_input0_sentinel.string().c_str());
+    }
+    const auto diagnostic_presenter_swapchain_gradient_sentinel =
+        std::filesystem::path(g_root) /
+        "run-diagnostic-presenter-swapchain-gradient";
+    if (std::filesystem::exists(
+            diagnostic_presenter_swapchain_gradient_sentinel)) {
+        setenv("EXECUTOR_DIAGNOSTIC_PRESENTER_SWAPCHAIN_GRADIENT", "1", 1);
+        NativeLog(
+            ANDROID_LOG_INFO,
+            "[EXECUTOR_DIAGNOSTIC_PRESENTER_SWAPCHAIN_GRADIENT] "
+            "source=sentinel path=%s",
+            diagnostic_presenter_swapchain_gradient_sentinel.string().c_str());
+    }
+    const auto diagnostic_fs_fragcoord_sentinel =
+        std::filesystem::path(g_root) / "run-diagnostic-fs-fragcoord";
+    if (std::filesystem::exists(diagnostic_fs_fragcoord_sentinel)) {
+        setenv("EXECUTOR_DIAGNOSTIC_FS_FRAGCOORD", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_DIAGNOSTIC_FS_FRAGCOORD] source=sentinel path=%s",
+                  diagnostic_fs_fragcoord_sentinel.string().c_str());
+    }
+    const auto diagnostic_fs_fragcoord_mono_x_sentinel =
+        std::filesystem::path(g_root) / "run-diagnostic-fs-fragcoord-mono-x";
+    if (std::filesystem::exists(diagnostic_fs_fragcoord_mono_x_sentinel)) {
+        setenv("EXECUTOR_DIAGNOSTIC_FS_FRAGCOORD_MONO_X", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_DIAGNOSTIC_FS_FRAGCOORD_MONO_X] source=sentinel path=%s",
+                  diagnostic_fs_fragcoord_mono_x_sentinel.string().c_str());
+    }
+    const auto diagnostic_fs_fragcoord_mono_y_sentinel =
+        std::filesystem::path(g_root) / "run-diagnostic-fs-fragcoord-mono-y";
+    if (std::filesystem::exists(diagnostic_fs_fragcoord_mono_y_sentinel)) {
+        setenv("EXECUTOR_DIAGNOSTIC_FS_FRAGCOORD_MONO_Y", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_DIAGNOSTIC_FS_FRAGCOORD_MONO_Y] source=sentinel path=%s",
+                  diagnostic_fs_fragcoord_mono_y_sentinel.string().c_str());
+    }
+    const auto diagnostic_vs_attr0_from_position_sentinel =
+        std::filesystem::path(g_root) / "run-diagnostic-vs-attr0-from-position";
+    if (std::filesystem::exists(diagnostic_vs_attr0_from_position_sentinel)) {
+        setenv("EXECUTOR_DIAGNOSTIC_VS_ATTR0_FROM_POSITION", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_DIAGNOSTIC_VS_ATTR0_FROM_POSITION] source=sentinel path=%s",
+                  diagnostic_vs_attr0_from_position_sentinel.string().c_str());
+    }
+    const auto bisect_disable_dynamic_vertex_input_sentinel =
+        std::filesystem::path(g_root) / "run-bisect-disable-dynamic-vertex-input";
+    if (std::filesystem::exists(bisect_disable_dynamic_vertex_input_sentinel)) {
+        setenv("EXECUTOR_BISECT_DISABLE_DYNAMIC_VERTEX_INPUT", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_BISECT_DISABLE_DYNAMIC_VERTEX_INPUT] source=sentinel path=%s",
+                  bisect_disable_dynamic_vertex_input_sentinel.string().c_str());
+    }
+    const auto bisect_disable_legacy_vertex_attributes_sentinel =
+        std::filesystem::path(g_root) / "run-bisect-disable-legacy-vertex-attributes";
+    if (std::filesystem::exists(bisect_disable_legacy_vertex_attributes_sentinel)) {
+        setenv("EXECUTOR_BISECT_DISABLE_LEGACY_VERTEX_ATTRIBUTES", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_BISECT_DISABLE_LEGACY_VERTEX_ATTRIBUTES] source=sentinel path=%s",
+                  bisect_disable_legacy_vertex_attributes_sentinel.string().c_str());
     }
     const auto serialize_gnm_submits_sentinel =
         std::filesystem::path(g_root) / "run-android-serialize-gnm-submits";
@@ -22433,6 +32070,323 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_LIVE_HLE_FLIGHT] source=sentinel path=%s enabled=1",
                    live_hle_flight_sentinel.string().c_str());
+    }
+    const auto fex_thread_hle_probe_sentinel =
+        std::filesystem::path(g_root) / "run-fex-thread-hle-probe";
+    if (std::filesystem::exists(fex_thread_hle_probe_sentinel)) {
+        setenv("EXECUTOR_TRACE_FEX_THREAD_HLE_PROBE", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_FEX_THREAD_HLE_PROBE] source=sentinel path=%s enabled=1",
+                  fex_thread_hle_probe_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_TRACE_FEX_THREAD_HLE_PROBE");
+    }
+    const auto fex_delayed_thread_context_sentinel =
+        std::filesystem::path(g_root) / "run-fex-delayed-thread-context";
+    if (std::filesystem::exists(fex_delayed_thread_context_sentinel)) {
+        std::thread([] {
+            std::this_thread::sleep_for(std::chrono::seconds(22));
+            executor_lsx4_android_dump_box64_emu_states("fex-delayed-thread-context-22s");
+            std::this_thread::sleep_for(std::chrono::seconds(8));
+            executor_lsx4_android_dump_box64_emu_states("fex-delayed-thread-context-30s");
+        }).detach();
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_FEX_DELAYED_THREAD_CONTEXT] source=sentinel path=%s enabled=1",
+                  fex_delayed_thread_context_sentinel.string().c_str());
+    }
+    const auto fex_game_main_late_sentinel =
+        std::filesystem::path(g_root) / "run-fex-game-main-late";
+    if (std::filesystem::exists(fex_game_main_late_sentinel)) {
+        setenv("EXECUTOR_TRACE_FEX_GAME_MAIN_LATE", "1", 1);
+        std::thread([] {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            for (unsigned sample = 0; sample < 60; ++sample) {
+                const auto guest_thread_address =
+                    g_exit8_async_loading_guest_thread.load(std::memory_order_acquire);
+                const auto runnable =
+                    g_exit8_async_loading_runnable.load(std::memory_order_acquire);
+                const auto probe_path = std::filesystem::path(g_root) /
+                                        "diagnostic-exit8-async-loading-state.txt";
+                if (std::FILE* probe_file =
+                        std::fopen(probe_path.string().c_str(), "a")) {
+                    std::fprintf(probe_file,
+                                 "sample=%u guest=0x%llx runnable=0x%llx\n",
+                                 sample,
+                                 static_cast<unsigned long long>(guest_thread_address),
+                                 static_cast<unsigned long long>(runnable));
+                    if (runnable != 0) {
+                        for (std::uint64_t offset = 0; offset < 0x500;
+                             offset += 0x40) {
+                            std::fprintf(
+                                probe_file, "+0x%03llx %s\n",
+                                static_cast<unsigned long long>(offset),
+                                GuestQwordsHexBestEffortLocked(runnable + offset, 8)
+                                    .c_str());
+                        }
+                    }
+                    if (guest_thread_address != 0) {
+                        auto* const guest_thread =
+                            reinterpret_cast<Libraries::Kernel::Pthread*>(
+                                guest_thread_address);
+                        if (guest_thread->lock.try_lock()) {
+                            std::fprintf(
+                                probe_file,
+                                "pthread name=%s state=%u wchan=%p mutex=%p "
+                                "willSleep=%d userWaiters=%d defer=%d lastWake=%s "
+                                "wakeCount=%llu spurious=%llu\n",
+                                guest_thread->name.c_str(),
+                                static_cast<unsigned>(guest_thread->state),
+                                guest_thread->wchan, guest_thread->mutex_obj,
+                                guest_thread->will_sleep ? 1 : 0,
+                                guest_thread->has_user_waiters ? 1 : 0,
+                                guest_thread->nwaiter_defer,
+                                guest_thread->last_wake_site != nullptr
+                                    ? guest_thread->last_wake_site
+                                    : "<null>",
+                                static_cast<unsigned long long>(
+                                    guest_thread->wake_release_count.load(
+                                        std::memory_order_relaxed)),
+                                static_cast<unsigned long long>(
+                                    guest_thread->spurious_cond_wakes.load(
+                                        std::memory_order_relaxed)));
+                            guest_thread->lock.unlock();
+                        } else {
+                            std::fprintf(probe_file,
+                                         "pthread state=<lock-busy>\n");
+                        }
+                    }
+                    std::fclose(probe_file);
+                }
+
+                Libraries::Kernel::Pthread* game_main = nullptr;
+                std::uintptr_t game_main_pthread = 0;
+                long game_main_native_tid = 0;
+                long game_main_host_tid = 0;
+                if (auto* const thread_state =
+                        Libraries::Kernel::ThrState::Instance();
+                    thread_state != nullptr) {
+                    std::scoped_lock thread_list_guard{
+                        thread_state->thread_list_lock};
+                    for (auto* const thread : thread_state->threads) {
+                        if (thread != nullptr && thread->name == "Game:Main") {
+                            game_main = thread;
+                            game_main_pthread = thread->native_thr.GetHandle();
+                            game_main_native_tid = static_cast<long>(
+                                thread->native_thr.GetTid());
+                            break;
+                        }
+                    }
+                }
+                std::error_code task_scan_error;
+                for (const auto& task_entry : std::filesystem::directory_iterator(
+                         "/proc/self/task", task_scan_error)) {
+                    if (task_scan_error) {
+                        break;
+                    }
+                    std::ifstream comm_file(task_entry.path() / "comm");
+                    std::string comm;
+                    if (!std::getline(comm_file, comm) || comm != "Game:Main") {
+                        continue;
+                    }
+                    const std::string tid_text =
+                        task_entry.path().filename().string();
+                    char* tid_end = nullptr;
+                    const long parsed_tid =
+                        std::strtol(tid_text.c_str(), &tid_end, 10);
+                    if (tid_end != tid_text.c_str() && *tid_end == '\0' &&
+                        parsed_tid > 0) {
+                        game_main_host_tid = parsed_tid;
+                        break;
+                    }
+                }
+
+                std::uint64_t rip = 0;
+                std::uint64_t rsp = 0;
+                std::uint64_t rbp = 0;
+                long host_tid = 0;
+                char host_name[64]{};
+                int regs_rc =
+                    game_main_pthread != 0 &&
+                            executor_jit_get_guest_thread_regs_by_pthread != nullptr
+                        ? executor_jit_get_guest_thread_regs_by_pthread(
+                              game_main_pthread, &rip, &rsp, &rbp, &host_tid,
+                              host_name, sizeof(host_name))
+                        : -1;
+                if (regs_rc != 0 && game_main_host_tid > 0 &&
+                    executor_jit_get_guest_thread_regs_by_tid != nullptr) {
+                    regs_rc = executor_jit_get_guest_thread_regs_by_tid(
+                        game_main_host_tid, &rip, &rsp, &rbp, &host_tid,
+                        host_name, sizeof(host_name));
+                }
+                auto* const rip_module =
+                    regs_rc == 0 ? FindGuestModuleByAddress(rip) : nullptr;
+                const auto main_probe_path =
+                    std::filesystem::path(g_root) /
+                    "diagnostic-exit8-game-main-state.txt";
+                if (std::FILE* const probe_file =
+                        std::fopen(main_probe_path.string().c_str(), "a")) {
+                    std::fprintf(
+                        probe_file,
+                        "sample=%u guest=%p pthread=0x%llx nativeTid=%ld "
+                        "procTid=%ld "
+                        "regsRc=%d hostTid=%ld "
+                        "hostName=%s rip=0x%llx module=%s offset=0x%llx "
+                        "rsp=0x%llx rbp=0x%llx stack=%s\n",
+                        sample, static_cast<void*>(game_main),
+                        static_cast<unsigned long long>(game_main_pthread),
+                        game_main_native_tid, game_main_host_tid, regs_rc,
+                        host_tid,
+                        host_name[0] != '\0' ? host_name : "<unknown>",
+                        static_cast<unsigned long long>(rip),
+                        rip_module != nullptr
+                            ? rip_module->file.string().c_str()
+                            : "<unknown>",
+                        static_cast<unsigned long long>(
+                            rip_module != nullptr
+                                ? GuestModuleOffset(*rip_module, rip)
+                                : 0),
+                        static_cast<unsigned long long>(rsp),
+                        static_cast<unsigned long long>(rbp),
+                        rsp != 0
+                            ? GuestQwordsHexBestEffortLocked(rsp, 16).c_str()
+                            : "<unavailable>");
+                    if (game_main != nullptr && game_main->lock.try_lock()) {
+                        std::fprintf(
+                            probe_file,
+                            "pthread name=%s state=%u wchan=%p mutex=%p "
+                            "willSleep=%d userWaiters=%d defer=%d lastWake=%s "
+                            "wakeCount=%llu spurious=%llu\n",
+                            game_main->name.c_str(),
+                            static_cast<unsigned>(game_main->state),
+                            game_main->wchan, game_main->mutex_obj,
+                            game_main->will_sleep ? 1 : 0,
+                            game_main->has_user_waiters ? 1 : 0,
+                            game_main->nwaiter_defer,
+                            game_main->last_wake_site != nullptr
+                                ? game_main->last_wake_site
+                                : "<null>",
+                            static_cast<unsigned long long>(
+                                game_main->wake_release_count.load(
+                                    std::memory_order_relaxed)),
+                            static_cast<unsigned long long>(
+                                game_main->spurious_cond_wakes.load(
+                                    std::memory_order_relaxed)));
+                        game_main->lock.unlock();
+                    }
+                    std::fclose(probe_file);
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        }).detach();
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_FEX_GAME_MAIN_LATE] source=sentinel path=%s enabled=1",
+                  fex_game_main_late_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_TRACE_FEX_GAME_MAIN_LATE");
+    }
+    const auto exit8_taskgraph_boundary_sentinel =
+        std::filesystem::path(g_root) / "run-exit8-taskgraph-boundary";
+    if (std::filesystem::exists(exit8_taskgraph_boundary_sentinel)) {
+        setenv("EXECUTOR_TRACE_EXIT8_TASKGRAPH_BOUNDARY", "1", 1);
+        static std::atomic_bool pthread_snapshot_started{false};
+        if (!pthread_snapshot_started.exchange(true, std::memory_order_acq_rel)) {
+            std::thread([] {
+                struct ThreadSnapshot {
+                    void* guest{};
+                    std::string name;
+                    std::int32_t guest_tid{};
+                    std::uintptr_t native_handle{};
+                    long native_tid{};
+                    unsigned state{};
+                    void* wchan{};
+                    void* mutex{};
+                    bool will_sleep{};
+                    bool user_waiters{};
+                    int deferred_waiters{};
+                    bool wake_posted{};
+                    std::string last_wake;
+                    std::uint64_t wake_count{};
+                    std::uint64_t spurious_count{};
+                    bool lock_busy{};
+                };
+
+                std::this_thread::sleep_for(std::chrono::seconds(12));
+                for (unsigned sample = 0; sample < 40; ++sample) {
+                    std::vector<ThreadSnapshot> rows;
+                    auto* const thread_state = Libraries::Kernel::ThrState::Instance();
+                    if (thread_state != nullptr &&
+                        thread_state->thread_list_lock.try_lock()) {
+                        rows.reserve(thread_state->threads.size());
+                        for (auto* const thread : thread_state->threads) {
+                            if (thread == nullptr ||
+                                thread->state == Libraries::Kernel::PthreadState::Dead) {
+                                continue;
+                            }
+                            ThreadSnapshot row{};
+                            row.guest = thread;
+                            row.name = thread->name;
+                            row.guest_tid = thread->tid.load(std::memory_order_relaxed);
+                            row.native_handle = thread->native_thr.GetHandle();
+                            row.native_tid = static_cast<long>(thread->native_thr.GetTid());
+                            if (thread->lock.try_lock()) {
+                                row.state = static_cast<unsigned>(thread->state);
+                                row.wchan = thread->wchan;
+                                row.mutex = thread->mutex_obj;
+                                row.will_sleep = thread->will_sleep;
+                                row.user_waiters = thread->has_user_waiters;
+                                row.deferred_waiters = thread->nwaiter_defer;
+                                row.wake_posted = thread->wake_sema_posted;
+                                row.last_wake = thread->last_wake_site != nullptr
+                                                    ? thread->last_wake_site
+                                                    : "<null>";
+                                row.wake_count = thread->wake_release_count.load(
+                                    std::memory_order_relaxed);
+                                row.spurious_count = thread->spurious_cond_wakes.load(
+                                    std::memory_order_relaxed);
+                                thread->lock.unlock();
+                            } else {
+                                row.lock_busy = true;
+                            }
+                            rows.emplace_back(std::move(row));
+                        }
+                        thread_state->thread_list_lock.unlock();
+                    }
+
+                    const auto path = std::filesystem::path(g_root) /
+                                      "diagnostic-exit8-pthread-snapshot.txt";
+                    if (std::FILE* const file =
+                            std::fopen(path.string().c_str(), "a")) {
+                        std::fprintf(file, "sample=%u rows=%zu\n", sample, rows.size());
+                        for (const auto& row : rows) {
+                            std::fprintf(
+                                file,
+                                " guest=%p name=%s guestTid=%d nativeHandle=0x%llx "
+                                "nativeTid=%ld state=%u wchan=%p mutex=%p willSleep=%d "
+                                "userWaiters=%d deferred=%d wakePosted=%d lastWake=%s "
+                                "wakeCount=%llu spurious=%llu lockBusy=%d\n",
+                                row.guest, row.name.c_str(), row.guest_tid,
+                                static_cast<unsigned long long>(row.native_handle),
+                                row.native_tid, row.state, row.wchan, row.mutex,
+                                row.will_sleep ? 1 : 0, row.user_waiters ? 1 : 0,
+                                row.deferred_waiters, row.wake_posted ? 1 : 0,
+                                row.last_wake.c_str(),
+                                static_cast<unsigned long long>(row.wake_count),
+                                static_cast<unsigned long long>(row.spurious_count),
+                                row.lock_busy ? 1 : 0);
+                        }
+                        std::fclose(file);
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
+            }).detach();
+        }
+        NativeLog(
+            ANDROID_LOG_INFO,
+            "[EXECUTOR_EXIT8_TASKGRAPH_BOUNDARY] source=sentinel path=%s enabled=1",
+            exit8_taskgraph_boundary_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_TRACE_EXIT8_TASKGRAPH_BOUNDARY");
     }
     const auto sync_frontier_sentinel =
         std::filesystem::path(g_root) / "run-sync-frontier";
@@ -22722,6 +32676,7 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                   std::filesystem::exists(force_gfx_sentinel) ? 1 : 0);
     }
     if (std::filesystem::exists(std::filesystem::path(g_root) / "run-live-quiet")) {
+        setenv("EXECUTOR_LIVE_QUIET", "1", 1);
         unsetenv("EXECUTOR_TRACE_LIVE_WIDE");
         unsetenv("EXECUTOR_TRACE_LIVE_HLE");
         unsetenv("EXECUTOR_TRACE_LIVE_SYNC");
@@ -22740,6 +32695,8 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                   "[EXECUTOR_LIVE_QUIET] enabled=1 tracing=off behavioral-flags=kept "
                   "directPosixSem=%s",
                   std::getenv("EXECUTOR_TRACE_LIVE_POSIX_DIRECT_SEM") ? "kept" : "off");
+    } else {
+        unsetenv("EXECUTOR_LIVE_QUIET");
     }
     const auto resource_manifest_sentinel =
         std::filesystem::path(g_root) / "run-resource-manifest-trace";
@@ -22768,6 +32725,15 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
         setenv("EXECUTOR_TRACE_VIDEOOUT_SOURCE", "1", 1);
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_TRACE_VIDEOOUT_SOURCE] enabled=1 mode=bounded-first-transitions");
+    } else {
+        unsetenv("EXECUTOR_TRACE_VIDEOOUT_SOURCE");
+    }
+    if (std::filesystem::exists(std::filesystem::path(g_root) / "run-trace-pad")) {
+        setenv("EXECUTOR_TRACE_PAD", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_TRACE_PAD] enabled=1 mode=bounded-state-changes");
+    } else {
+        unsetenv("EXECUTOR_TRACE_PAD");
     }
 #endif
     ConfigureFirmwareSupportLocked();
@@ -22798,6 +32764,12 @@ extern "C" const char* executor_lsx4_runtime_firmware_status() {
 }
 
 extern "C" int executor_lsx4_runtime_set_pad_button(std::uint32_t button_mask, int pressed) {
+    if (Executor::Ps1Classic::IsActive()) {
+        Executor::Ps1Classic::SetButton(button_mask, pressed != 0);
+        NativeLog(ANDROID_LOG_INFO, "[PS1_DIRECT_INPUT] button=0x%08x pressed=%d",
+                  button_mask, pressed ? 1 : 0);
+        return 0;
+    }
     Libraries::Pad::ExecutorPadRecordHostButtonEvent(button_mask, pressed != 0);
     auto* controller = Common::Singleton<Input::GameController>::Instance();
     controller->Button(0, static_cast<Libraries::Pad::OrbisPadButtonDataOffset>(button_mask),
@@ -22808,6 +32780,10 @@ extern "C" int executor_lsx4_runtime_set_pad_button(std::uint32_t button_mask, i
 }
 
 extern "C" int executor_lsx4_runtime_set_pad_axis(int axis, int value) {
+    if (Executor::Ps1Classic::IsActive()) {
+        Executor::Ps1Classic::SetAxis(axis, value);
+        return 0;
+    }
     if (axis < 0 || axis >= static_cast<int>(Input::Axis::AxisMax)) {
         return -1;
     }
@@ -22881,6 +32857,13 @@ bool InitializeAndroidTitleInfo(const std::filesystem::path& app0_path,
 extern "C" int executor_lsx4_runtime_set_touchpad(int pressed, float x, float y) {
     const float clamped_x = std::clamp(x, 0.0f, 1.0f);
     const float clamped_y = std::clamp(y, 0.0f, 1.0f);
+    if (Executor::Ps1Classic::IsActive()) {
+        Executor::Ps1Classic::SetTouchpad(pressed != 0, clamped_x, clamped_y);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[PS1_DIRECT_INPUT] touchpad pressed=%d x=%.3f y=%.3f",
+                  pressed ? 1 : 0, clamped_x, clamped_y);
+        return 0;
+    }
     auto* controller = Common::Singleton<Input::GameController>::Instance();
     controller->SetTouchpadState(0, pressed != 0, clamped_x, clamped_y);
     controller->Button(0, Libraries::Pad::OrbisPadButtonDataOffset::TouchPad, pressed != 0);
@@ -22905,6 +32888,125 @@ extern "C" int executor_lsx4_runtime_audio_init() {
 #else
     return 0;
 #endif
+}
+
+extern "C" int executor_lsx4_runtime_reset_title_session() {
+    if (Executor::Ps1Classic::IsActive()) {
+        Executor::Ps1Classic::Stop();
+    }
+    Libraries::AudioOut::ResetForTitleSession();
+    Libraries::Ajm::ResetForTitleSession();
+    g_audio_init_last_result.store(0x7fffffff, std::memory_order_release);
+    g_audio_probe_last_result.store(0x7fffffff, std::memory_order_release);
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_AUDIO] title_session_reset result=clean");
+    return 0;
+}
+
+extern "C" void executor_lsx4_install_jit_signal_handlers();
+
+extern "C" int executor_lsx4_runtime_set_paused(const int enabled) {
+    const bool paused = enabled != 0;
+    std::lock_guard lifecycle_lock{g_runtime_lifecycle_lock};
+
+
+
+    Executor::Ps1Classic::SetPaused(paused);
+    if (g_runtime_pause_requested == paused &&
+        g_runtime_pause_effective == paused) {
+        ++g_runtime_pause_idempotent;
+        g_runtime_pause_last_result = 0;
+        return 0;
+    }
+
+
+
+
+    const bool ps1_active = Executor::Ps1Classic::IsActive();
+    if (paused) {
+
+
+
+
+
+        if (!ps1_active && !Core::HasSleepSignalHandler()) {
+            if (RuntimeGuestJitActive()) {
+                executor_lsx4_install_jit_signal_handlers();
+            } else {
+                (void)Core::Signals::Instance();
+            }
+        }
+        if (!ps1_active) {
+
+
+            Libraries::AudioOut::SetSessionPaused(true);
+        }
+        if (!ps1_active && !DebugState.TryPauseGuestThreads()) {
+            Libraries::AudioOut::SetSessionPaused(false);
+            ++g_runtime_pause_rejected;
+            g_runtime_pause_last_result = -3;
+            NativeLog(ANDROID_LOG_ERROR,
+                      "[EXECUTOR_RUNTIME_LIFECYCLE] transition=pause result=rejected "
+                      "reason=sleep-handler-unavailable backend=%s",
+                      Executor::GuestCpuBackendName(
+                          g_runtime_guest_backend.load(std::memory_order_acquire)));
+            return g_runtime_pause_last_result;
+        }
+        g_runtime_pause_requested = true;
+        g_runtime_pause_effective = true;
+        ++g_runtime_pause_transitions;
+    } else {
+        // Wake guest lock owners before inline audio consumption can acquire
+
+        if (DebugState.IsGuestThreadsPaused()) {
+            DebugState.ResumeGuestThreads();
+        }
+        Libraries::AudioOut::SetSessionPaused(false);
+        g_runtime_pause_requested = false;
+        g_runtime_pause_effective = false;
+        ++g_runtime_resume_transitions;
+    }
+    g_runtime_pause_last_result = 0;
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_RUNTIME_LIFECYCLE] transition=%s result=0 ps1=%d "
+              "guestPaused=%d audioPaused=%d pauseCount=%llu resumeCount=%llu",
+              paused ? "pause" : "resume", ps1_active ? 1 : 0,
+              DebugState.IsGuestThreadsPaused() ? 1 : 0,
+              Libraries::AudioOut::IsSessionPaused() ? 1 : 0,
+              static_cast<unsigned long long>(g_runtime_pause_transitions),
+              static_cast<unsigned long long>(g_runtime_resume_transitions));
+    return 0;
+}
+
+extern "C" const char* executor_lsx4_runtime_lifecycle_status() {
+    static thread_local std::string status;
+    std::lock_guard lifecycle_lock{g_runtime_lifecycle_lock};
+    const bool ps1_active = Executor::Ps1Classic::IsActive();
+    const bool signal_capable = Core::HasSleepSignalHandler();
+    std::ostringstream out;
+    out << "{"
+        << R"("schema":"lsx4.runtime-lifecycle.v1",)"
+        << R"("platform":"ps4",)"
+        << R"("backend":")"
+        << Executor::GuestCpuBackendName(
+               g_runtime_guest_backend.load(std::memory_order_acquire))
+        << R"(",)"
+        << R"("supported":)" << (ps1_active || signal_capable ? "true" : "false") << ","
+        << R"("sleepSignalHandler":)" << (signal_capable ? "true" : "false") << ","
+        << R"("requested":)" << (g_runtime_pause_requested ? "true" : "false") << ","
+        << R"("effective":)" << (g_runtime_pause_effective ? "true" : "false") << ","
+        << R"("guestPaused":)" << (DebugState.IsGuestThreadsPaused() ? "true" : "false") << ","
+        << R"("audioPaused":)" << (Libraries::AudioOut::IsSessionPaused() ? "true" : "false") << ","
+        << R"("ps1Active":)" << (ps1_active ? "true" : "false") << ","
+        << R"("ps1Paused":)" << (Executor::Ps1Classic::IsPaused() ? "true" : "false") << ","
+        << R"("pauseTransitions":)" << g_runtime_pause_transitions << ","
+        << R"("resumeTransitions":)" << g_runtime_resume_transitions << ","
+        << R"("idempotentTransitions":)" << g_runtime_pause_idempotent << ","
+        << R"("rejectedTransitions":)" << g_runtime_pause_rejected << ","
+        << R"("lastResult":)" << g_runtime_pause_last_result
+        << "}";
+    status = out.str();
+    return status.c_str();
 }
 
 extern "C" int executor_lsx4_runtime_set_audio_enabled(const int enabled) {
@@ -22933,6 +33035,9 @@ extern "C" int executor_lsx4_runtime_set_managed_optimization(const int option,
     constexpr int HostFlagM = 16;
     constexpr int HostSve2 = 17;
     constexpr int HostRcpc = 18;
+    constexpr int GuestSpinWaitEvent = 19;
+    constexpr int Fsr = 20;
+    constexpr int Rcas = 21;
     static std::atomic<bool> tiered_jit{false};
     static std::atomic<bool> trace_compilation{false};
     const bool active = enabled != 0;
@@ -23040,6 +33145,22 @@ extern "C" int executor_lsx4_runtime_set_managed_optimization(const int option,
         Executor::Jit::ConfigureHostRcpc(active);
         option_name = "host_rcpc";
         break;
+    case GuestSpinWaitEvent:
+        Executor::Jit::ConfigureGuestSpinWaitEvent(active);
+        option_name = "guest_spin_wait_event";
+        break;
+    case Fsr:
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+        VideoCore::SetManagedMobileFsrEnabled(active);
+#endif
+        option_name = "fsr";
+        break;
+    case Rcas:
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+        VideoCore::SetManagedMobileRcasEnabled(active);
+#endif
+        option_name = "rcas";
+        break;
     default:
         return -1;
     }
@@ -23048,7 +33169,7 @@ extern "C" int executor_lsx4_runtime_set_managed_optimization(const int option,
               "vkDiagnostics=%d coarseFragment=%d disableRobustness=%d "
               "readbackBatch=%d driverCalls=%d asyncPipeline=%d mobileGpu=%d "
               "audioSimd=%d fastGuestMemory=%d relaxedFpFusion=%d adpf=%d "
-              "flagm=%d sve2=%d rcpc=%d",
+              "flagm=%d sve2=%d rcpc=%d guestSpinWaitEvent=%d",
               option_name, active ? 1 : 0, Config::directMemoryAccess() ? 1 : 0,
               Config::managedGpuFastPath() ? 0 : 1,
               Config::managedCoarseFragmentShading() ? 1 : 0,
@@ -23060,7 +33181,8 @@ extern "C" int executor_lsx4_runtime_set_managed_optimization(const int option,
               Executor::AndroidPerformanceHint::IsEnabled() ? 1 : 0,
               Executor::Jit::HostFlagMEnabled() ? 1 : 0,
               Executor::Jit::HostSve2Enabled() ? 1 : 0,
-              Executor::Jit::HostRcpcEnabled() ? 1 : 0);
+              Executor::Jit::HostRcpcEnabled() ? 1 : 0,
+              Executor::Jit::GuestSpinWaitEventEnabled() ? 1 : 0);
 #else
               Config::managedReadbackBatching() ? 1 : 0,
               VideoCore::IsManagedVulkanDriverOptimization() ? 1 : 0,
@@ -23072,7 +33194,8 @@ extern "C" int executor_lsx4_runtime_set_managed_optimization(const int option,
               Executor::AndroidPerformanceHint::IsEnabled() ? 1 : 0,
               Executor::Jit::HostFlagMEnabled() ? 1 : 0,
               Executor::Jit::HostSve2Enabled() ? 1 : 0,
-              Executor::Jit::HostRcpcEnabled() ? 1 : 0);
+              Executor::Jit::HostRcpcEnabled() ? 1 : 0,
+              Executor::Jit::GuestSpinWaitEventEnabled() ? 1 : 0);
 #endif
     return 0;
 }
@@ -23147,18 +33270,24 @@ extern "C" const char* executor_lsx4_runtime_audio_status() {
 void RefreshAndroidVulkanWindowLocked() {
 #ifdef __ANDROID__
     if (!g_surface_attached || !g_native_window || g_surface_width <= 0 || g_surface_height <= 0) {
-        if (g_window == g_android_vulkan_window.get()) {
-            g_window = nullptr;
+
+
+        if (g_android_vulkan_window) {
+            g_android_vulkan_window->UpdateAndroidSurface(0, 0, nullptr);
         }
-        g_android_vulkan_window.reset();
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_VULKAN_WSI] nativeSurfaceAttached=NO windowBridgeReady=NO "
                   "phase=android_window_detached");
         return;
     }
 
-    g_android_vulkan_window =
-        std::make_unique<Frontend::WindowSDL>(g_surface_width, g_surface_height, g_native_window);
+    if (!g_android_vulkan_window) {
+        g_android_vulkan_window =
+            std::make_unique<Frontend::WindowSDL>(g_surface_width, g_surface_height, g_native_window);
+    } else {
+        g_android_vulkan_window->UpdateAndroidSurface(g_surface_width, g_surface_height,
+                                                     g_native_window);
+    }
     g_window = g_android_vulkan_window.get();
     NativeLog(ANDROID_LOG_INFO,
               "[EXECUTOR_VULKAN_WSI] nativeSurfaceAttached=YES windowBridgeReady=YES "
@@ -23182,6 +33311,7 @@ extern "C" int executor_lsx4_runtime_attach_surface(void* native_window) {
         g_surface_attached = false;
         g_surface_width = 0;
         g_surface_height = 0;
+        Executor::Ps1Classic::AttachSurface(nullptr, 0, 0);
         RefreshAndroidVulkanWindowLocked();
         return -1;
     }
@@ -23192,6 +33322,7 @@ extern "C" int executor_lsx4_runtime_attach_surface(void* native_window) {
         g_surface_width = ANativeWindow_getWidth(static_cast<ANativeWindow*>(g_native_window));
         g_surface_height = ANativeWindow_getHeight(static_cast<ANativeWindow*>(g_native_window));
 #endif
+        Executor::Ps1Classic::AttachSurface(g_native_window, g_surface_width, g_surface_height);
         NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_VULKAN_WSI] nativeSurfaceAttached=YES phase=attach_same "
                   "width=%d height=%d nativeWindow=%p",
@@ -23212,6 +33343,7 @@ extern "C" int executor_lsx4_runtime_attach_surface(void* native_window) {
     g_native_window = native_window;
 #endif
     g_surface_attached = true;
+    Executor::Ps1Classic::AttachSurface(g_native_window, g_surface_width, g_surface_height);
     NativeLog(ANDROID_LOG_INFO,
               "[EXECUTOR_VULKAN_WSI] nativeSurfaceAttached=YES phase=attach_new "
               "width=%d height=%d nativeWindow=%p",
@@ -23231,6 +33363,7 @@ extern "C" int executor_lsx4_runtime_detach_surface() {
     g_surface_attached = false;
     g_surface_width = 0;
     g_surface_height = 0;
+    Executor::Ps1Classic::AttachSurface(nullptr, 0, 0);
     NativeLog(ANDROID_LOG_INFO,
               "[EXECUTOR_VULKAN_WSI] nativeSurfaceAttached=NO windowBridgeReady=NO "
               "phase=detach_surface");
@@ -23362,10 +33495,399 @@ extern "C" const char* executor_lsx4_runtime_status() {
     return g_status.c_str();
 }
 
+extern "C" int executor_lsx4_runtime_set_render_scale_percent(int percent) {
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    const int clamped = percent <= 0 ? 0 : (percent > 100 ? 100 : percent);
+    VideoCore::SetMobileGpuForcedScalePercent(static_cast<std::uint32_t>(clamped));
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_RENDER_SCALE] requested=%d applied=%d adaptive=%d",
+              percent, clamped, clamped == 0 ? 1 : 0);
+    return clamped;
+#else
+    (void)percent;
+    return 0;
+#endif
+}
+
 extern "C" const char* executor_lsx4_runtime_jit_status() {
     static std::string status;
     status = Lsx4::Translation::DescribeTranslationRuntime();
     return status.c_str();
+}
+
+extern "C" const char* executor_lsx4_runtime_fex_proof_metrics() {
+    static thread_local std::string snapshot;
+    const auto boot_time_ns = []() noexcept -> std::uint64_t {
+        timespec value{};
+        return ::clock_gettime(CLOCK_BOOTTIME, &value) == 0
+                   ? static_cast<std::uint64_t>(value.tv_sec) * UINT64_C(1000000000) +
+                         static_cast<std::uint64_t>(value.tv_nsec)
+                   : 0;
+    };
+
+    const std::uint64_t before_ns = boot_time_ns();
+    Lsx4FexProofMetricsV1 metrics{};
+    const int query_status = Executor::Fex::QueryProofMetrics(metrics);
+    const std::uint64_t after_ns = boot_time_ns();
+    const auto effective =
+        g_runtime_guest_backend.load(std::memory_order_acquire);
+    const char* mode = "invalid";
+    if (metrics.mode == LSX4_FEX_PROOF_METRICS_DISABLED) {
+        mode = "off";
+    } else if (metrics.mode == LSX4_FEX_PROOF_METRICS_STATIC) {
+        mode = "static";
+    } else if (metrics.mode == LSX4_FEX_PROOF_METRICS_DYNAMIC) {
+        mode = "dynamic";
+    }
+
+    std::ostringstream output;
+    output << "{"
+           << R"("schema":"lsx4-fex-proof-metrics/v1",)"
+           << R"("source":"fex-runtime-diagnostic-v1",)"
+           << R"("effectiveBackend":")"
+           << Executor::GuestCpuBackendName(effective) << R"(",)"
+           << R"("pid":)" << static_cast<unsigned long long>(::getpid()) << ","
+           << R"("bootBeforeNs":)" << before_ns << ","
+           << R"("bootAfterNs":)" << after_ns << ","
+           << R"("queryStatus":)" << query_status << ","
+           << R"("status":)" << metrics.status << ","
+           << R"("structSize":)" << metrics.struct_size << ","
+           << R"("abiVersion":)" << metrics.abi_version << ","
+           << R"("instrumentationState":")" << mode << R"(",)"
+           << R"("captureFlags":)" << metrics.capture_flags << ","
+           << R"("requestedMask":)" << metrics.requested_mask << ","
+           << R"("validMask":)" << metrics.valid_mask << ","
+           << R"("unavailableMask":)" << metrics.unavailable_mask << ","
+           << R"("exactMask":)" << metrics.exact_mask << ","
+           << R"("sampledMask":)" << metrics.sampled_mask << ","
+           << R"("staticMask":)" << metrics.static_mask << ","
+           << R"("dynamicMask":)" << metrics.dynamic_mask << ","
+           << R"("perturbedMask":)" << metrics.perturbed_mask << ","
+           << R"("attemptedNotRetiredMask":)"
+           << metrics.attempted_not_retired_mask << ","
+           << R"("epoch":)" << metrics.epoch << ","
+           << R"("sequence":)" << metrics.sequence << ","
+           << R"("values":{)"
+           << R"("executedGuestInstructionEntries":)"
+           << metrics.executed_guest_instruction_entries << ","
+           << R"("executedIrBlockEntries":)" << metrics.executed_ir_block_entries << ","
+           << R"("executedDispatcherEntries":)"
+           << metrics.executed_dispatcher_entries << ","
+           << R"("compiledGuestInstructionSites":)"
+           << metrics.compiled_guest_instruction_sites << ","
+           << R"("compiledGuestBytes":)" << metrics.compiled_guest_bytes << ","
+           << R"("publishedNativeBlockBytes":)"
+           << metrics.published_native_block_bytes << ","
+           << R"("compiledSpillSlots":)" << metrics.compiled_spill_slots << ","
+           << R"("compiledSpillSites":)" << metrics.compiled_spill_sites << ","
+           << R"("compiledFillSites":)" << metrics.compiled_fill_sites << ","
+           << R"("compiledHelperSites":)" << metrics.compiled_helper_sites << ","
+           << R"("compiledFlagSites":)" << metrics.compiled_flag_sites << ","
+           << R"("compiledFenceSites":)" << metrics.compiled_fence_sites << ","
+           << R"("compiledDmbSites":)" << metrics.compiled_dmb_sites << ","
+           << R"("translationUnits":)" << metrics.translation_units << ","
+           << R"("compiledIrBlocks":)" << metrics.compiled_ir_blocks << ","
+           << R"("publishedNativeBlocks":)" << metrics.published_native_blocks << ","
+           << R"("compiledExplicitHelperSites":)"
+           << metrics.compiled_explicit_helper_sites << ","
+           << R"("compiledExplicitFenceDmbSites":)"
+           << metrics.compiled_explicit_fence_dmb_sites << "}}";
+    snapshot = output.str();
+    return snapshot.c_str();
+}
+
+extern "C" const char* executor_lsx4_runtime_proof_counters() {
+    static thread_local std::string snapshot;
+    const auto boot_time_ns = []() noexcept -> std::uint64_t {
+        timespec value{};
+        return ::clock_gettime(CLOCK_BOOTTIME, &value) == 0
+                   ? static_cast<std::uint64_t>(value.tv_sec) * UINT64_C(1000000000) +
+                         static_cast<std::uint64_t>(value.tv_nsec)
+                   : 0;
+    };
+
+    const std::uint64_t before_ns = boot_time_ns();
+    Lsx4FunnelRuntimeProofCountersV1 counters{};
+    counters.struct_size = sizeof(counters);
+    counters.abi_version = LSX4_FUNNEL_RUNTIME_PROOF_COUNTERS_ABI_V1;
+    const std::int32_t query_status =
+        executor_funnel_runtime_proof_counters_query_v1(&counters);
+    const std::uint64_t after_ns = boot_time_ns();
+    const auto effective = g_runtime_guest_backend.load(std::memory_order_acquire);
+    const char* mode = "invalid";
+    if (counters.mode == LSX4_FUNNEL_RUNTIME_PROOF_COUNTERS_DISABLED) {
+        mode = "off";
+    } else if (counters.mode ==
+               LSX4_FUNNEL_RUNTIME_PROOF_COUNTERS_DYNAMIC_DIAGNOSTIC) {
+        mode = "dynamic-diagnostic";
+    }
+
+    std::ostringstream output;
+    output << "{"
+           << R"("schema":"lsx4-runtime-proof-counters/v1",)"
+           << R"("source":"funnel-runtime-diagnostic-v1",)"
+           << R"("effectiveBackend":")"
+           << Executor::GuestCpuBackendName(effective) << R"(",)"
+           << R"("pid":)" << static_cast<unsigned long long>(::getpid()) << ","
+           << R"("bootBeforeNs":)" << before_ns << ","
+           << R"("bootAfterNs":)" << after_ns << ","
+           << R"("queryStatus":)" << query_status << ","
+           << R"("status":)" << counters.status << ","
+           << R"("structSize":)" << counters.struct_size << ","
+           << R"("abiVersion":)" << counters.abi_version << ","
+           << R"("instrumentationState":")" << mode << R"(",)"
+           << R"("captureFlags":)" << counters.capture_flags << ","
+           << R"("saturated":)" << counters.saturated << ","
+           << R"("requestedMask":)" << counters.requested_mask << ","
+           << R"("validMask":)" << counters.valid_mask << ","
+           << R"("unavailableMask":)" << counters.unavailable_mask << ","
+           << R"("exactMask":)" << counters.exact_mask << ","
+           << R"("sampledMask":)" << counters.sampled_mask << ","
+           << R"("staticMask":)" << counters.static_mask << ","
+           << R"("dynamicMask":)" << counters.dynamic_mask << ","
+           << R"("perturbedMask":)" << counters.perturbed_mask << ","
+           << R"("attemptedNotRetiredMask":)"
+           << counters.attempted_not_retired_mask << ","
+           << R"("epoch":)" << counters.epoch << ","
+           << R"("sequence":)" << counters.sequence << ","
+           << R"("values":{)"
+           << R"("guestInvalidationRequests":)"
+           << counters.guest_invalidation_requests << ","
+           << R"("guestInvalidationCompletions":)"
+           << counters.guest_invalidation_completions << ","
+           << R"("guestInvalidationWaitNs":)"
+           << counters.guest_invalidation_wait_ns << ","
+           << R"("ownedGeneratedCodeWriteFaults":)"
+           << counters.owned_generated_code_write_faults << ","
+           << R"("fastmemMisses":)" << counters.fastmem_misses << "}}";
+    snapshot = output.str();
+    return snapshot.c_str();
+}
+
+extern "C" const char* executor_lsx4_runtime_gpu_residency_metrics() {
+    static thread_local std::string snapshot;
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    const auto pipeline = Vulkan::GetPipelineResidencyTelemetrySnapshot();
+    const auto caches = Vulkan::GetRendererCacheResidencyTelemetrySnapshot();
+    const auto utility_rings = Vulkan::GetRendererUtilityRingTelemetrySnapshot();
+    const auto mobile = VideoCore::GetMobileGpuOptimizationStats();
+    std::ostringstream output;
+    const auto write_utility_ring = [&output](
+                                        const char* const name,
+                                        const Vulkan::UtilityRingUsageTelemetrySnapshot& ring,
+                                        const bool trailing_comma) {
+        output << '"' << name << R"(":{)"
+               << R"("capacityBytes":)" << ring.capacity_bytes << ','
+               << R"("requestedBytes":)" << ring.requested_bytes << ','
+               << R"("requestCount":)" << ring.request_count << ','
+               << R"("maxRequestBytes":)" << ring.max_request_bytes << ','
+               << R"("maxMappedEnd":)" << ring.max_mapped_end << ','
+               << R"("wrapCount":)" << ring.wrap_count << ','
+               << R"("forcedWaitCount":)" << ring.forced_wait_count << ','
+               << R"("failedRequestCount":)" << ring.failed_request_count << '}'
+               << (trailing_comma ? "," : "");
+    };
+    output << "{"
+           << R"("schema":"lsx4-gpu-residency-metrics/v1",)"
+           << R"("source":"renderer-published-lock-free-snapshot",)"
+           << R"("pid":)" << static_cast<unsigned long long>(::getpid()) << ","
+           << R"("pipeline":{)"
+           << R"("sequence":)" << pipeline.sequence << ","
+           << R"("programEntries":)" << pipeline.program_entries << ","
+           << R"("graphicsPipelineEntries":)"
+           << pipeline.graphics_pipeline_entries << ","
+           << R"("computePipelineEntries":)"
+           << pipeline.compute_pipeline_entries << ","
+           << R"("newPipelines":)" << pipeline.new_pipelines << ","
+           << R"("shaderIdentityEntries":)"
+           << pipeline.shader_identity_entries << ","
+           << R"("srtObjects":)" << pipeline.srt_objects << ","
+           << R"("srtRetainedBytes":)" << pipeline.srt_retained_bytes << ","
+           << R"("descriptorTopology":{)"
+           << R"("descriptorLayouts":)" << pipeline.descriptor_layouts << ","
+           << R"("pushDescriptorLayouts":)"
+           << pipeline.push_descriptor_layouts << ","
+           << R"("legacyDescriptorLayouts":)"
+           << pipeline.legacy_descriptor_layouts << ","
+           << R"("descriptorBindings":)" << pipeline.descriptor_bindings << ","
+           << R"("maxDescriptorBindings":)"
+           << pipeline.max_descriptor_bindings << ","
+           << R"("maxPushDescriptors":)" << pipeline.max_push_descriptors << ","
+           << R"("maxUpdateAfterBindDescriptors":)"
+           << pipeline.max_update_after_bind_descriptors << "}},"
+           << R"("caches":{)"
+           << R"("sequence":)" << caches.sequence << ","
+           << R"("textureGuestBytes":)" << caches.texture_guest_bytes << ","
+           << R"("textureImageEntries":)" << caches.texture_image_entries << ","
+           << R"("textureImageViewEntries":)"
+           << caches.texture_image_view_entries << ","
+           << R"("textureSamplerEntries":)"
+           << caches.texture_sampler_entries << ","
+           << R"("bufferResidentBytes":)" << caches.buffer_resident_bytes << ","
+           << R"("bufferUtilityBytes":)" << caches.buffer_utility_bytes << ","
+           << R"("bufferEntries":)" << caches.buffer_entries << ","
+           << R"("imageTopology":{)"
+           << R"("imageCreations":)" << caches.image_creations << ","
+           << R"("mutableImageCreations":)" << caches.mutable_image_creations << ","
+           << R"("extendedUsageImageCreations":)"
+           << caches.extended_usage_image_creations << ","
+           << R"("colorStorageImageCreations":)"
+           << caches.color_storage_image_creations << ","
+           << R"("depthImageCreations":)" << caches.depth_image_creations << ","
+           << R"("blockImageCreations":)" << caches.block_image_creations << ","
+           << R"("imageAllocationBytes":)" << caches.image_allocation_bytes << ","
+           << R"("maxImageAllocationBytes":)"
+           << caches.max_image_allocation_bytes << ","
+           << R"("boundedFormatListImageCreations":)"
+           << caches.bounded_format_list_image_creations << ","
+           << R"("boundedFormatListEntries":)"
+           << caches.bounded_format_list_entries << ","
+           << R"("maxBoundedFormatListEntries":)"
+           << caches.max_bounded_format_list_entries << ","
+           << R"("imageViewCreations":)" << caches.image_view_creations << ","
+           << R"("reinterpretedImageViewCreations":)"
+           << caches.reinterpreted_image_view_creations << ","
+           << R"("storageImageViewCreations":)"
+           << caches.storage_image_view_creations << "}},"
+           << R"("utilityRings":{)"
+           << R"("sequence":)" << utility_rings.sequence << ',';
+    write_utility_ring("staging", utility_rings.staging, true);
+    write_utility_ring("stream", utility_rings.stream, true);
+    write_utility_ring("download", utility_rings.download, true);
+    write_utility_ring("device", utility_rings.device, false);
+    const auto& upload = utility_rings.upload_reservation;
+    output << "},"
+           << R"("uploadReservation":{)"
+           << R"("transactionCount":)" << upload.transaction_count << ','
+           << R"("completedTransactionCount":)"
+           << upload.completed_transaction_count << ','
+           << R"("failedTransactionCount":)"
+           << upload.failed_transaction_count << ','
+           << R"("measurementCount":)" << upload.measurement_count << ','
+           << R"("retryCount":)" << upload.retry_count << ','
+           << R"("fullSpanCandidateBytes":)"
+           << upload.full_span_candidate_bytes << ','
+           << R"("dirtyBytes":)" << upload.dirty_bytes << ','
+           << R"("avoidedBytes":)" << upload.avoided_bytes << ','
+           << R"("maxFullSpanCandidateBytes":)"
+           << upload.max_full_span_candidate_bytes << ','
+           << R"("maxDirtyBytes":)" << upload.max_dirty_bytes << "},"
+           << R"("memory":{)"
+           << R"("observedSamples":)" << mobile.observed_memory_samples << ","
+           << R"("usedBytes":)" << mobile.memory_used_bytes << ","
+           << R"("budgetBytes":)" << mobile.memory_budget_bytes << ","
+           << R"("residencyGcPasses":)" << mobile.residency_gc_passes << ","
+           << R"("residencyGcEvictions":)" << mobile.residency_gc_evictions << ","
+           << R"("residencyGcNoVictimSkips":)"
+           << mobile.residency_gc_no_victim_skips << ","
+           << R"("textureGcPasses":)" << mobile.texture_gc_passes << ","
+           << R"("textureGcEvictions":)" << mobile.texture_gc_evictions << ","
+           << R"("textureGcNoVictimSkips":)"
+           << mobile.texture_gc_no_victim_skips << ","
+           << R"("textureGcForcedPasses":)"
+           << mobile.texture_gc_forced_passes << ","
+           << R"("textureGcAuditPasses":)"
+           << mobile.texture_gc_audit_passes << ","
+           << R"("bufferGcPasses":)" << mobile.buffer_gc_passes << ","
+           << R"("bufferGcEvictions":)" << mobile.buffer_gc_evictions << ","
+           << R"("bufferGcNoVictimSkips":)"
+           << mobile.buffer_gc_no_victim_skips << ","
+           << R"("bufferGcForcedPasses":)"
+           << mobile.buffer_gc_forced_passes << ","
+           << R"("bufferGcAuditPasses":)"
+           << mobile.buffer_gc_audit_passes << ","
+           << R"("androidMemoryPressureCallbacks":)"
+           << mobile.android_memory_pressure_callbacks << ","
+           << R"("androidMemoryPressureConsumed":)"
+           << mobile.android_memory_pressure_consumed << ","
+           << R"("androidMemoryPressureMaxLevel":)"
+           << mobile.android_memory_pressure_max_level << ","
+           << R"("androidMemoryInfoSamples":)"
+           << mobile.android_memory_info_samples << ","
+           << R"("androidMemoryAvailableBytes":)"
+           << mobile.android_memory_available_bytes << ","
+           << R"("androidMemoryThresholdBytes":)"
+           << mobile.android_memory_threshold_bytes << ","
+           << R"("androidMemoryLowSamples":)"
+           << mobile.android_memory_low_samples
+           << ","
+           << R"("androidProcessMemorySamples":)"
+           << mobile.android_process_memory_samples << ","
+           << R"("androidProcessTotalPssBytes":)"
+           << mobile.android_process_total_pss_bytes << ","
+           << R"("androidProcessGraphicsBytes":)"
+           << mobile.android_process_graphics_bytes << ","
+           << R"("androidProcessTotalSwapBytes":)"
+           << mobile.android_process_total_swap_bytes
+           << "}}";
+    snapshot = output.str();
+#else
+    snapshot =
+        R"({"schema":"lsx4-gpu-residency-metrics/v1","supported":false,"reason":"external-funnel-baseline"})";
+#endif
+    return snapshot.c_str();
+}
+
+extern "C" int executor_lsx4_runtime_report_android_memory_pressure(
+    const int level) {
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    if (level <= 0) {
+        return -1;
+    }
+    const auto bounded = static_cast<u32>(std::min(level, 100));
+    VideoCore::ReportAndroidMemoryPressure(bounded);
+    return static_cast<int>(bounded);
+#else
+    (void)level;
+    return -2;
+#endif
+}
+
+extern "C" int executor_lsx4_runtime_report_android_memory_info(
+    const int level, const unsigned long long available_bytes,
+    const unsigned long long threshold_bytes, const int low_memory) {
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    if (level < 0) {
+        return -1;
+    }
+    const auto bounded = static_cast<u32>(std::min(level, 100));
+    VideoCore::ReportAndroidMemoryInfo(
+        bounded, static_cast<u64>(available_bytes),
+        static_cast<u64>(threshold_bytes), low_memory != 0);
+    return static_cast<int>(bounded);
+#else
+    (void)level;
+    (void)available_bytes;
+    (void)threshold_bytes;
+    (void)low_memory;
+    return -2;
+#endif
+}
+
+extern "C" int executor_lsx4_runtime_report_android_process_memory_info(
+    const unsigned long long total_pss_bytes,
+    const unsigned long long graphics_bytes,
+    const unsigned long long total_swap_bytes) {
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    VideoCore::ReportAndroidProcessMemoryInfo(
+        static_cast<u64>(total_pss_bytes), static_cast<u64>(graphics_bytes),
+        static_cast<u64>(total_swap_bytes));
+    return 0;
+#else
+    (void)total_pss_bytes;
+    (void)graphics_bytes;
+    (void)total_swap_bytes;
+    return -2;
+#endif
+}
+
+extern "C" int
+executor_lsx4_runtime_android_memory_pressure_monitor_requested() {
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    return VideoCore::IsAndroidMemoryPressureMonitorRequested() ? 1 : 0;
+#else
+    return 0;
+#endif
 }
 
 extern "C" int executor_jit_guest_range_selftest() {
@@ -23399,7 +33921,7 @@ extern "C" int executor_jit_guest_range_selftest() {
 
 extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
                                                    std::size_t value_count) {
-    constexpr std::size_t kValueCount = 92;
+    constexpr std::size_t kValueCount = 166;
     if (values == nullptr || value_count < kValueCount) {
         return -1;
     }
@@ -23426,7 +33948,39 @@ extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
             static_cast<unsigned long long>(
                 cpu.simd_estimated_loads_stores_avoided));
     }
-    values[0] = cpu.decoded_regions;
+    const Lsx4FexBackendApiV3* const fex_api = Executor::Fex::ActiveApi();
+    std::uint64_t translated_blocks = cpu.decoded_regions;
+    std::uint64_t fex_code_cache_generation = 0;
+    std::uint64_t fex_code_cache_current_segments = 0;
+    std::uint64_t fex_code_cache_used_bytes = 0;
+    std::uint64_t fex_code_cache_capacity_bytes = 0;
+    std::uint64_t fex_jit_compilations = 0;
+    std::uint64_t fex_jit_compile_time_ns = 0;
+    if (fex_api != nullptr && fex_api->query != nullptr) {
+        Lsx4FexQueryRequestV3 request{};
+        request.struct_size = sizeof(request);
+        request.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+        request.request_cookie = UINT64_C(0x4855444645580001);
+        Lsx4FexQueryResultV3 result{};
+        result.struct_size = sizeof(result);
+        result.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+        result.request_cookie = request.request_cookie;
+        const std::int32_t status =
+            fex_api->query(fex_api->backend_context, &request, &result);
+        if (status == LSX4_FEX_STATUS_OK &&
+            result.status == LSX4_FEX_STATUS_OK &&
+            result.struct_size >= sizeof(result) &&
+            result.request_cookie == request.request_cookie) {
+            translated_blocks = result.published_executable_blocks;
+            fex_code_cache_generation = result.code_cache_generation;
+            fex_code_cache_current_segments = result.code_cache_current_segments;
+            fex_code_cache_used_bytes = result.code_cache_used_bytes;
+            fex_code_cache_capacity_bytes = result.code_cache_capacity_bytes;
+            fex_jit_compilations = result.jit_compilations;
+            fex_jit_compile_time_ns = result.jit_compile_time_ns;
+        }
+    }
+    values[0] = translated_blocks;
     values[1] = cpu.native_regions;
     values[2] = cpu.semantic_regions;
     values[3] = cpu.unsupported_regions;
@@ -23436,7 +33990,9 @@ extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
     values[7] = gpu.builder_shader;
     values[8] = gpu.submit_calls;
     values[9] = gpu.submit_done_calls;
-    values[10] = Vulkan::ExecutorGetLivePresentCount();
+    values[10] = Executor::Ps1Classic::IsActive()
+                     ? Executor::Ps1Classic::PresentCount()
+                     : Vulkan::ExecutorGetLivePresentCount();
     values[11] = cpu.stored_ir_enabled;
     values[12] = cpu.stored_ir_loaded;
     values[13] = cpu.stored_ir_hits;
@@ -23529,7 +34085,174 @@ extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
     values[89] = cpu.tier1_loop_osr_handoffs;
     values[90] = cpu.tier1_compile_time_us;
     values[91] = cpu.tier1_generated_bytes;
+    values[92] = fex_api != nullptr ? 1 : 0;
+    values[93] = fex_code_cache_generation;
+    values[94] = fex_code_cache_current_segments;
+    values[95] = fex_code_cache_used_bytes;
+    values[96] = fex_code_cache_capacity_bytes;
+    values[97] = fex_jit_compilations;
+    values[98] = fex_jit_compile_time_ns;
+#if defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    std::fill(values + 99, values + kValueCount, 0);
+#else
+
+
+    values[99] = mobile.fsr_active;
+    values[100] = mobile.rcas_active;
+    values[101] = mobile.fsr_source_width;
+    values[102] = mobile.fsr_source_height;
+    values[103] = mobile.fsr_output_width;
+    values[104] = mobile.fsr_output_height;
+    values[105] = VideoCore::IsManagedMobileFsrEnabled() ? 1 : 0;
+    values[106] = VideoCore::IsManagedMobileRcasEnabled() ? 1 : 0;
+    values[107] = mobile.rcas_frames;
+
+
+    values[108] = 1;
+    values[109] = mobile.upscaler_requested_mode;
+    values[110] = mobile.upscaler_effective_mode;
+    values[111] = mobile.upscaler_frames;
+    values[112] = mobile.upscaler_fallback_reason;
+    values[113] = mobile.temporal_native_inputs;
+#endif
+
+
+    const auto cpu_profile = Executor::CpuTuning::Get();
+    values[114] = 1;
+    values[115] = cpu_profile.identity;
+    values[116] = static_cast<std::uint32_t>(cpu_profile.preset);
+    values[117] = static_cast<std::uint32_t>(cpu_profile.execution_mode);
+    values[118] = static_cast<std::uint32_t>(cpu_profile.fast_memory);
+    values[119] = static_cast<std::uint32_t>(cpu_profile.memory_manager);
+    values[120] = cpu_profile.block_linking;
+    values[121] = static_cast<std::uint32_t>(cpu_profile.persistent_cache);
+    values[122] = static_cast<std::uint32_t>(cpu_profile.function_replacements);
+    values[123] = cpu_profile.guest_clock_percent;
+    values[124] = static_cast<std::uint32_t>(cpu_profile.cycle_skip);
+    values[125] = static_cast<std::uint32_t>(cpu_profile.idle_loop_skip);
+    values[126] = static_cast<std::uint32_t>(cpu_profile.wait_loop_detection);
+    values[127] = static_cast<std::uint32_t>(cpu_profile.spin_loop_detection);
+    values[128] = cpu_profile.max_guest_workers;
+    values[129] = cpu_profile.fast_event_timing;
+    values[130] = static_cast<std::uint32_t>(cpu_profile.jit_block_size);
+    values[131] = static_cast<std::uint32_t>(cpu_profile.fp_accuracy);
+    values[132] = static_cast<std::uint32_t>(cpu_profile.atomics);
+    values[133] = cpu_profile.accurate_cache_line_stores;
+    values[134] = cpu_profile.accurate_dma_timing;
+    values[135] = cpu_profile.memory_exceptions;
+    values[136] = cpu_profile.icache_accuracy;
+    values[137] = cpu_profile.ignore_bad_accesses;
+    values[138] = static_cast<std::uint32_t>(cpu_profile.jit_feature_mask);
+    values[139] = cpu_profile.jit_disable_mask;
+    values[140] = cpu_profile.cpu_gpu_dual_thread;
+    values[141] = static_cast<std::uint32_t>(cpu_profile.scheduler);
+    values[142] = cpu_profile.preferred_heavy_threads;
+    values[143] = cpu_profile.subsystem_multithreading;
+    values[144] = cpu_profile.separate_io_thread;
+    values[145] = cpu_profile.separate_audio_hle_thread;
+    values[146] = cpu_profile.guest_thread_delay_mode;
+    values[147] = cpu_profile.guest_thread_delay_us;
+    values[148] = cpu_profile.sync_on_idle_skip;
+    values[149] = static_cast<std::uint32_t>(cpu_profile.cpu_gpu_sync);
+    values[150] = cpu_profile.force_real_clock_sync;
+    values[151] = static_cast<std::uint32_t>(cpu_profile.hle_mode);
+    values[152] = cpu_profile.hle_fast_timers;
+    values[153] = cpu_profile.per_game_profile;
+    values[154] = cpu_profile.auto_game_db;
+    values[155] = Executor::CpuTuning::CounterValue(
+                      Executor::CpuTuning::Counter::IdleYields) +
+                  Common::CpuTuningEventCount(
+                      Common::CpuTuningEvent::IdleYields);
+    values[156] = Executor::CpuTuning::CounterValue(
+                      Executor::CpuTuning::Counter::WaitParks) +
+                  Common::CpuTuningEventCount(
+                      Common::CpuTuningEvent::WaitParks);
+    values[157] = Executor::CpuTuning::CounterValue(
+        Executor::CpuTuning::Counter::SpinParks);
+    values[158] = Executor::CpuTuning::CounterValue(
+        Executor::CpuTuning::Counter::CyclesSkipped);
+    values[159] = Executor::CpuTuning::CounterValue(
+        Executor::CpuTuning::Counter::BadAccessesIgnored);
+    values[160] = Executor::CpuTuning::CounterValue(
+                      Executor::CpuTuning::Counter::HleFastCalls) +
+                  Common::CpuTuningEventCount(
+                      Common::CpuTuningEvent::HleFastTimers);
+    values[161] = Executor::CpuTuning::CounterValue(
+                      Executor::CpuTuning::Counter::HleAccurateCalls) +
+                  Common::CpuTuningEventCount(
+                      Common::CpuTuningEvent::HleAccurateTimers);
+    values[162] = Executor::CpuTuning::CounterValue(
+                      Executor::CpuTuning::Counter::DmaDelays) +
+                  Common::CpuTuningEventCount(
+                      Common::CpuTuningEvent::DmaDelays);
+    values[163] = Executor::CpuTuning::CounterValue(
+        Executor::CpuTuning::Counter::GuestThreadsDelayed);
+    values[164] = Executor::CpuTuning::CounterValue(
+        Executor::CpuTuning::Counter::WorkerStartsThrottled);
+    values[165] = Executor::CpuTuning::CounterValue(
+                      Executor::CpuTuning::Counter::CpuGpuSyncs) +
+                  Common::CpuTuningEventCount(
+                      Common::CpuTuningEvent::CpuGpuSyncs);
     return static_cast<int>(kValueCount);
+}
+
+extern "C" void executor_lsx4_android_note_guest_thread_exit(void* thread,
+                                                                const char* name) {
+    if (!IsCpuLimitedGuestWorkerName(name)) {
+        return;
+    }
+    auto& admission = GuestWorkerAdmissions();
+    {
+        std::lock_guard lock(admission.mutex);
+        admission.active.erase(thread);
+    }
+    admission.condition.notify_one();
+}
+
+extern "C" void executor_lsx4_android_wait_guest_worker_slot(void* thread,
+                                                                const char* name) {
+    if (thread == nullptr || !IsCpuLimitedGuestWorkerName(name)) {
+        return;
+    }
+    const auto limit = Executor::CpuTuning::Get().max_guest_workers;
+
+
+
+    if (limit == 0) {
+        return;
+    }
+    auto& admission = GuestWorkerAdmissions();
+    std::unique_lock lock(admission.mutex);
+    const bool throttled = admission.active.size() >= limit;
+    if (throttled) {
+        Executor::CpuTuning::Count(
+            Executor::CpuTuning::Counter::WorkerStartsThrottled);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_GUEST_WORKER_LIMIT] action=park active=%zu "
+                  "limit=%u name=%s thread=%p",
+                  admission.active.size(), limit, name, thread);
+    }
+    admission.condition.wait(lock, [&] {
+        return admission.active.size() < limit;
+    });
+    admission.active.insert(thread);
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_GUEST_WORKER_LIMIT] action=admit active=%zu "
+              "limit=%u name=%s thread=%p throttled=%d",
+              admission.active.size(), limit, name, thread, throttled ? 1 : 0);
+}
+
+extern "C" std::uint32_t executor_lsx4_android_guest_thread_delay_us(
+    const char* name) {
+    if (!IsCpuLimitedGuestWorkerName(name)) {
+        return 0;
+    }
+    const auto delay = Executor::CpuTuning::Get().guest_thread_delay_us;
+    if (delay != 0) {
+        Executor::CpuTuning::Count(
+            Executor::CpuTuning::Counter::GuestThreadsDelayed);
+    }
+    return delay;
 }
 
 extern "C" const char* executor_lsx4_runtime_jit_selftest() {
@@ -23651,9 +34374,34 @@ extern "C" int executor_lsx4_runtime_launch_game(const char* path);
 extern "C" int executor_lsx4_runtime_relocate_imports();
 extern "C" int executor_lsx4_runtime_run_embedded_box64_mapped_entry();
 extern "C" int executor_lsx4_runtime_run_jit_mapped_entry();
-extern "C" void executor_lsx4_install_jit_signal_handlers();
+extern "C" int executor_lsx4_prepare_fex_signal_handlers() __attribute__((weak));
+extern "C" int executor_lsx4_rollback_prepared_fex_signal_handlers() __attribute__((weak));
 
 extern "C" int executor_lsx4_runtime_launch_game_jit(const char* path) {
+    executor_lsx4_runtime_reset_title_session();
+    const std::filesystem::path direct_path = path ? path : "";
+    if (Executor::Ps1Classic::IsPackage(direct_path)) {
+
+
+
+        return Executor::Ps1Classic::Launch(direct_path, std::filesystem::path(g_root));
+    }
+
+
+
+
+    struct SessionResetGuard {
+        ~SessionResetGuard() {
+            executor_lsx4_runtime_reset_title_session();
+        }
+    } session_reset_guard;
+
+    const int audio_result = executor_lsx4_runtime_audio_init();
+    if (audio_result != 0) {
+        NativeLog(ANDROID_LOG_WARN,
+                  "[EXECUTOR_AUDIO] title_session_prepare init=%d; guest init may retry",
+                  audio_result);
+    }
     const int load_result = executor_lsx4_runtime_launch_game(path);
     if (load_result < 0) {
         return load_result;
@@ -23662,14 +34410,18 @@ extern "C" int executor_lsx4_runtime_launch_game_jit(const char* path) {
     if (relocate_result < 0) {
         return relocate_result;
     }
-    g_jit_launch_entry_requested.store(true, std::memory_order_release);
-    return executor_lsx4_runtime_run_jit_mapped_entry();
+    const bool current_jit = RuntimeGuestJitActive();
+    g_jit_launch_entry_requested.store(current_jit, std::memory_order_release);
+    return current_jit
+        ? executor_lsx4_runtime_run_jit_mapped_entry()
+        : executor_lsx4_runtime_run_embedded_box64_mapped_entry();
 }
 
 extern "C" int executor_lsx4_runtime_launch_game(const char* path) {
     std::lock_guard lock(g_lock);
-    g_runtime_guest_backend.store(1, std::memory_order_release);
-    executor_lsx4_install_jit_signal_handlers();
+    if (RuntimeGuestJitActive()) {
+        executor_lsx4_install_jit_signal_handlers();
+    }
     NativeLog(ANDROID_LOG_INFO,
               "[EXECUTOR_RUNTIME_GUEST_BACKEND] launch route=%s",
               RuntimeGuestBackendName());
@@ -23678,6 +34430,17 @@ extern "C" int executor_lsx4_runtime_launch_game(const char* path) {
         g_status = R"({"state":"module_load_failed","core":"lsx4-native","error":"empty path"})";
         return -1;
     }
+    if (RuntimeGuestFexActive()) {
+        const std::uint64_t hle_generation =
+            Core::AeroLib::BeginAndroidX64ResolvedHleGeneration();
+        const std::uint64_t box64_hle_generation =
+            BeginBox64HleManifestGeneration();
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_FEX_HLE_ABI_GENERATION] phase=begin generation=%llu "
+                  "box64ManifestGeneration=%llu",
+                  static_cast<unsigned long long>(hle_generation),
+                  static_cast<unsigned long long>(box64_hle_generation));
+    }
 
     std::string direct_launch_title;
     if (TryParseDirectTitleLaunch(raw_path, direct_launch_title)) {
@@ -23685,7 +34448,8 @@ extern "C" int executor_lsx4_runtime_launch_game(const char* path) {
         const auto direct_app0 = std::filesystem::path(g_root) / "runtime-fs" / "user" /
                                  "app" / direct_launch_title;
         ConfigureJitPersistentCacheForLaunch(
-            true, direct_app0, direct_app0 / "eboot.bin");
+            RuntimeGuestJitActive(), direct_app0,
+            direct_app0 / "eboot.bin");
         return DirectLaunchInstalledTitleLocked(direct_launch_title);
     }
 
@@ -23750,7 +34514,8 @@ extern "C" int executor_lsx4_runtime_launch_game(const char* path) {
                   "[EXECUTOR_LIBC_ALLOCATOR_POLICY] owner=%s available=%d path=%s",
                   has_guest_libc ? "guest-libc" : "executor-hle", has_guest_libc ? 1 : 0,
                   guest_libc_path.string().c_str());
-        ConfigureJitPersistentCacheForLaunch(true, app0_path, launch_path);
+        ConfigureJitPersistentCacheForLaunch(
+            RuntimeGuestJitActive(), app0_path, launch_path);
         const auto managed_path = app0_path / "Media" / "Managed";
         if (std::filesystem::exists(managed_path)) {
             const std::string mono_path =
@@ -24389,7 +35154,363 @@ extern "C" const char* executor_lsx4_runtime_embedded_box64_mapped_entry_info() 
     return g_box64_mapped_entry_info.c_str();
 }
 
+struct ExecutorFexMappedEntryStorage {
+    std::vector<Lsx4FexMappedSegmentV5> segments;
+    std::vector<Lsx4FexExecutableRangeV5> executable_ranges;
+    Lsx4FexExecutableRangeSnapshotV5 range_snapshot{};
+    Lsx4FexMappedEntryRequestV5 request{};
+};
+
+bool BuildExecutorFexMappedEntryRequest(
+    const ExecutorBox64MappedEntryRequest& source,
+    ExecutorFexMappedEntryStorage& storage, std::string& error) {
+    storage = {};
+    if (source.entry == 0 || source.stack_base == 0 || source.stack_size < 0x4000 ||
+        source.segment_count > ExecutorBox64MappedEntryMaxSegments ||
+        source.stack_base > UINT64_MAX - source.stack_size) {
+        error = "invalid FEX mapped-entry source";
+        return false;
+    }
+
+    const std::uint64_t funnel_slab_base =
+        Core::AeroLib::GetAndroidX64ZeroStubSlabBase();
+    const std::uint64_t funnel_slab_size =
+        Core::AeroLib::GetAndroidX64ZeroStubSlabSize();
+    if ((funnel_slab_base == 0) != (funnel_slab_size == 0) ||
+        (funnel_slab_base != 0 && funnel_slab_base > UINT64_MAX - funnel_slab_size)) {
+        error = "invalid funnel mixed-stub slab geometry";
+        return false;
+    }
+
+
+
+
+    storage.segments.reserve(source.segment_count + 5);
+    std::vector<Lsx4FexExecutableRangeV5> base_executable_ranges;
+    base_executable_ranges.reserve(source.segment_count);
+    const auto elf_protection_to_posix = [](const std::uint32_t elf_protection) {
+        std::uint32_t protection = 0;
+        if ((elf_protection & PF_READ) != 0) {
+            protection |= PROT_READ;
+        }
+        if ((elf_protection & PF_WRITE) != 0) {
+            protection |= PROT_WRITE;
+        }
+        if ((elf_protection & PF_EXEC) != 0) {
+            protection |= PROT_EXEC;
+        }
+        return protection;
+    };
+    for (std::uint32_t index = 0; index < source.segment_count; ++index) {
+        const auto& segment = source.segments[index];
+        if (segment.size == 0 || segment.address > UINT64_MAX - segment.size) {
+            error = "invalid FEX mapped segment";
+            return false;
+        }
+        const std::uint32_t protection = elf_protection_to_posix(segment.prot);
+        std::uint32_t range_flags = 0;
+        if ((protection & PROT_EXEC) != 0) {
+            range_flags |= LSX4_FEX_RANGE_EXECUTABLE;
+        }
+        if ((protection & PROT_WRITE) != 0) {
+            range_flags |= LSX4_FEX_RANGE_WRITABLE;
+        }
+        if ((range_flags & (LSX4_FEX_RANGE_EXECUTABLE | LSX4_FEX_RANGE_WRITABLE)) ==
+            (LSX4_FEX_RANGE_EXECUTABLE | LSX4_FEX_RANGE_WRITABLE)) {
+            range_flags |= LSX4_FEX_RANGE_SELF_MODIFYING;
+        }
+        const bool is_funnel_slab =
+            funnel_slab_base != 0 && segment.address == funnel_slab_base &&
+            segment.size == funnel_slab_size;
+        const bool is_imt_slab =
+            g_imt_dyn_slab != nullptr &&
+            segment.address == reinterpret_cast<std::uint64_t>(g_imt_dyn_slab) &&
+            segment.size == kImtDynSlabSize;
+        const std::uint64_t cookie =
+            is_funnel_slab
+                ? StableGlobalExecutableRangeCookie(
+                      UINT64_C(0x46554e4e454c5258), segment.address, segment.size)
+                : is_imt_slab
+                      ? StableGlobalExecutableRangeCookie(
+                            kImtDynSlabCookieDomain, segment.address, segment.size)
+                      : StableModuleExecutableRangeCookie(segment.address, segment.size);
+        storage.segments.push_back({
+            .address = segment.address,
+            .size = segment.size,
+            .range_cookie = cookie,
+            .protection = protection,
+            .range_flags = range_flags,
+        });
+        if ((range_flags & LSX4_FEX_RANGE_EXECUTABLE) != 0) {
+            if (g_fex_persistent_rip_seed_enabled.load(
+                    std::memory_order_acquire) &&
+                !is_funnel_slab && !is_imt_slab &&
+                (range_flags & (LSX4_FEX_RANGE_WRITABLE |
+                                LSX4_FEX_RANGE_SELF_MODIFYING)) == 0) {
+                range_flags |= LSX4_FEX_RANGE_PERSISTENT_MODULE;
+                storage.segments.back().range_flags = range_flags;
+            }
+            base_executable_ranges.push_back({
+                .address = segment.address,
+                .size = segment.size,
+                .range_cookie = cookie,
+                .protection = protection,
+                .range_flags = range_flags,
+            });
+        }
+    }
+
+    const auto ranges_overlap = [](const std::uint64_t lhs_address,
+                                   const std::uint64_t lhs_size,
+                                   const std::uint64_t rhs_address,
+                                   const std::uint64_t rhs_size) {
+        return lhs_address < rhs_address + rhs_size &&
+               rhs_address < lhs_address + lhs_size;
+    };
+    auto append_required_segment = [&](const std::uint64_t address,
+                                       const std::uint64_t size,
+                                       const std::uint64_t domain,
+                                       const std::uint32_t protection,
+                                       const std::uint32_t required_flags,
+                                       const bool executable) -> bool {
+        if (address == 0 || size == 0 || address > UINT64_MAX - size) {
+            error = "invalid required FEX mapped segment";
+            return false;
+        }
+        for (const auto& existing : storage.segments) {
+            const bool contained = existing.address <= address &&
+                                   address + size <= existing.address + existing.size;
+            if (contained) {
+                if ((existing.protection & protection) != protection ||
+                    (existing.range_flags & required_flags) != required_flags) {
+                    error = "required FEX mapping is covered with incompatible policy";
+                    return false;
+                }
+                return true;
+            }
+            if (ranges_overlap(address, size, existing.address, existing.size)) {
+                error = "required FEX mapping partially overlaps another segment";
+                return false;
+            }
+        }
+        const std::uint64_t cookie =
+            StableGlobalExecutableRangeCookie(domain, address, size);
+        if (std::any_of(storage.segments.begin(), storage.segments.end(),
+                        [cookie](const auto& existing) {
+                            return existing.range_cookie == cookie;
+                        })) {
+            error = "required FEX mapped-segment cookie collision";
+            return false;
+        }
+        const Lsx4FexMappedSegmentV5 segment{
+            .address = address,
+            .size = size,
+            .range_cookie = cookie,
+            .protection = protection,
+            .range_flags = required_flags,
+        };
+        storage.segments.push_back(segment);
+        if (executable) {
+            base_executable_ranges.push_back({
+                .address = segment.address,
+                .size = segment.size,
+                .range_cookie = segment.range_cookie,
+                .protection = segment.protection,
+                .range_flags = segment.range_flags,
+            });
+        }
+        return true;
+    };
+
+    if (!append_required_segment(
+            source.stack_base, source.stack_size,
+            UINT64_C(0x464558535441434b), PROT_READ | PROT_WRITE,
+            LSX4_FEX_RANGE_WRITABLE, false)) {
+        return false;
+    }
+    const long raw_page_size = sysconf(_SC_PAGESIZE);
+    if (raw_page_size <= 0 ||
+        (static_cast<std::uint64_t>(raw_page_size) &
+         (static_cast<std::uint64_t>(raw_page_size) - 1)) != 0) {
+        error = "invalid host page size for FEX exit stub";
+        return false;
+    }
+    const std::uint64_t page_size = static_cast<std::uint64_t>(raw_page_size);
+    const std::uint64_t exit_page = source.exit_func & ~(page_size - 1);
+    if (source.exit_func == 0 ||
+        !append_required_segment(
+            exit_page, page_size, UINT64_C(0x4645584558495458),
+            PROT_READ | PROT_EXEC, LSX4_FEX_RANGE_EXECUTABLE, true)) {
+        if (source.exit_func == 0 && error.empty()) {
+            error = "missing FEX guest exit stub";
+        }
+        return false;
+    }
+    if (source.entry_params != 0 &&
+        !append_required_segment(
+            source.entry_params, 2 * sizeof(std::uint64_t),
+            UINT64_C(0x464558454e545259), PROT_READ, 0, false)) {
+        return false;
+    }
+
+    std::vector<ExactHleSpan> exact_hle_spans;
+    std::vector<Core::AeroLib::AndroidX64LeasedHleStubSpan> funnel_hle_spans;
+    std::uint64_t funnel_manifest_generation = 0;
+    if (!Core::AeroLib::SnapshotAndroidX64LeasedHleStubManifest(
+            &funnel_hle_spans, &funnel_manifest_generation, &error)) {
+        return false;
+    }
+    exact_hle_spans.reserve(funnel_hle_spans.size());
+    for (const auto& span : funnel_hle_spans) {
+        exact_hle_spans.push_back({span.address, span.size});
+    }
+
+    std::vector<ExactHleSpan> box64_hle_spans;
+    std::uint64_t box64_manifest_generation = 0;
+    if (!SnapshotBox64HleLeaseManifest(
+            box64_hle_spans, box64_manifest_generation, error)) {
+        return false;
+    }
+    if (!Lsx4::FexHleLease::IsCurrentManifestGeneration(
+            funnel_manifest_generation) ||
+        !Lsx4::FexHleLease::IsCurrentManifestGeneration(
+            box64_manifest_generation)) {
+        error = "HLE lease manifest protocol generation mismatch";
+        return false;
+    }
+    std::uint64_t combined_manifest_generation = 0;
+    {
+        std::scoped_lock combined_lock(g_fex_hle_combined_manifest_mutex);
+        if (!Lsx4::FexHleLease::ComposeCombinedManifestGeneration(
+                g_fex_hle_combined_manifest_generation,
+                funnel_manifest_generation, box64_manifest_generation,
+                combined_manifest_generation)) {
+            error = "HLE lease manifest combined generation overflow/mismatch";
+            return false;
+        }
+    }
+    exact_hle_spans.insert(exact_hle_spans.end(),
+                           box64_hle_spans.begin(), box64_hle_spans.end());
+
+    const bool has_box64_slab =
+        source.hle_trampoline_base != 0 || source.hle_trampoline_size != 0;
+    if (has_box64_slab) {
+        const auto box64_slab_base =
+            reinterpret_cast<std::uint64_t>(g_box64_hle_trampoline_slab);
+        if (source.hle_trampoline_base == 0 || source.hle_trampoline_size == 0 ||
+            source.hle_trampoline_base > UINT64_MAX - source.hle_trampoline_size ||
+            source.hle_trampoline_base != box64_slab_base ||
+            source.hle_trampoline_size != ExecutorBox64HleTrampolineSlabSize) {
+            error = "invalid Box64 mixed-stub slab geometry";
+            return false;
+        }
+        base_executable_ranges.push_back({
+            .address = source.hle_trampoline_base,
+            .size = source.hle_trampoline_size,
+            .range_cookie = StableGlobalExecutableRangeCookie(
+                UINT64_C(0x424f5836344d4958), source.hle_trampoline_base,
+                source.hle_trampoline_size),
+            .protection = PROT_READ | PROT_EXEC,
+            .range_flags = LSX4_FEX_RANGE_EXECUTABLE,
+        });
+    } else if (!box64_hle_spans.empty()) {
+        error = "Box64 HLE manifest exists without its mixed-stub slab";
+        return false;
+    }
+
+    auto append_hle_frame_pool = [&](const std::uint64_t base,
+                                     const std::uint64_t size,
+                                     const std::uint64_t domain) -> bool {
+        if (base == 0 || size != Lsx4::FexHleLease::PoolSize ||
+            base > UINT64_MAX - size ||
+            (base & (Lsx4::FexHleLease::SlotSize - 1)) != 0) {
+            error = "invalid HLE frame-pool geometry";
+            return false;
+        }
+        return append_required_segment(
+            base, size, domain, PROT_READ | PROT_WRITE,
+            LSX4_FEX_RANGE_WRITABLE | LSX4_FEX_RANGE_HLE_FRAME_POOL,
+            false);
+    };
+    if (!funnel_hle_spans.empty()) {
+        Core::AeroLib::AndroidX64HleSafePoolGeometry geometry{};
+        if (!Core::AeroLib::GetAndroidX64HleSafePoolGeometry(&geometry) ||
+            geometry.slot_size != Lsx4::FexHleLease::SlotSize ||
+            geometry.stack_pointer_offset != Lsx4::FexHleLease::FrameOffset ||
+            geometry.lease_pointer_offset != Lsx4::FexHleLease::GuardPointerOffset ||
+            geometry.slot_count != Lsx4::FexHleLease::SlotCount ||
+            !append_hle_frame_pool(
+                geometry.base, geometry.size, UINT64_C(0x46554e4e504f4f4c))) {
+            if (error.empty()) {
+                error = "funnel HLE frame-pool contract mismatch";
+            }
+            return false;
+        }
+        RegisterBox64ExternalGuestMutableRange(
+            reinterpret_cast<const void*>(geometry.base),
+            static_cast<std::size_t>(geometry.size),
+            "funnel_hle_frame_pool");
+    }
+    if (!box64_hle_spans.empty()) {
+        const auto& pool = GetExecutorBox64HleSafePool();
+        if (!append_hle_frame_pool(
+                pool.base, ExecutorBox64HleSafePoolSize,
+                UINT64_C(0x424f5836504f4f4c))) {
+            return false;
+        }
+        RegisterBox64ExternalGuestMutableRange(
+            reinterpret_cast<const void*>(pool.base),
+            ExecutorBox64HleSafePoolSize, "box64_hle_frame_pool");
+    }
+
+    if (!BuildSparseExactHleExecutableRanges(
+            base_executable_ranges, exact_hle_spans,
+            storage.executable_ranges, error)) {
+        return false;
+    }
+    storage.range_snapshot = {
+        .struct_size = sizeof(Lsx4FexExecutableRangeSnapshotV5),
+        .abi_version = LSX4_FEX_EXECUTABLE_RANGE_ABI_V5,
+        .generation = combined_manifest_generation,
+        .ranges = storage.executable_ranges.data(),
+        .capacity = static_cast<std::uint32_t>(storage.executable_ranges.size()),
+        .range_count = static_cast<std::uint32_t>(storage.executable_ranges.size()),
+        .snapshot_flags = 0,
+        .reserved = 0,
+    };
+    storage.request = {
+        .struct_size = sizeof(Lsx4FexMappedEntryRequestV5),
+        .abi_version = LSX4_FEX_MAPPED_ENTRY_ABI_V5,
+        .request_flags = 0,
+
+
+
+        .timeout_ms = 0,
+        .entry = source.entry,
+        .proc_param = source.proc_param,
+        .stack_base = source.stack_base,
+        .stack_size = source.stack_size,
+        .tls_image_address = source.tls_image_addr,
+        .tls_image_size = source.tls_image_size,
+        .tls_module_id = source.tls_mod_id,
+        .tcb_base = source.tcb_base,
+        .entry_params = source.entry_params,
+        .exit_function = source.exit_func,
+        .hle_trampoline_base = 0,
+        .hle_trampoline_size = 0,
+        .segments = storage.segments.data(),
+        .segment_count = static_cast<std::uint32_t>(storage.segments.size()),
+        .reserved = 0,
+        .executable_ranges = &storage.range_snapshot,
+        .request_cookie = UINT64_C(0x4c53583446455835),
+    };
+    return true;
+}
+
 extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
+    if (ExecutorManagedSpawnProbeEnabled()) {
+        ExecutorStartManagedSpawnProbePoller();
+    }
     std::unique_lock lock(g_lock);
     if (RuntimeGuestJitActive()) {
         const bool launch_entry_requested =
@@ -24405,7 +35526,8 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
             return 0;
         }
     }
-    if (!RuntimeGuestJitActive() && (!g_box64_embed || !g_box64_run_mapped_entry)) {
+    if (!RuntimeGuestJitActive() && !RuntimeGuestFexActive() &&
+        (!g_box64_embed || !g_box64_run_mapped_entry)) {
         g_box64_mapped_entry_info =
             R"({"attempted":false,"error":"embedded Box64 is not loaded"})";
         g_status =
@@ -24452,7 +35574,7 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
             return -4;
         }
 
-        if (RuntimeGuestJitActive()) {
+        if (RuntimeGuestJitActive() || RuntimeGuestFexActive()) {
             std::string bootstrap_error;
             NativeLog(ANDROID_LOG_INFO,
                       "[EXECUTOR_JIT_PROCESS_BOOTSTRAP] stage=begin mode=full");
@@ -24472,6 +35594,29 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
                 return -8;
             }
 
+            if (RuntimeGuestFexActive()) {
+                std::string eager_plt_error;
+                if (!ResolveFexLazyPltSlots(*linker, eager_plt_error)) {
+                    g_box64_mapped_entry_info =
+                        std::string(R"({"attempted":false,"mode":"fex-2608","error":")") +
+                        JsonEscape(eager_plt_error) + R"("})";
+                    g_status =
+                        std::string(R"({"state":"fex_eager_plt_failed","core":"lsx4-native","error":")") +
+                        JsonEscape(eager_plt_error) + R"("})";
+                    return -25;
+                }
+                std::string hle_prewarm_error;
+                if (!PrewarmFexHleManifests(hle_prewarm_error)) {
+                    g_box64_mapped_entry_info =
+                        std::string(R"({"attempted":false,"mode":"fex-2608","error":")") +
+                        JsonEscape(hle_prewarm_error) + R"("})";
+                    g_status =
+                        std::string(R"({"state":"fex_hle_prewarm_failed","core":"lsx4-native","error":")") +
+                        JsonEscape(hle_prewarm_error) + R"("})";
+                    return -26;
+                }
+            }
+
             std::string refreshed_error;
             if (!BuildMappedEntryRequestFromModule(*module, request, refreshed_error)) {
                 g_box64_mapped_entry_info =
@@ -24487,6 +35632,453 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
                       "entry=%p segments=%u tcb=%p",
                       reinterpret_cast<void*>(request.entry), request.segment_count,
                       reinterpret_cast<void*>(request.tcb_base));
+        }
+
+        if (RuntimeGuestFexActive()) {
+            std::string hle_abi_error;
+            if (!Core::AeroLib::SealAndroidX64ResolvedHleGeneration(
+                    &hle_abi_error)) {
+                g_box64_mapped_entry_info =
+                    std::string(R"({"attempted":false,"mode":"fex-2608","error":")") +
+                    JsonEscape(hle_abi_error) + R"("})";
+                g_status =
+                    std::string(R"({"state":"fex_hle_abi_rejected","core":"lsx4-native","error":")") +
+                    JsonEscape(hle_abi_error) + R"("})";
+                NativeLog(ANDROID_LOG_ERROR,
+                          "[EXECUTOR_FEX_HLE_ABI_GATE] phase=mapped-entry "
+                          "result=reject error=%s",
+                          hle_abi_error.c_str());
+                return -24;
+            }
+            SealBox64HleManifestGeneration();
+            ExecutorFexMappedEntryStorage fex_storage{};
+            std::string fex_request_error;
+            if (!BuildExecutorFexMappedEntryRequest(request, fex_storage, fex_request_error)) {
+                g_box64_mapped_entry_info =
+                    std::string(R"({"attempted":false,"mode":"fex-2608","error":")") +
+                    JsonEscape(fex_request_error) + R"("})";
+                g_status =
+                    std::string(
+                        R"({"state":"fex_mapped_entry_request_failed","core":"lsx4-native","error":")") +
+                    JsonEscape(fex_request_error) + R"("})";
+                return -20;
+            }
+
+            if (!ReserveFexFaultSignalOwnerLocked()) {
+                g_guest_cpu_backend_supported = false;
+                g_guest_cpu_backend_fallback_reason = "fex-signal-owner-reservation-conflict";
+                RefreshGuestCpuBackendStatusLocked();
+                g_box64_mapped_entry_info =
+                    R"({"attempted":false,"mode":"fex-2608","error":"fault-signal owner reservation conflict"})";
+                g_status =
+                    R"({"state":"fex_activation_failed","core":"lsx4-native","error":"fault-signal owner reservation conflict"})";
+                return -21;
+            }
+
+            const auto& fex_host_isa = Executor::Jit::GetHostIsaProfile();
+            const bool sm8650_software_tso_memory_path =
+                Common::IsSnapdragon8Gen3Host() &&
+                (fex_host_isa.os_features &
+                 LSX4_FEX_HOST_OS_HARDWARE_TSO_ENABLED) == 0;
+#ifdef __ANDROID__
+            const bool sm8650_strict_split_locks_requested =
+                sm8650_software_tso_memory_path &&
+                std::filesystem::exists(std::filesystem::path(g_root) /
+                                        "run-sm8650-fex-strict-split-locks-ab");
+            const bool sm8650_strict_split_locks_effective =
+                sm8650_strict_split_locks_requested &&
+                ::setenv("LSX4_FEX_STRICT_SPLIT_LOCKS", "1", 1) == 0;
+            if (!sm8650_strict_split_locks_effective) {
+                (void)::unsetenv("LSX4_FEX_STRICT_SPLIT_LOCKS");
+            }
+#else
+            const bool sm8650_strict_split_locks_requested = false;
+            const bool sm8650_strict_split_locks_effective = false;
+#endif
+            NativeLog(ANDROID_LOG_INFO,
+                      "[EXECUTOR_FEX_STRICT_SPLIT_LOCKS] requested=%d effective=%d "
+                      "sm8650SoftwareTso=%d",
+                      sm8650_strict_split_locks_requested ? 1 : 0,
+                      sm8650_strict_split_locks_effective ? 1 : 0,
+                      sm8650_software_tso_memory_path ? 1 : 0);
+            if (!Executor::Fex::StageActivation(ExecutorFexHostCallbacks(),
+                                                &fex_storage.range_snapshot)) {
+                const auto fex_status = Executor::Fex::Status();
+                const bool safe_pre_activation_failure =
+                    fex_status.state == Executor::Fex::LoaderState::Failed;
+                if (safe_pre_activation_failure && ReleaseFexFaultSignalOwnerReservationLocked() &&
+                    PublishFaultSignalOwnerLocked(FaultSignalOwner::Current)) {
+                    SelectCurrentGuestCpuBackendLocked(fex_status.error.empty()
+                                                           ? "fex-activation-stage-failed"
+                                                           : fex_status.error.c_str(),
+                                                       false);
+                    NativeLog(ANDROID_LOG_ERROR,
+                              "[EXECUTOR_FEX_ACTIVATION] stage=adapter result=failed "
+                              "fallback=current error=%s",
+                              fex_status.error.c_str());
+                } else {
+                    g_guest_cpu_backend_supported = false;
+                    g_guest_cpu_backend_fallback_reason =
+                        "fex-activation-stranded-restart-required";
+                    RefreshGuestCpuBackendStatusLocked();
+                    NativeLog(ANDROID_LOG_ERROR,
+                              "[EXECUTOR_FEX_ACTIVATION] stage=adapter result=stranded "
+                              "fallback=forbidden loaderState=%u error=%s",
+                              static_cast<unsigned>(fex_status.state), fex_status.error.c_str());
+                }
+                g_box64_mapped_entry_info =
+                    std::string(R"({"attempted":false,"mode":"fex-2608","error":")") +
+                    JsonEscape(fex_status.error) + R"("})";
+                g_status =
+                    std::string(
+                        R"({"state":"fex_activation_failed","core":"lsx4-native","error":")") +
+                    JsonEscape(fex_status.error) + R"("})";
+                return -21;
+            }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            const bool sm8650_deferred_write_epoch_ab_requested =
+                sm8650_software_tso_memory_path &&
+                std::filesystem::exists(
+                    std::filesystem::path(g_root) /
+                    "run-enable-sm8650-fex-deferred-write-epoch-ab");
+            const bool sm8650_synchronous_page_manager_requested =
+                sm8650_software_tso_memory_path &&
+                !sm8650_deferred_write_epoch_ab_requested;
+            const bool buffer_capture_ack_requested =
+                !sm8650_synchronous_page_manager_requested &&
+                (sm8650_software_tso_memory_path ||
+                 std::filesystem::exists(std::filesystem::path(g_root) /
+                                         "run-enable-fex-buffer-capture-ack"));
+#ifdef __ANDROID__
+            if (buffer_capture_ack_requested) {
+                (void)::setenv("EXECUTOR_FEX_BUFFER_CAPTURE_ACK", "1", 1);
+            } else {
+                (void)::unsetenv("EXECUTOR_FEX_BUFFER_CAPTURE_ACK");
+            }
+#endif
+            const bool deferred_write_epoch_requested =
+                !sm8650_synchronous_page_manager_requested &&
+                (buffer_capture_ack_requested ||
+                 std::filesystem::exists(std::filesystem::path(g_root) /
+                                         "run-enable-fex-deferred-write-epoch"));
+            const bool deferred_write_epoch_enabled =
+                deferred_write_epoch_requested &&
+                Executor::Fex::ConfigureDeferredWriteEpoch({
+                    .callback_context = nullptr,
+                    .publish_ready =
+                        &VideoCore::PageManager::PublishFexDeferredWriteEpochReady,
+                });
+            VideoCore::PageManager::SetFexDeferredWriteEpochEnabled(
+                deferred_write_epoch_enabled);
+#ifdef __ANDROID__
+            const bool deferred_bulk_guest_writes_requested =
+                std::filesystem::exists(
+                    std::filesystem::path(g_root) /
+                    "run-enable-fex-deferred-bulk-guest-writes");
+
+
+
+
+
+
+            const bool deferred_bulk_guest_writes_enabled =
+                sm8650_software_tso_memory_path &&
+                deferred_write_epoch_enabled &&
+                deferred_bulk_guest_writes_requested;
+            if (deferred_bulk_guest_writes_enabled) {
+                (void)::setenv("EXECUTOR_FEX_DEFERRED_BULK_GUEST_WRITES", "1", 1);
+            } else {
+                (void)::unsetenv("EXECUTOR_FEX_DEFERRED_BULK_GUEST_WRITES");
+            }
+#else
+            const bool deferred_bulk_guest_writes_requested = false;
+            const bool deferred_bulk_guest_writes_enabled = false;
+#endif
+            NativeLog(ANDROID_LOG_INFO,
+                      "[EXECUTOR_FEX_WRITE_EPOCH] requested=%d configured=%d "
+                      "captureAck=%d deferredBulkRequested=%d deferredBulk=%d "
+                      "sm8650SoftwareTso=%d sm8650SynchronousPageManager=%d "
+                      "sm8650DeferredEpochAb=%d "
+                      "fallback=%s",
+                      deferred_write_epoch_requested ? 1 : 0,
+                      deferred_write_epoch_enabled ? 1 : 0,
+                      buffer_capture_ack_requested ? 1 : 0,
+                      deferred_bulk_guest_writes_requested ? 1 : 0,
+                      deferred_bulk_guest_writes_enabled ? 1 : 0,
+                      sm8650_software_tso_memory_path ? 1 : 0,
+                      sm8650_synchronous_page_manager_requested ? 1 : 0,
+                      sm8650_deferred_write_epoch_ab_requested ? 1 : 0,
+                      deferred_write_epoch_enabled ? "none" : "synchronous");
+
+            const int signal_prepare_status =
+                executor_lsx4_prepare_fex_signal_handlers != nullptr
+                    ? executor_lsx4_prepare_fex_signal_handlers()
+                    : LSX4_FEX_STATUS_NOT_FOUND;
+            if (signal_prepare_status != 0) {
+                if (executor_lsx4_rollback_prepared_fex_signal_handlers != nullptr) {
+                    (void)executor_lsx4_rollback_prepared_fex_signal_handlers();
+                }
+                g_guest_cpu_backend_supported = false;
+                g_guest_cpu_backend_fallback_reason =
+                    "fex-signal-handler-prepare-failed-restart-required";
+                RefreshGuestCpuBackendStatusLocked();
+                g_box64_mapped_entry_info =
+                    R"({"attempted":false,"mode":"fex-2608","error":"signal handler preparation failed"})";
+                g_status =
+                    R"({"state":"fex_activation_failed","core":"lsx4-native","error":"signal handler preparation failed"})";
+                NativeLog(ANDROID_LOG_ERROR,
+                          "[EXECUTOR_FEX_ACTIVATION] stage=signal-prepare result=failed "
+                          "fallback=forbidden status=%d",
+                          signal_prepare_status);
+                return -21;
+            }
+
+            if (!Executor::Fex::CommitActivation() ||
+                Executor::Fex::ActiveApiForSignal() == nullptr) {
+                if (executor_lsx4_rollback_prepared_fex_signal_handlers != nullptr) {
+                    (void)executor_lsx4_rollback_prepared_fex_signal_handlers();
+                }
+                const auto fex_status = Executor::Fex::Status();
+                g_guest_cpu_backend_supported = false;
+                g_guest_cpu_backend_fallback_reason =
+                    "fex-activation-commit-failed-restart-required";
+                RefreshGuestCpuBackendStatusLocked();
+                g_box64_mapped_entry_info =
+                    std::string(R"({"attempted":false,"mode":"fex-2608","error":")") +
+                    JsonEscape(fex_status.error.empty()
+                                   ? "activation commit did not publish signal API"
+                                   : fex_status.error) +
+                    R"("})";
+                g_status =
+                    std::string(
+                        R"({"state":"fex_activation_failed","core":"lsx4-native","error":")") +
+                    JsonEscape(g_guest_cpu_backend_fallback_reason) + R"("})";
+                NativeLog(ANDROID_LOG_ERROR,
+                          "[EXECUTOR_FEX_ACTIVATION] stage=commit result=failed "
+                          "fallback=forbidden error=%s",
+                          fex_status.error.c_str());
+                return -21;
+            }
+
+
+
+            (void)EnableFexExactStoreWatchFromMarker();
+            if (FexGuestStoreTraceMarkerExists()) {
+                StartFexGuestStoreTracePoller();
+            }
+            const Lsx4FexBackendApiV3* const fex_api = Executor::Fex::ActiveApi();
+            if (fex_api == nullptr || fex_api->run_mapped_entry_v5 == nullptr) {
+                if (executor_lsx4_rollback_prepared_fex_signal_handlers != nullptr) {
+                    (void)executor_lsx4_rollback_prepared_fex_signal_handlers();
+                }
+                g_guest_cpu_backend_supported = false;
+                g_guest_cpu_backend_fallback_reason =
+                    "fex-active-api-incomplete-restart-required";
+                RefreshGuestCpuBackendStatusLocked();
+                g_box64_mapped_entry_info =
+                    R"({"attempted":false,"mode":"fex-2608","error":"active API missing mapped entry"})";
+                g_status =
+                    R"({"state":"fex_activation_failed","core":"lsx4-native","error":"active API missing mapped entry"})";
+                return -22;
+            }
+            if (!CommitFexFaultSignalOwnerLocked()) {
+                if (executor_lsx4_rollback_prepared_fex_signal_handlers != nullptr) {
+                    (void)executor_lsx4_rollback_prepared_fex_signal_handlers();
+                }
+                g_guest_cpu_backend_supported = false;
+                g_guest_cpu_backend_fallback_reason =
+                    "fex-signal-owner-commit-failed-restart-required";
+                RefreshGuestCpuBackendStatusLocked();
+                ExecutorFexFatalError(nullptr, LSX4_FEX_STATUS_INVALID_STATE,
+                                      "FEX signal API active without committed signal owner");
+                return -21;
+            }
+            RefreshGuestCpuBackendStatusLocked();
+            RegisterBox64HleTrampolineSlabWithFex();
+            NativeLog(ANDROID_LOG_INFO,
+                      "[EXECUTOR_FEX_ACTIVATION] stage=commit result=ok "
+                      "signalOwner=fex api=%p",
+                      static_cast<const void*>(fex_api));
+
+            std::string lifecycle_error;
+            lock.unlock();
+            const bool lifecycle_ok =
+                DrainDeferredFexBootstrapLifecycles(lifecycle_error);
+            lock.lock();
+            if (!lifecycle_ok) {
+                g_guest_cpu_backend_supported = false;
+                g_guest_cpu_backend_fallback_reason =
+                    "fex-bootstrap-lifecycle-drain-failed-restart-required";
+                RefreshGuestCpuBackendStatusLocked();
+                g_box64_mapped_entry_info =
+                    std::string(R"({"attempted":false,"mode":"fex-2608","error":")") +
+                    JsonEscape(lifecycle_error) + R"("})";
+                g_status =
+                    std::string(
+                        R"({"state":"fex_bootstrap_lifecycle_failed","core":"lsx4-native","error":")") +
+                    JsonEscape(lifecycle_error) + R"("})";
+                ExecutorFexFatalError(
+                    nullptr, LSX4_FEX_STATUS_BACKEND_FAILURE,
+                    lifecycle_error.empty()
+                        ? "FEX bootstrap module lifecycle drain failed"
+                        : lifecycle_error.c_str());
+                NativeLog(ANDROID_LOG_ERROR,
+                          "[EXECUTOR_FEX_BOOTSTRAP_LIFECYCLE] "
+                          "phase=failed fallback=forbidden error=%s",
+                          lifecycle_error.c_str());
+                return -25;
+            }
+
+            Lsx4FexMappedEntryResultV5 fex_result{};
+            fex_result.struct_size = sizeof(fex_result);
+            fex_result.abi_version = LSX4_FEX_MAPPED_ENTRY_ABI_V5;
+            fex_result.request_cookie = fex_storage.request.request_cookie;
+            BeginMappedEntryBoundaryProbe("fex-2608", *module, request);
+            ScopedBox64GuestEntryActive guest_entry_scope("loader_fex_entry");
+            auto* primary_guest_thread = Libraries::Kernel::g_curthread;
+            int call_status = LSX4_FEX_STATUS_BACKEND_FAILURE;
+            lock.unlock();
+            std::thread guest_entry_thread([&]() {
+                ScopedAndroidGuestPauseRegistration pause_registration;
+                Lsx4FexThreadIdentityV3 identity{
+                    .struct_size = sizeof(Lsx4FexThreadIdentityV3),
+                    .abi_version = LSX4_FEX_BACKEND_ABI_V3,
+                    .guest_thread = reinterpret_cast<std::uint64_t>(primary_guest_thread),
+                    .pthread_handle = primary_guest_thread != nullptr
+                                          ? static_cast<std::uint64_t>(
+                                                primary_guest_thread->native_thr.GetHandle())
+                                          : 0,
+                    .host_tid = static_cast<std::int64_t>(syscall(SYS_gettid)),
+                    .backend_thread = 0,
+                };
+                if (primary_guest_thread != nullptr) {
+                    Libraries::Kernel::g_curthread = primary_guest_thread;
+                    Common::SetCurrentThreadName(primary_guest_thread->name.c_str());
+                    PreferPerformanceCpusForPrimaryGuest();
+                    primary_guest_thread->native_thr.Initialize();
+                    if (primary_guest_thread->tcb != nullptr) {
+                        Core::SetTcbBase(primary_guest_thread->tcb);
+                    }
+                }
+
+
+
+
+
+                sigset_t empty_signal_mask;
+                sigemptyset(&empty_signal_mask);
+                const int signal_mask_rc =
+                    pthread_sigmask(SIG_SETMASK, &empty_signal_mask, nullptr);
+                NativeLog(signal_mask_rc == 0 ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR,
+                          "[EXECUTOR_FEX_PRIMARY_THREAD] phase=before-bind thread=%p "
+                          "name=%s native=0x%zx tcb=%p signalMaskRc=%d",
+                          static_cast<void*>(primary_guest_thread),
+                          primary_guest_thread != nullptr
+                              ? primary_guest_thread->name.c_str()
+                              : "<none>",
+                          primary_guest_thread != nullptr
+                              ? static_cast<std::size_t>(
+                                    primary_guest_thread->native_thr.GetHandle())
+                              : 0,
+                          primary_guest_thread != nullptr
+                              ? static_cast<void*>(primary_guest_thread->tcb)
+                              : nullptr,
+                          signal_mask_rc);
+                if (signal_mask_rc != 0) {
+                    call_status = LSX4_FEX_STATUS_BACKEND_FAILURE;
+                    return;
+                }
+                call_status = fex_api->bind_host_thread(
+                    fex_api->backend_context, &identity);
+                NativeLog(call_status == LSX4_FEX_STATUS_OK
+                              ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR,
+                          "[EXECUTOR_FEX_PRIMARY_THREAD] phase=after-bind "
+                          "thread=%p status=%d",
+                          static_cast<void*>(primary_guest_thread), call_status);
+                if (call_status != LSX4_FEX_STATUS_OK) {
+                    return;
+                }
+                Lsx4FexGuestTlsStateV3 tls{
+                    .struct_size = sizeof(Lsx4FexGuestTlsStateV3),
+                    .abi_version = LSX4_FEX_BACKEND_ABI_V3,
+                    .target = identity,
+                    .fs_base = request.tcb_base,
+                    .gs_base = request.tcb_base,
+                    .tcb_base = request.tcb_base,
+                    .tls_image_address = request.tls_image_addr,
+                    .tls_image_size = request.tls_image_size,
+                    .tls_module_id = request.tls_mod_id,
+                    .tls_flags = 0,
+                    .reserved = 0,
+                };
+                call_status = fex_api->set_guest_tls(
+                    fex_api->backend_context, &tls);
+                if (call_status == LSX4_FEX_STATUS_OK) {
+                    call_status = fex_api->run_mapped_entry_v5(
+                        fex_api->backend_context, &fex_storage.request, &fex_result);
+                }
+                const int unbind_status = fex_api->unbind_host_thread(
+                    fex_api->backend_context);
+                if (call_status == LSX4_FEX_STATUS_OK &&
+                    unbind_status != LSX4_FEX_STATUS_OK) {
+                    call_status = unbind_status;
+                }
+            });
+            guest_entry_thread.join();
+            const std::string boundary_probe = FinishMappedEntryBoundaryProbe(
+                "fex-2608", call_status,
+                call_status == LSX4_FEX_STATUS_OK ? "completed" : "backend-failure");
+            lock.lock();
+
+            const bool completed =
+                call_status == LSX4_FEX_STATUS_OK &&
+                fex_result.status == LSX4_FEX_STATUS_OK &&
+                fex_result.request_cookie == fex_storage.request.request_cookie;
+            std::ostringstream info;
+            info << "{"
+                 << R"("attempted":true,)"
+                 << R"("mode":"fex-2608",)"
+                 << R"("completed":)" << (completed ? "true" : "false") << ","
+                 << R"("callStatus":)" << call_status << ","
+                 << R"("resultStatus":)" << fex_result.status << ","
+                 << R"("rax":")" << Hex64(fex_result.rax) << R"(",)"
+                 << R"("finalRip":")" << Hex64(fex_result.final_rip) << R"(",)"
+                 << R"("guestExitCode":")" << Hex64(fex_result.guest_exit_code) << R"(",)"
+                 << R"("entry":")" << Hex64(request.entry) << R"(",)"
+                 << R"("mappedEntryBoundaryProbe":)" << boundary_probe
+                 << "}";
+            g_box64_mapped_entry_info = info.str();
+            WriteTextFile(std::filesystem::path(g_root) / "translator" /
+                              "last-fex-entry-run.json",
+                          g_box64_mapped_entry_info);
+            g_status = std::string(R"({"state":")") +
+                       (completed ? "fex_mapped_entry_exited"
+                                  : "fex_mapped_entry_failed") +
+                       R"(","core":"lsx4-native","fex":)" +
+                       g_box64_mapped_entry_info + "}";
+            NativeLog(completed ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR,
+                      "[EXECUTOR_FEX_ENTRY_RUN] call=%d result=%d rax=0x%llx "
+                      "finalRip=0x%llx exit=0x%llx",
+                      call_status, fex_result.status,
+                      static_cast<unsigned long long>(fex_result.rax),
+                      static_cast<unsigned long long>(fex_result.final_rip),
+                      static_cast<unsigned long long>(fex_result.guest_exit_code));
+            return completed ? static_cast<int>(fex_result.guest_exit_code)
+                             : -23;
         }
 
         if (RuntimeGuestJitActive()) {
@@ -24518,8 +36110,11 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
             int result = 0;
             std::string exception_text;
             auto* primary_guest_thread = Libraries::Kernel::g_curthread;
+            BeginMappedEntryBoundaryProbe("loader", *module, request);
+            ScopedBox64GuestEntryActive guest_entry_scope("loader_jit_entry");
             lock.unlock();
             std::thread guest_entry_thread([&]() {
+                ScopedAndroidGuestPauseRegistration pause_registration;
                 try {
                     if (primary_guest_thread != nullptr) {
                         Libraries::Kernel::g_curthread = primary_guest_thread;
@@ -24563,6 +36158,8 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
                 }
             });
             guest_entry_thread.join();
+            const std::string boundary_probe = FinishMappedEntryBoundaryProbe(
+                "loader", result, exception_text.c_str());
             lock.lock();
 
             std::ostringstream info;
@@ -24578,6 +36175,7 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
                  << R"("stackBase":")" << Hex64(request.stack_base) << R"(",)"
                  << R"("stackSize":")" << Hex64(request.stack_size) << R"(",)"
                  << R"("tcbBase":")" << Hex64(request.tcb_base) << R"(",)"
+                 << R"("mappedEntryBoundaryProbe":)" << boundary_probe << ","
                  << R"("next_step":"expand JIT opcode/helper coverage for the reported guest block")"
                  << "}";
             g_box64_mapped_entry_info = info.str();
@@ -24689,6 +36287,7 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
         {
             auto* primary_guest_thread = Libraries::Kernel::g_curthread;
             std::thread guest_entry_thread([&]() {
+                ScopedAndroidGuestPauseRegistration pause_registration;
                 if (primary_guest_thread != nullptr) {
                     Libraries::Kernel::g_curthread = primary_guest_thread;
                     Common::SetCurrentThreadName(primary_guest_thread->name.c_str());

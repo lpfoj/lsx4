@@ -1,14 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="game_move_selected">%1$s ausgewählt. Ziehen oder Zielposition antippen.</string>
+    <string name="game_move_completed">%1$s verschoben</string>
+    <string name="library_hold_hint">Halten: 2 s auswählen · 4 s unspielbar · 5 s spielbar. Auswahl ziehen oder Ziel antippen.</string>
+    <string name="library_hold_hint_dismiss">Hinweis zu Listengesten ausblenden</string>
+    <string name="game_hold_countdown">Halteziel: %1$d s</string>
     <string name="app_name">LSX4</string><string name="library_scanning">Installierte Spiele werden gesucht…</string><string name="library_found">Gefundene Spiele: %1$d</string><string name="library_empty_status">Keine Spiele gefunden</string><string name="library_empty">Keine Spiele installiert. Mit + einen entpackten Ordner oder ein PKG importieren.</string>
-    <string name="menu_import_directory">Ordner importieren</string><string name="menu_import_pkg">PKG importieren</string><string name="menu_settings">Einstellungen</string><string name="menu_add">Spiel hinzufügen</string><string name="menu_remove_game">Ausgewähltes Spiel entfernen</string><string name="game_removing">%1$s wird entfernt…</string><string name="game_removed">%1$s entfernt</string><string name="game_remove_failed">%1$s konnte nicht entfernt werden</string>
-    <string name="game_selected_for_removal">%1$s zum Entfernen ausgewählt</string><string name="game_selection_cleared">Auswahl von %1$s aufgehoben</string><string name="game_marked_unsupported">%1$s zu den nicht unterstützten Spielen hinzugefügt</string><string name="game_marked_supported">%1$s zu den unterstützten Spielen hinzugefügt</string>
-    <string name="game_status_unclassified">Nicht klassifiziert</string><string name="game_status_unsupported">Nicht unterstützt</string><string name="game_status_supported">Unterstützt</string>
-    <string name="game_item_accessibility">%1$s, %2$s. %3$s. 2 Sekunden halten, um das Spiel zum Entfernen auszuwählen, 4 Sekunden für nicht unterstützt oder 8 Sekunden für unterstützt.</string>
+    <string name="menu_import_directory">Ordner importieren</string><string name="menu_import_pkg">PKG importieren</string><string name="menu_settings">Einstellungen</string><string name="menu_add">Spiel hinzufügen</string><string name="menu_remove_game">Ausgewähltes Spiel entfernen</string><string name="game_remove_title">Spiel entfernen?</string><string name="game_remove_message">%1$s und die installierten Dateien von diesem Gerät entfernen?</string><string name="game_remove_confirm">Entfernen</string><string name="game_removing">%1$s wird entfernt…</string><string name="game_removed">%1$s entfernt</string><string name="game_remove_failed">%1$s konnte nicht entfernt werden</string>
+    <string name="game_selected_for_removal">%1$s zum Entfernen ausgewählt</string><string name="game_selection_cleared">Auswahl von %1$s aufgehoben</string><string name="game_marked_unsupported">%1$s als nicht spielbar markiert</string><string name="game_marked_supported">%1$s als spielbar markiert</string>
+    <string name="game_status_unclassified">Nicht klassifiziert</string><string name="game_status_unsupported">Nicht spielbar</string><string name="game_status_supported">Spielbar</string>
+    <string name="game_item_accessibility">%1$s, %2$s. %3$s.</string>
     <string name="metadata_only">Nur Metadaten · eboot fehlt</string>
     <string name="settings_title">Einstellungen</string><string name="settings_subtitle">Änderungen werden automatisch gespeichert</string><string name="section_general">Allgemein</string><string name="language">App-Sprache</string>
     <string name="category_graphics">Grafik</string><string name="category_graphics_summary">GPU, Auflösung und Patches</string><string name="category_audio">Audio</string><string name="category_audio_summary">Audioausgabe</string><string name="category_controls">Steuerung</string><string name="category_controls_summary">Bildschirmsteuerung</string><string name="category_cache">Caching</string><string name="category_cache_summary">Cache kompilierter Blöcke</string><string name="category_other">Sonstiges</string><string name="category_other_summary">Debug-HUD</string>
-    <string name="graphics_gpu">GPU</string><string name="graphics_gpu_summary">Grafik-API und Gerätefamilie</string><string name="graphics_patches">Patches</string><string name="graphics_patches_summary">Grafikpatches pro Spiel</string><string name="graphics_resolution">Ausgabeauflösung</string>
+    <string name="graphics_gpu">GPU</string><string name="graphics_gpu_summary">Grafik-API und Gerätefamilie</string><string name="graphics_patches">Patches</string><string name="graphics_patches_summary">Grafikpatches pro Spiel</string><string name="graphics_resolution">Interne Renderauflösung</string><string name="graphics_fsr_output_resolution">Hochskalierte Ausgabeauflösung</string>
     <string name="gpu_vulkan">Vulkan (Snapdragon, starkes Mali)</string><string name="gpu_opengl">OpenGL (Mali, andere)</string><string name="gpu_opengl_pending">In Entwicklung</string>
     <string name="audio_enable">Audioausgabe aktivieren</string><string name="controls_enable">Bildschirmsteuerung anzeigen</string><string name="controls_hint">Bei verbundenem physischen Controller wird sie ausgeblendet.</string><string name="controls_opacity">Deckkraft der Steuerung</string>
     <string name="cache_enable">Persistenter Cache kompilierter Blöcke</string><string name="cache_hint">Verwendet kompilierte Blöcke bei späteren Starts erneut.</string><string name="debug_hud">Debug-HUD</string>
@@ -31,6 +36,10 @@
     <string name="surface_detached">Oberfläche getrennt.</string>
     <string name="surface_detach_failed">Trennen der Oberfläche fehlgeschlagen: %1$s</string>
     <string name="aarch64_jit">AArch64-JIT</string>
+    <string name="guest_cpu_backend_current">Aktueller AArch64-JIT</string>
+    <string name="guest_cpu_backend_fex_experimental">FEX (Experimentell)</string>
+    <string name="optimization_guest_cpu_backend">Gast-CPU-Backend</string>
+    <string name="optimization_guest_cpu_backend_hint">Current ist der sichere Standard. FEX ist ein experimentelles Guest-only-Backend und wird nach einem Neustart des Spielprozesses angewendet. Nicht unterstützte Builds melden den Rückfall auf Current ausdrücklich.</string>
     <string name="controls_gamepad_hint">Wenn ein unterstützter Controller verbunden ist, wird die Bildschirmsteuerung automatisch ausgeblendet. Controller werden unterstützt.</string>
     <string name="resolution_native">Nativ (Gerät)</string>
     <string name="resolution_upscale_150">1,5×-Hochskalierung (2880×1620)</string>
@@ -45,11 +54,6 @@
     <string name="audio_ngs2_error_size">Das ausgewählte Modul ist zu groß</string>
     <string name="audio_ngs2_error_name">Wähle das Firmwaremodul mit dem Namen %1$s aus</string>
     <string name="audio_ngs2_error_format">Die ausgewählte Datei ist kein entschlüsseltes PS4-Modul</string>
-    <string name="game_hold_waiting">Halten: 2 s entfernen · 4 s nicht unterstützt · 8 s unterstützt</string>
-    <string name="game_hold_release_remove">Jetzt loslassen: zum Entfernen auswählen</string>
-    <string name="game_hold_release_unsupported">Jetzt loslassen: als nicht unterstützt markieren</string>
-    <string name="game_hold_release_supported">Jetzt loslassen: als unterstützt markieren</string>
-    <string name="game_hold_elapsed">%1$.1f / 8.0 s · %2$s</string>
     <string name="game_menu_title">Schnellsteuerung</string>
     <string name="game_menu_hint">Zum Schließen nach rechts wischen oder außerhalb tippen</string>
     <string name="game_menu_open">Schnellsteuerung öffnen</string>
@@ -66,4 +70,31 @@
     <string name="optimization_coarse_fragment_2x2_hint">Führt einen Fragment-Shader-Aufruf pro 2×2-Pixelgruppe aus. Dies kann die GPU-Last deutlich senken, reduziert aber feine Details und kann Effekte beeinträchtigen. Starten Sie das Spiel nach einer Änderung neu.</string>
     <string name="optimization_disable_vk_robustness">Vulkan-Robustheitsprüfungen deaktivieren</string>
     <string name="optimization_disable_vk_robustness_hint">Entfernt den GPU-Grenzschutz für Puffer und Bilder. Shaderlastige Spiele können schneller werden, ungültige Zugriffe können jedoch Grafikfehler oder Treiberabstürze verursachen. Starten Sie das Spiel nach einer Änderung neu.</string>
+    <string name="controls_customize_overlay">Bildschirmsteuerung anpassen</string>
+    <string name="controls_customize_overlay_summary">Jedes Overlay-Element verschieben, skalieren, ausblenden oder wiederherstellen.</string>
+    <string name="controls_optional_buttons">Optionale Tasten</string>
+    <string name="controls_show_share">Share anzeigen</string>
+    <string name="controls_show_ps">PS anzeigen</string>
+    <string name="controls_show_touchpad">Touchpad anzeigen</string>
+    <string name="controls_phone_triggers">Telefon-Trigger</string>
+    <string name="controls_phone_trigger_left">Linker Telefon-Trigger</string>
+    <string name="controls_phone_trigger_right">Rechter Telefon-Trigger</string>
+    <string name="controls_phone_trigger_hint">Erkennen antippen und den physischen Trigger drücken. Langes Drücken löscht die Belegung. Die Erkennung ist nicht an ein Telefonmodell gebunden.</string>
+    <string name="controls_trigger_detect">Trigger erkennen</string>
+    <string name="controls_trigger_press_now">Trigger jetzt drücken…</string>
+    <string name="controls_trigger_detected">Erkannt: %1$s</string>
+    <string name="overlay_editor_select_hint">Steuerung auswählen</string>
+    <string name="overlay_editor_selected">Ausgewählt: %1$s</string>
+    <string name="overlay_editor_hide">Ausblenden</string>
+    <string name="overlay_editor_add">Hinzufügen</string>
+    <string name="overlay_editor_reset">Zurücksetzen</string>
+    <string name="overlay_editor_done">Fertig</string>
+    <string name="overlay_editor_none_hidden">Alle Steuerelemente sind bereits sichtbar.</string>
+    <string name="overlay_editor_reset_confirm">Standardpositionen, Größen und Sichtbarkeit wiederherstellen?</string>
+    <string name="overlay_editor_gesture_hint">Ziehen zum Verschieben · Finger spreizen zum Skalieren · Ausgeblendete Elemente mit Hinzufügen wiederherstellen</string>
+    <string name="graphics_upscaled_output_resolution">Hochskalierte Ausgabeauflösung</string>
+    <string name="loading_active">Alles in Ordnung, wird geladen</string>
+    <string name="loading_waiting">Warten auf das Spiel. Kein Fehler bestätigt</string>
+    <string name="loading_failed">Fehler erkannt. Das Spiel kann geschlossen werden</string>
+    <string name="loading_blocks">Blöcke: %1$,d</string>
 </resources>

@@ -1,0 +1,25 @@
+[Unit]
+Description=LSX4 voluntary compatibility report inbox
+After=network.target
+
+[Service]
+Type=simple
+User=lsx4-reports
+Group=lsx4-reports
+WorkingDirectory=/opt/lsx4-reports
+ExecStart=/usr/bin/python3 -B /opt/lsx4-reports/service.py serve
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/lsx4-reports
+RestrictAddressFamilies=AF_INET AF_UNIX
+MemoryMax=128M
+TasksMax=64
+LimitNOFILE=128
+
+[Install]
+WantedBy=multi-user.target

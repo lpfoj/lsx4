@@ -78,10 +78,13 @@ bool Materialize(Xbyak_aarch64::CodeGenerator& code, const X86Mnemonic mnemonic,
     if (!recipe) {
         return false;
     }
-    code.ubfx(scratch_a, flags, recipe->first_bit, 1);
     if (recipe->relation == Relation::Flag) {
-        code.mov(result, scratch_a);
+
+
+
+        code.ubfx(result, flags, recipe->first_bit, 1);
     } else {
+        code.ubfx(scratch_a, flags, recipe->first_bit, 1);
         code.ubfx(scratch_b, flags, recipe->second_bit, 1);
         if (recipe->relation == Relation::EitherFlag) {
             code.orr(result, scratch_a, scratch_b);
@@ -132,6 +135,24 @@ bool EmitGuestBranchReturn(Xbyak_aarch64::CodeGenerator& code,
                            const std::uint64_t fallthrough,
                            const std::uint64_t taken) noexcept {
     code.ldr(code.x9, Xbyak_aarch64::ptr(code.x0, flags_state_offset));
+    const auto recipe = SelectRecipe(mnemonic);
+    if (!recipe) {
+        return false;
+    }
+    if (recipe->relation == Relation::Flag) {
+
+
+
+
+
+        code.mov(code.x11, fallthrough);
+        code.mov(code.x12, taken);
+        code.tst(code.x9, std::uint64_t{1} << recipe->first_bit);
+        code.csel(code.x0, code.x12, code.x11,
+                  recipe->invert ? Xbyak_aarch64::EQ : Xbyak_aarch64::NE);
+        code.ret();
+        return true;
+    }
     if (!Materialize(code, mnemonic, code.x9, code.x10, code.x11, code.x12)) {
         return false;
     }

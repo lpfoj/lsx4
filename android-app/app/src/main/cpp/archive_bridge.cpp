@@ -1,9 +1,9 @@
-/*
- * UnRAR source code may be used in any software to handle RAR archives
- * without limitations free of charge, but cannot be used to develop a RAR
- * (WinRAR) compatible archiver and to re-create RAR compression algorithm,
- * which is proprietary.
- */
+
+
+
+
+
+
 
 #include <jni.h>
 

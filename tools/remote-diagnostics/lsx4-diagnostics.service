@@ -1,0 +1,22 @@
+[Unit]
+Description=LSX4 remote diagnostics receiver
+After=network.target
+
+[Service]
+Type=simple
+User=lsx4-diag
+Group=lsx4-diag
+ExecStart=/usr/bin/python3 /opt/lsx4-diagnostics/receiver.py
+Environment=PYTHONUNBUFFERED=1
+Environment=LSX4_DIAGNOSTICS_DATA_DIR=/srv/lsx4-diagnostics
+Environment=LSX4_DIAGNOSTICS_TOKEN_FILE=/etc/lsx4-diagnostics/upload.token
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/lsx4-diagnostics
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

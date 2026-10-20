@@ -32,6 +32,7 @@ extern "C" bool ExecutorJitWriteGuestBytes(
 extern "C" bool ExecutorJitIsReadableGuestRange(
     std::uint64_t address, std::size_t size);
 extern "C" bool ExecutorJitIsExecutableGuestAddress(std::uint64_t address);
+extern "C" bool ExecutorJitIsWritableGuestAddress(std::uint64_t address);
 
 extern "C" std::uint64_t executor_jit_ensure_hle_thunk_slab();
 extern "C" std::uint64_t executor_jit_hle_thunk_slab_base();

@@ -52,6 +52,9 @@ enum class PackedLogicKind : std::uint8_t {
 
 PackedBitTestResult TestPackedBits(const void* left, const void* right,
                                    std::size_t width) noexcept;
+PackedBitTestResult TestPackedSignBits(const void* left, const void* right,
+                                       std::size_t lane_width,
+                                       std::size_t total_width) noexcept;
 bool DuplicateDwordParity(void* destination, const void* source,
                           std::size_t width, bool odd_lanes) noexcept;
 bool DuplicateLowQwordPerLane(void* destination, const void* source,

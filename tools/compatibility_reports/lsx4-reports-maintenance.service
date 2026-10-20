@@ -1,0 +1,15 @@
+[Unit]
+Description=Back up private LSX4 reports database without expiring reports
+
+[Service]
+Type=oneshot
+User=lsx4-reports
+Group=lsx4-reports
+WorkingDirectory=/opt/lsx4-reports
+ExecStart=/usr/bin/python3 -B /opt/lsx4-reports/maintenance.py
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/lsx4-reports

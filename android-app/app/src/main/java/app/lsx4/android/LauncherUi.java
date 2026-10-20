@@ -1,9 +1,12 @@
 package app.lsx4.android;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
+import android.content.ClipData;
 import android.content.ContentResolver;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.database.Cursor;
 import android.graphics.Bitmap;
@@ -13,17 +16,26 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.LocaleList;
+import android.os.ParcelFileDescriptor;
 import android.os.StatFs;
 import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.util.Log;
+import android.text.Editable;
+import android.text.InputType;
+import android.text.TextWatcher;
 import android.view.Gravity;
+import android.view.DragEvent;
 import android.view.HapticFeedbackConstants;
 import android.view.Menu;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
+import android.widget.EditText;
 import android.widget.ImageView;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
@@ -35,6 +47,7 @@ import android.widget.Toast;
 
 import org.apache.commons.compress.archivers.sevenz.SevenZArchiveEntry;
 import org.apache.commons.compress.archivers.sevenz.SevenZFile;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
@@ -51,7 +64,6 @@ import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -68,11 +80,43 @@ public final class LauncherUi {
 
     private static final int MENU_IMPORT_DIRECTORY = 5101;
     private static final int MENU_IMPORT_PKG = 5102;
+    private static final int MENU_SORT_MANUAL = 5201;
+    private static final int MENU_SORT_REVERSE = 5202;
+    private static final int MENU_SORT_PLAYABLE = 5203;
+    private static final int MENU_SORT_UNPLAYABLE = 5204;
+    private static final int MENU_STYLE_LIST = 5301;
+    private static final int MENU_STYLE_HORIZONTAL = 5302;
+    private static final int MENU_STYLE_VERTICAL = 5303;
+    private static final int MENU_SOUND_EFFECTS = 5304;
+    private static final int MENU_MUSIC = 5305;
+    private static final int MENU_THEME = 5306;
+    private static final int MENU_THEME_FIRST = 5310;
+    private static final int MENU_STYLE_LIBRARY_HORIZONTAL = 5320;
+    private static final int MENU_STYLE_LIBRARY_VERTICAL = 5321;
+    private static final int MENU_STYLE_TILES_HORIZONTAL = 5322;
+    private static final int MENU_STYLE_TILES_VERTICAL = 5323;
+    private static final int MENU_GROUP_STYLE = 1;
+    private static final int MENU_GROUP_THEME = 2;
+    private static final int STYLE_LIST = 0;
+    private static final int STYLE_HORIZONTAL = 1;
+    private static final int STYLE_VERTICAL = 2;
+    private static final int STYLE_LIBRARY_HORIZONTAL = 3;
+    private static final int STYLE_LIBRARY_VERTICAL = 4;
+    private static final int STYLE_TILES_HORIZONTAL = 5;
+    private static final int STYLE_TILES_VERTICAL = 6;
+    private static final long HOME_LAUNCH_DELAY_MS = 380L;
     private static final String EXTRA_EMBEDDED_AARCH64_JIT_BACKEND =
             "embedded_aarch64_jit_backend";
     private static final String EXTRA_GAME_PLATFORM = "game_platform";
     private static final String PLATFORM_PS4 = "ps4";
     private static final String PLATFORM_PS5 = "ps5";
+    private static final String LIBRARY_LAYOUT_PREFS = "lsx4_library_layout";
+    private static final String KEY_GAME_ORDER = "game_order_v1";
+    private static final String KEY_SORT_MODE = "game_sort_mode_v1";
+    private static final String KEY_SORT_REVERSED = "game_sort_reversed_v1";
+    private static final String KEY_HOLD_HINT_HIDDEN = "hold_hint_hidden_v1";
+    private static final String KEY_HOME_STYLE = "launcher_home_style_v1";
+    private static final String KEY_HOME_THEME = "launcher_home_theme_v1";
     private static final Pattern TITLE_ID = Pattern.compile("[A-Z0-9]{9}");
     private static final int MAX_SFO_BYTES = 1024 * 1024;
     private static final int COPY_BUFFER_BYTES = 1024 * 1024;
@@ -85,39 +129,70 @@ public final class LauncherUi {
     private static final int MAX_TREE_URI_LENGTH = 8192;
     private static final long MAX_DOCUMENT_METADATA_CHARS = 8L * 1024L * 1024L;
     private static final long FREE_SPACE_RESERVE_BYTES = 512L * 1024L * 1024L;
+    private static final long PKG_EXTRACTION_RESERVE_BYTES = 128L * 1024L * 1024L;
     private static final Object IMPORT_LOCK = new Object();
     private static final AtomicBoolean IMPORT_ACTIVE = new AtomicBoolean();
 
-    private final Activity activity;
+    private final MainActivity activity;
     private final AtomicBoolean workRunning = new AtomicBoolean();
     private final GameCompatibilityRepository compatibilityRepository;
+    private final SharedPreferences libraryLayoutPreferences;
     private final Handler holdHandler;
     private final int touchSlop;
     private LinearLayout gameList;
+    private ScrollView gameScroll;
+    private LinearLayout searchRow;
+    private EditText searchInput;
+    private int sortMode;
+    private boolean sortReversed;
+    private String searchQuery = "";
     private TextView status;
     private ProgressBar progress;
     private ImageView removeAction;
     private GameEntry selectedGame;
+    private int homeStyle;
+    private int homeTheme;
+    private PlayStationHomeView homeView;
+    private MenuSoundEngine menuSounds;
+    private View gestureHintView;
+    private boolean homeLaunchPending;
+    private View appBarView;
+    private FrameLayout screenView;
+    private View functionAnchor;
     private List<GameEntry> latestGames = Collections.emptyList();
     private View rootView;
     private volatile boolean destroyed;
+    private final Runnable applySearch = () -> {
+        if (!destroyed) {
+            renderVisibleGames();
+            scrollGamesToTop();
+        }
+    };
 
-    public LauncherUi(Activity activity) {
+    public LauncherUi(MainActivity activity) {
         if (activity == null) {
             throw new IllegalArgumentException("activity == null");
         }
         this.activity = activity;
         compatibilityRepository = new GameCompatibilityRepository(activity);
+        libraryLayoutPreferences = activity.getSharedPreferences(
+                LIBRARY_LAYOUT_PREFS, Activity.MODE_PRIVATE);
+        sortMode = GameLibraryView.validMode(libraryLayoutPreferences.getInt(
+                KEY_SORT_MODE, GameLibraryView.MANUAL));
+        sortReversed = libraryLayoutPreferences.getBoolean(KEY_SORT_REVERSED, false);
+        homeStyle = validHomeStyle(libraryLayoutPreferences.getInt(KEY_HOME_STYLE, STYLE_LIST));
+        homeTheme = validHomeTheme(libraryLayoutPreferences.getInt(KEY_HOME_THEME, 0));
         holdHandler = new Handler(Looper.getMainLooper());
         touchSlop = ViewConfiguration.get(activity).getScaledTouchSlop();
     }
 
     public View buildView() {
-        activity.setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+        activity.setRequestedOrientation(requestedOrientation());
 
         LinearLayout root = new LinearLayout(activity);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(0xff111417);
+        root.setFocusableInTouchMode(true);
         UiChrome.applyInsets(root, dp(16), dp(12), dp(16), dp(14));
 
         LinearLayout appBar = new LinearLayout(activity);
@@ -153,8 +228,32 @@ public final class LauncherUi {
         removeAction.setClickable(true);
         removeAction.setFocusable(true);
         removeAction.setVisibility(View.GONE);
-        removeAction.setOnClickListener(view -> removeSelectedGame());
+        removeAction.setOnClickListener(view -> confirmRemoveSelectedGame());
         appBar.addView(removeAction, new LinearLayout.LayoutParams(dp(48), dp(48)));
+
+        ImageView homeLayout = new ImageView(activity);
+        homeLayout.setImageResource(R.drawable.ic_home_layout);
+        homeLayout.setPadding(dp(12), dp(12), dp(12), dp(12));
+        homeLayout.setContentDescription(activity.getString(R.string.home_layout_action));
+        homeLayout.setTooltipText(activity.getString(R.string.home_layout_action));
+        homeLayout.setClickable(true);
+        homeLayout.setFocusable(true);
+        homeLayout.setOnClickListener(this::showHomeStyleMenu);
+        appBar.addView(homeLayout, new LinearLayout.LayoutParams(dp(48), dp(48)));
+
+        ImageView sort = new ImageView(activity);
+        sort.setImageResource(R.drawable.ic_sort);
+        sort.setPadding(dp(12), dp(12), dp(12), dp(12));
+        sort.setContentDescription(activity.getString(R.string.library_sort_action));
+        sort.setTooltipText(activity.getString(R.string.library_sort_action));
+        sort.setClickable(true);
+        sort.setFocusable(true);
+        sort.setOnClickListener(this::showSortMenu);
+        sort.setOnLongClickListener(view -> {
+            toggleSearch();
+            return true;
+        });
+        appBar.addView(sort, new LinearLayout.LayoutParams(dp(48), dp(48)));
 
         TextView add = toolbarAction("+", activity.getString(R.string.menu_add));
         add.setOnClickListener(this::showAddMenu);
@@ -166,24 +265,375 @@ public final class LauncherUi {
         settings.setContentDescription(activity.getString(R.string.menu_settings));
         settings.setClickable(true);
         settings.setFocusable(true);
-        settings.setOnClickListener(view ->
-                activity.startActivity(new Intent(activity, SettingsActivity.class)));
+        settings.setOnClickListener(view -> openMenuSettings());
         appBar.addView(settings, new LinearLayout.LayoutParams(dp(48), dp(48)));
         root.addView(appBar, matchWrap());
+        appBarView = appBar;
+        buildSearchRow(root);
+
+        if (!libraryLayoutPreferences.getBoolean(KEY_HOLD_HINT_HIDDEN, false)) {
+            LinearLayout gestureHint = new LinearLayout(activity);
+            gestureHint.setOrientation(LinearLayout.HORIZONTAL);
+            gestureHint.setGravity(Gravity.CENTER_VERTICAL);
+            gestureHint.setPadding(dp(12), dp(7), dp(4), dp(7));
+            gestureHint.setBackground(roundedBackground(0xd91a2027, 0xff34404c, 12));
+            TextView hintText = label(activity.getString(R.string.library_hold_hint),
+                    10, 0xffaeb8c3);
+            gestureHint.addView(hintText, new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            TextView dismissHint = toolbarAction("\u00d7",
+                    activity.getString(R.string.library_hold_hint_dismiss));
+            dismissHint.setTextSize(20);
+            dismissHint.setOnClickListener(view -> {
+                libraryLayoutPreferences.edit()
+                        .putBoolean(KEY_HOLD_HINT_HIDDEN, true).apply();
+                root.removeView(gestureHint);
+            });
+            gestureHint.addView(dismissHint,
+                    new LinearLayout.LayoutParams(dp(36), dp(36)));
+            LinearLayout.LayoutParams hintLp = matchWrap();
+            hintLp.setMargins(0, dp(8), 0, 0);
+            root.addView(gestureHint, hintLp);
+            gestureHintView = gestureHint;
+        }
 
         gameList = new LinearLayout(activity);
         gameList.setOrientation(LinearLayout.VERTICAL);
-        ScrollView scroll = new ScrollView(activity);
-        scroll.setFillViewport(true);
-        scroll.addView(gameList);
+        gameScroll = new ScrollView(activity);
+        gameScroll.setFillViewport(true);
+        gameScroll.addView(gameList);
         LinearLayout.LayoutParams scrollLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
         scrollLp.setMargins(0, dp(10), 0, 0);
-        root.addView(scroll, scrollLp);
+        root.addView(gameScroll, scrollLp);
+
+        FrameLayout screen = new FrameLayout(activity);
+        screen.setBackgroundColor(0xff111417);
+        homeView = new PlayStationHomeView(activity);
+        homeView.setTheme(homeTheme);
+        homeView.setListener(new PlayStationHomeView.Listener() {
+            @Override
+            public void onActivate(PlayStationHomeView.Item item) {
+                launchFromHome(item);
+            }
+
+            @Override
+            public void onSettings(PlayStationHomeView.Item item) {
+                if (item != null && item.tag instanceof GameEntry) {
+                    openGameSettings((GameEntry) item.tag);
+                }
+            }
+
+            @Override
+            public void onFunction(int function, android.graphics.RectF bounds) {
+                runHomeFunction(function, bounds);
+            }
+        });
+        screen.addView(homeView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        screen.addView(root, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        functionAnchor = new View(activity);
+        functionAnchor.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        screen.addView(functionAnchor, new FrameLayout.LayoutParams(1, 1));
 
         rootView = root;
+        screenView = screen;
+        applyHomeStyle(false);
         refresh();
-        return root;
+        return screen;
+    }
+
+
+    private void runHomeFunction(int function, android.graphics.RectF bounds) {
+        if (functionAnchor == null) {
+            return;
+        }
+        FrameLayout.LayoutParams anchorLp = new FrameLayout.LayoutParams(
+                Math.max(1, Math.round(bounds.width())), Math.max(1, Math.round(bounds.height())));
+        anchorLp.leftMargin = Math.round(bounds.left);
+        anchorLp.topMargin = Math.round(bounds.top);
+        functionAnchor.setLayoutParams(anchorLp);
+        functionAnchor.post(() -> {
+            if (destroyed || functionAnchor == null) {
+                return;
+            }
+            switch (function) {
+            case PlayStationHomeView.FUNCTION_VIEW:
+                showHomeStyleMenu(functionAnchor);
+                break;
+            case PlayStationHomeView.FUNCTION_SEARCH:
+                toggleSearch();
+                break;
+            case PlayStationHomeView.FUNCTION_SORT:
+                showSortMenu(functionAnchor);
+                break;
+            case PlayStationHomeView.FUNCTION_ADD:
+                showAddMenu(functionAnchor);
+                break;
+            case PlayStationHomeView.FUNCTION_SETTINGS:
+                openMenuSettings();
+                break;
+            default:
+                break;
+            }
+        });
+    }
+
+    private static int validHomeStyle(int style) {
+        return style >= STYLE_LIST && style <= STYLE_TILES_VERTICAL ? style : STYLE_LIST;
+    }
+
+    private static int validHomeTheme(int theme) {
+        return theme >= 0 && theme < PlayStationHomeView.THEMES.length ? theme : 0;
+    }
+
+
+    int requestedOrientation() {
+        return homeStyle == STYLE_HORIZONTAL || homeStyle == STYLE_LIBRARY_HORIZONTAL
+                || homeStyle == STYLE_TILES_HORIZONTAL
+                ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                : ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+    }
+
+
+    void applyWindowMode() {
+        homeTheme = validHomeTheme(libraryLayoutPreferences.getInt(KEY_HOME_THEME, 0));
+        if (homeView != null) homeView.setTheme(homeTheme);
+        boolean home = homeStyle != STYLE_LIST;
+        activity.setRequestedOrientation(requestedOrientation());
+        android.view.Window window = activity.getWindow();
+        window.setNavigationBarColor(home ? android.graphics.Color.TRANSPARENT : 0xff111417);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            window.setNavigationBarContrastEnforced(!home);
+        }
+        if (homeView != null) {
+            homeView.setImmersive(home);
+        }
+        if (!home && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            android.view.WindowInsetsController controller =
+                    window.getDecorView().getWindowInsetsController();
+            if (controller != null) {
+                controller.show(android.view.WindowInsets.Type.systemBars());
+            }
+        }
+    }
+
+    private MenuSoundEngine ensureMenuSounds() {
+        if (menuSounds == null) {
+            menuSounds = new MenuSoundEngine(activity, libraryLayoutPreferences);
+        }
+        return menuSounds;
+    }
+
+    void setMenuActive(boolean active) {
+        if (homeView != null) homeView.setMenuActive(active);
+        if (!active && menuSounds != null) menuSounds.setAmbientActive(false);
+    }
+
+    private void showHomeStyleMenu(View anchor) {
+        PopupMenu popup = new PopupMenu(activity, anchor, Gravity.END);
+        Menu menu = popup.getMenu();
+        menu.add(MENU_GROUP_STYLE, MENU_STYLE_LIST, 0, R.string.home_layout_list)
+                .setChecked(homeStyle == STYLE_LIST);
+        menu.add(MENU_GROUP_STYLE, MENU_STYLE_HORIZONTAL, 1, R.string.home_layout_horizontal)
+                .setChecked(homeStyle == STYLE_HORIZONTAL);
+        menu.add(MENU_GROUP_STYLE, MENU_STYLE_VERTICAL, 2, R.string.home_layout_vertical)
+                .setChecked(homeStyle == STYLE_VERTICAL);
+        menu.add(MENU_GROUP_STYLE, MENU_STYLE_LIBRARY_HORIZONTAL, 3, R.string.home_layout_library_horizontal)
+                .setChecked(homeStyle == STYLE_LIBRARY_HORIZONTAL);
+        menu.add(MENU_GROUP_STYLE, MENU_STYLE_LIBRARY_VERTICAL, 4, R.string.home_layout_library_vertical)
+                .setChecked(homeStyle == STYLE_LIBRARY_VERTICAL);
+        menu.add(MENU_GROUP_STYLE, MENU_STYLE_TILES_HORIZONTAL, 5, R.string.home_layout_tiles_horizontal)
+                .setChecked(homeStyle == STYLE_TILES_HORIZONTAL);
+        menu.add(MENU_GROUP_STYLE, MENU_STYLE_TILES_VERTICAL, 6, R.string.home_layout_tiles_vertical)
+                .setChecked(homeStyle == STYLE_TILES_VERTICAL);
+        menu.setGroupCheckable(MENU_GROUP_STYLE, true, true);
+        MenuSoundEngine sounds = ensureMenuSounds();
+        menu.add(Menu.NONE, MENU_SOUND_EFFECTS, 7, R.string.home_sound_effects)
+                .setCheckable(true).setChecked(sounds.effectsEnabled());
+        menu.add(Menu.NONE, MENU_MUSIC, 8, R.string.home_music)
+                .setCheckable(true).setChecked(sounds.musicEnabled());
+        popup.setOnMenuItemClickListener(item -> {
+            int themeIndex = item.getItemId() - MENU_THEME_FIRST;
+            if (themeIndex >= 0 && themeIndex < PlayStationHomeView.THEMES.length) {
+                setHomeTheme(themeIndex);
+                return true;
+            }
+            switch (item.getItemId()) {
+            case MENU_STYLE_LIST:
+                setHomeStyle(STYLE_LIST);
+                return true;
+            case MENU_STYLE_HORIZONTAL:
+                setHomeStyle(STYLE_HORIZONTAL);
+                return true;
+            case MENU_STYLE_VERTICAL:
+                setHomeStyle(STYLE_VERTICAL);
+                return true;
+            case MENU_STYLE_LIBRARY_HORIZONTAL:
+                setHomeStyle(STYLE_LIBRARY_HORIZONTAL);
+                return true;
+            case MENU_STYLE_LIBRARY_VERTICAL:
+                setHomeStyle(STYLE_LIBRARY_VERTICAL);
+                return true;
+            case MENU_STYLE_TILES_HORIZONTAL:
+                setHomeStyle(STYLE_TILES_HORIZONTAL);
+                return true;
+            case MENU_STYLE_TILES_VERTICAL:
+                setHomeStyle(STYLE_TILES_VERTICAL);
+                return true;
+            case MENU_SOUND_EFFECTS:
+                sounds.setEffectsEnabled(!sounds.effectsEnabled());
+                return true;
+            case MENU_MUSIC:
+                sounds.setMusicEnabled(!sounds.musicEnabled());
+                return true;
+            default:
+                return false;
+            }
+        });
+        popup.show();
+    }
+
+    private void setHomeTheme(int theme) {
+        homeTheme = validHomeTheme(theme);
+        libraryLayoutPreferences.edit().putInt(KEY_HOME_THEME, homeTheme).apply();
+        if (homeView != null) {
+            homeView.setTheme(homeTheme);
+        }
+    }
+
+    private void setHomeStyle(int style) {
+        int next = validHomeStyle(style);
+        if (next == homeStyle) {
+            return;
+        }
+        homeStyle = next;
+        libraryLayoutPreferences.edit().putInt(KEY_HOME_STYLE, homeStyle).apply();
+        applyHomeStyle(true);
+    }
+
+
+    private void applyHomeStyle(boolean animate) {
+        if (homeView == null || gameScroll == null) {
+            return;
+        }
+        boolean home = homeStyle != STYLE_LIST;
+        gameScroll.setVisibility(home ? View.GONE : View.VISIBLE);
+        if (gestureHintView != null) {
+            gestureHintView.setVisibility(home ? View.GONE : View.VISIBLE);
+        }
+        if (appBarView != null) {
+            appBarView.setVisibility(home ? View.GONE : View.VISIBLE);
+        }
+        if (rootView != null) {
+            rootView.setBackgroundColor(home ? android.graphics.Color.TRANSPARENT : 0xff111417);
+        }
+
+        applyWindowMode();
+        if (home) {
+            selectedGame = null;
+            updateRemoveAction();
+
+            homeView.setLayoutMode(homeStyle);
+            homeView.setSounds(ensureMenuSounds());
+            homeView.setVisibility(View.VISIBLE);
+            if (animate) {
+                homeView.setAlpha(0f);
+                homeView.animate().alpha(1f).setDuration(260L).start();
+            }
+            homeView.requestFocus();
+        } else {
+            homeView.setVisibility(View.GONE);
+            if (menuSounds != null) {
+                menuSounds.setAmbientActive(false);
+            }
+        }
+        renderVisibleGames();
+    }
+
+    private List<PlayStationHomeView.Item> homeItems(List<GameEntry> games) {
+        List<PlayStationHomeView.Item> result = new ArrayList<>(games.size() + 1);
+        result.add(new PlayStationHomeView.Item("device",
+                activity.getString(R.string.home_device_title), "", null, null, null,
+                false, true, PlayStationHomeView.STATUS_UNCLASSIFIED, null));
+        result.add(new PlayStationHomeView.Item("menu:compatibility",
+                activity.getString(R.string.menu_compatibility_card), "", null, null, null,
+                true, false, PlayStationHomeView.STATUS_UNCLASSIFIED, "compatibility"));
+
+        for (String platform : new String[]{PLATFORM_PS4, PLATFORM_PS5}) {
+            for (GameEntry game : games) {
+                if (!platform.equals(game.platform)) {
+                    continue;
+                }
+                GameCompatibilityStatus compatibility =
+                        compatibilityRepository.statusOf(game.titleId);
+                int status = compatibility == GameCompatibilityStatus.SUPPORTED
+                        ? PlayStationHomeView.STATUS_SUPPORTED
+                        : compatibility == GameCompatibilityStatus.UNSUPPORTED
+                        ? PlayStationHomeView.STATUS_UNSUPPORTED
+                        : PlayStationHomeView.STATUS_UNCLASSIFIED;
+                result.add(new PlayStationHomeView.Item(game.titleId, game.title, game.titleId,
+                        PLATFORM_PS5.equals(game.platform) ? "PS5" : "PS4", game.icon,
+                        homeArt(game), game.launchable, false, status, game));
+            }
+        }
+        return result;
+    }
+
+    private static File homeArt(GameEntry game) {
+        File sceSys = new File(game.directory, "sce_sys");
+        for (String name : new String[]{"pic1.png", "pic0.png"}) {
+            File candidate = new File(sceSys, name);
+            if (safeRegularFileWithin(candidate, game.directory)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private void openMenuSettings() {
+        if (!destroyed) {
+            activity.startActivity(new Intent(activity, MenuSectionActivity.class)
+                    .putExtra(MenuSectionActivity.EXTRA_SECTION, "settings")
+                    .putExtra(MenuSectionActivity.EXTRA_STYLE, homeStyle));
+        }
+    }
+
+    private void launchFromHome(PlayStationHomeView.Item item) {
+        if (item != null && item.utility && !item.device && !destroyed) {
+            activity.startActivity(new Intent(activity, MenuSectionActivity.class)
+                    .putExtra(MenuSectionActivity.EXTRA_SECTION, (String) item.tag)
+                    .putExtra(MenuSectionActivity.EXTRA_STYLE, homeStyle));
+            return;
+        }
+        if (item != null && item.device && !destroyed) {
+            activity.startActivity(new Intent(activity, DeviceInfoActivity.class)
+                    .putExtra(DeviceInfoActivity.EXTRA_THEME, homeTheme));
+            return;
+        }
+        if (item == null || !(item.tag instanceof GameEntry) || homeLaunchPending) {
+            return;
+        }
+        GameEntry game = (GameEntry) item.tag;
+        if (!game.launchable) {
+            toast(activity.getString(R.string.metadata_only));
+            return;
+        }
+        if (workRunning.get() || IMPORT_ACTIVE.get()) {
+            toast(activity.getString(R.string.import_wait_before_launch));
+            return;
+        }
+        homeLaunchPending = true;
+        if (homeView != null) {
+            homeView.playActivation();
+        }
+        holdHandler.postDelayed(() -> {
+            homeLaunchPending = false;
+            if (!destroyed) {
+                launch(game);
+            }
+        }, HOME_LAUNCH_DELAY_MS);
     }
 
     private TextView toolbarAction(String glyph, String description) {
@@ -217,19 +667,174 @@ public final class LauncherUi {
         popup.show();
     }
 
+    private void showSortMenu(View anchor) {
+        PopupMenu popup = new PopupMenu(activity, anchor, Gravity.END);
+        Menu menu = popup.getMenu();
+        menu.add(Menu.NONE, MENU_SORT_MANUAL, 0, R.string.library_sort_manual)
+                .setCheckable(true).setChecked(sortMode == GameLibraryView.MANUAL && !sortReversed);
+        menu.add(Menu.NONE, MENU_SORT_REVERSE, 1, R.string.library_sort_reverse)
+                .setCheckable(true).setChecked(sortReversed);
+        menu.add(Menu.NONE, MENU_SORT_PLAYABLE, 2, R.string.library_sort_playable)
+                .setCheckable(true).setChecked(sortMode == GameLibraryView.PLAYABLE_FIRST && !sortReversed);
+        menu.add(Menu.NONE, MENU_SORT_UNPLAYABLE, 3, R.string.library_sort_unplayable)
+                .setCheckable(true).setChecked(sortMode == GameLibraryView.UNPLAYABLE_FIRST && !sortReversed);
+        popup.setOnMenuItemClickListener(item -> {
+            switch (item.getItemId()) {
+            case MENU_SORT_MANUAL:
+                sortMode = GameLibraryView.MANUAL;
+                sortReversed = false;
+                break;
+            case MENU_SORT_REVERSE:
+                sortReversed = !sortReversed;
+                break;
+            case MENU_SORT_PLAYABLE:
+                sortMode = GameLibraryView.PLAYABLE_FIRST;
+                sortReversed = false;
+                break;
+            case MENU_SORT_UNPLAYABLE:
+                sortMode = GameLibraryView.UNPLAYABLE_FIRST;
+                sortReversed = false;
+                break;
+            default:
+                return false;
+            }
+            libraryLayoutPreferences.edit()
+                    .putInt(KEY_SORT_MODE, sortMode)
+                    .putBoolean(KEY_SORT_REVERSED, sortReversed).apply();
+            selectedGame = null;
+            updateRemoveAction();
+            renderVisibleGames();
+            scrollGamesToTop();
+            return true;
+        });
+        popup.show();
+    }
+
+    private void buildSearchRow(LinearLayout root) {
+        searchRow = new LinearLayout(activity);
+        searchRow.setOrientation(LinearLayout.HORIZONTAL);
+        searchRow.setGravity(Gravity.CENTER_VERTICAL);
+        searchRow.setPadding(dp(12), 0, 0, 0);
+        searchRow.setBackground(roundedBackground(0xff1b2026, 0xff34404c, 12));
+        searchRow.setVisibility(View.GONE);
+
+        searchInput = new EditText(activity);
+        searchInput.setSingleLine(true);
+        searchInput.setTextSize(16);
+        searchInput.setTextColor(0xffeef2f6);
+        searchInput.setHintTextColor(0xff9aa6b2);
+        searchInput.setHint(R.string.library_search_hint);
+        searchInput.setContentDescription(activity.getString(R.string.library_search_hint));
+        searchInput.setBackgroundColor(android.graphics.Color.TRANSPARENT);
+        searchInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+
+        searchInput.setImeHintLocales(new LocaleList(Locale.ENGLISH));
+        searchInput.setImeOptions(EditorInfo.IME_ACTION_DONE
+                | EditorInfo.IME_FLAG_NO_EXTRACT_UI | EditorInfo.IME_FLAG_FORCE_ASCII);
+        searchInput.setOnEditorActionListener((view, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_DONE) {
+                hideSearchKeyboard();
+                return true;
+            }
+            return false;
+        });
+        searchInput.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence text, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence text, int start, int before, int count) {}
+            @Override public void afterTextChanged(Editable text) {
+                searchQuery = text.toString();
+                selectedGame = null;
+                updateRemoveAction();
+                holdHandler.removeCallbacks(applySearch);
+                holdHandler.postDelayed(applySearch, 150L);
+            }
+        });
+        searchRow.addView(searchInput, new LinearLayout.LayoutParams(0, dp(48), 1f));
+        TextView close = toolbarAction("\u00d7", activity.getString(R.string.library_search_hide));
+        close.setOnClickListener(view -> hideSearch());
+        searchRow.addView(close, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        LinearLayout.LayoutParams searchLp = matchWrap();
+        searchLp.setMargins(0, dp(8), 0, 0);
+        root.addView(searchRow, searchLp);
+    }
+
+    private void toggleSearch() {
+        if (searchRow == null) {
+            return;
+        }
+        if (searchRow.getVisibility() == View.VISIBLE) {
+            hideSearch();
+            return;
+        }
+        searchRow.setVisibility(View.VISIBLE);
+        searchInput.requestFocus();
+        searchInput.post(() -> {
+            if (!destroyed && searchRow != null && searchRow.getVisibility() == View.VISIBLE) {
+                InputMethodManager ime = activity.getSystemService(InputMethodManager.class);
+                if (ime != null) {
+                    ime.showSoftInput(searchInput, InputMethodManager.SHOW_IMPLICIT);
+                }
+            }
+        });
+    }
+
+    private void hideSearchKeyboard() {
+        InputMethodManager ime = activity.getSystemService(InputMethodManager.class);
+        if (ime != null && searchInput != null) {
+            ime.hideSoftInputFromWindow(searchInput.getWindowToken(), 0);
+        }
+    }
+
+    private void hideSearch() {
+        hideSearchKeyboard();
+        searchRow.setVisibility(View.GONE);
+        searchInput.clearFocus();
+        if (homeView != null && homeStyle != STYLE_LIST) {
+            homeView.requestFocus();
+        } else if (rootView != null) {
+            rootView.requestFocus();
+        }
+        searchInput.setText("");
+        searchQuery = "";
+        holdHandler.removeCallbacks(applySearch);
+        renderVisibleGames();
+        scrollGamesToTop();
+    }
+
+    private void scrollGamesToTop() {
+        if (gameScroll != null) {
+            gameScroll.scrollTo(0, 0);
+        }
+    }
+
     public View createView() {
         return buildView();
     }
 
     public View getView() {
-        return rootView;
+        return screenView;
     }
 
     public void destroy() {
         destroyed = true;
         holdHandler.removeCallbacksAndMessages(null);
+        if (homeView != null) {
+            homeView.release();
+            homeView = null;
+        }
+        if (menuSounds != null) {
+            menuSounds.release();
+            menuSounds = null;
+        }
+        gestureHintView = null;
+        appBarView = null;
+        functionAnchor = null;
+        screenView = null;
         rootView = null;
         gameList = null;
+        gameScroll = null;
+        searchRow = null;
+        searchInput = null;
         status = null;
         progress = null;
         removeAction = null;
@@ -409,13 +1014,14 @@ public final class LauncherUi {
         String platform;
         String titleId;
         String title;
-        if (paramJson != null) {
-            Ps5Metadata metadata = readPs5Metadata(
-                    readUriLimited(resolver, paramJson.uri, MAX_SFO_BYTES));
+        Ps5Metadata metadata = paramJson != null ? readPs5Metadata(
+                readUriLimited(resolver, paramJson.uri, MAX_SFO_BYTES)) : null;
+        if (metadata != null) {
             platform = PLATFORM_PS5;
             titleId = metadata.titleId;
             title = metadata.title;
         } else {
+            if (paramSfo == null) throw new IOException("нет метаданных PS4 или PS5");
             byte[] sourceSfo = readUriLimited(resolver, paramSfo.uri, MAX_SFO_BYTES);
             platform = PLATFORM_PS4;
             titleId = normalizeTitleId(PkgInstaller.sfoString(sourceSfo, "TITLE_ID"));
@@ -454,8 +1060,10 @@ public final class LauncherUi {
                     || !safeRegularFileWithin(stagedParam, staging)) {
                 throw new IOException("копия игры не прошла проверку структуры");
             }
+            Ps5Metadata copiedPs5 = PLATFORM_PS5.equals(platform)
+                    ? readPs5Metadata(readFileLimited(stagedParam, MAX_SFO_BYTES)) : null;
             String copiedId = PLATFORM_PS5.equals(platform)
-                    ? readPs5Metadata(readFileLimited(stagedParam, MAX_SFO_BYTES)).titleId
+                    ? (copiedPs5 == null ? null : copiedPs5.titleId)
                     : readSfoValue(stagedParam, "TITLE_ID");
             if (!titleId.equals(copiedId)) {
                 throw new IOException("title ID изменился во время копирования");
@@ -529,7 +1137,9 @@ public final class LauncherUi {
             File sceSys = checkedChild(gameRoot, "sce_sys");
             File paramJson = checkedChild(sceSys, "param.json");
             File paramSfo = checkedChild(sceSys, "param.sfo");
-            boolean ps5 = safeRegularFileWithin(paramJson, gameRoot);
+            Ps5Metadata metadata = safeRegularFileWithin(paramJson, gameRoot)
+                    ? readPs5Metadata(readFileLimited(paramJson, MAX_SFO_BYTES)) : null;
+            boolean ps5 = metadata != null;
             if (!isPlausibleEboot(eboot, gameRoot)
                     || (!ps5 && !safeRegularFileWithin(paramSfo, gameRoot))) {
                 throw new IOException("распакованная игра не прошла проверку структуры");
@@ -539,8 +1149,6 @@ public final class LauncherUi {
             String titleId;
             String title;
             if (ps5) {
-                Ps5Metadata metadata = readPs5Metadata(
-                        readFileLimited(paramJson, MAX_SFO_BYTES));
                 platform = PLATFORM_PS5;
                 titleId = metadata.titleId;
                 title = metadata.title;
@@ -761,85 +1369,97 @@ public final class LauncherUi {
         File home = homeDir();
         File inbox = checkedChild(home, "pkg-inbox");
         ensureDirectory(inbox);
-
         String displayName = queryDisplayName(uri);
-        String safeName = safeFileName(displayName, "import.pkg");
-        if (!safeName.toLowerCase(Locale.ROOT).endsWith(".pkg")) {
-            safeName += ".pkg";
+        cleanupLegacyPkgInbox(inbox);
+        StatFs storage = new StatFs(inbox.getAbsolutePath());
+        long available = storage.getAvailableBytes();
+        if (available <= PKG_EXTRACTION_RESERVE_BYTES) {
+            throw new IOException("недостаточно места для распаковки PKG; свободно "
+                    + formatBytes(available));
         }
-        File destination = uniqueChild(inbox, safeName);
-        long importBudget = availableImportBudget(inbox);
-        long declaredSize = querySize(uri);
-        if (declaredSize > importBudget) {
-            throw new IOException("недостаточно свободного места для PKG (нужно "
-                    + formatBytes(declaredSize) + ")");
-        }
-        long copied = copyUriToFile(uri, destination, importBudget);
-        postStatus(activity.getString(R.string.import_pkg_copied, formatBytes(copied)));
-        boolean registered = false;
         try {
-            PkgMetadata metadata = preflightPkg(destination);
-            if (!isValidTitleId(metadata.titleId)) {
-                throw new IOException("некорректный TITLE_ID в PKG");
-            }
-
-            File appRoot = appInstallRoot();
-            ensureDirectory(appRoot);
-            File finalDirectory = checkedChild(appRoot, metadata.titleId);
-            if (finalDirectory.exists() || Files.isSymbolicLink(finalDirectory.toPath())) {
-                throw new IOException("игра " + metadata.titleId
-                        + " уже установлена; PKG не будет менять её файлы");
-            }
-
             File metadataStagingRoot = checkedChild(home, "pkg-install-staging");
             ensureDirectory(metadataStagingRoot);
             File stagingHome = checkedChild(metadataStagingRoot,
-                    metadata.titleId + "-" + Long.toUnsignedString(System.nanoTime()));
+                    "pkg-" + Long.toUnsignedString(System.nanoTime()));
             ensureDirectory(stagingHome);
             try {
-                PkgInstaller.Result result = PkgInstaller.install(destination, stagingHome);
-                if (!result.ok) {
-                    throw new IOException(result.message == null ? "PkgInstaller отклонил PKG"
-                            : result.message);
+                long declaredSize = querySize(uri);
+                postStatus(declaredSize > 0
+                        ? "Распаковка PKG/PFS " + formatBytes(declaredSize) + "…"
+                        : "Распаковка PKG/PFS…");
+                try (ParcelFileDescriptor descriptor = activity.getContentResolver()
+                        .openFileDescriptor(uri, "r")) {
+                    if (descriptor == null) {
+                        throw new IOException("провайдер не открыл выбранный PKG");
+                    }
+                    String extractionError = RuntimeBridge.extractPs4PkgFd(
+                            descriptor.getFd(), stagingHome.getAbsolutePath());
+                    if (extractionError == null || !extractionError.isEmpty()) {
+                        throw new IOException(extractionError == null
+                                ? "нативный PKG/PFS extractor не ответил"
+                                : extractionError);
+                    }
                 }
-                if (!metadata.titleId.equals(result.titleId)) {
-                    throw new IOException("PkgInstaller вернул другой TITLE_ID");
+                File stagedDirectory = findExtractedGameRoot(stagingHome, 0);
+                if (stagedDirectory == null) {
+                    throw new IOException("PKG/PFS распакован без исполняемого eboot.bin");
                 }
-                File stagedDirectory = checkedChild(checkedChild(checkedChild(
-                        checkedChild(stagingHome, "runtime-fs"), "user"), "app"),
-                        metadata.titleId);
-                if (!stagedDirectory.isDirectory()
-                        || !safeRegularFileWithin(new File(new File(stagedDirectory, "sce_sys"),
-                                "param.sfo"), stagedDirectory)) {
-                    throw new IOException("PkgInstaller не создал полный metadata staging");
+                File stagedSfo = new File(new File(stagedDirectory, "sce_sys"), "param.sfo");
+                if (!safeRegularFileWithin(stagedSfo, stagedDirectory)) {
+                    throw new IOException("PKG/PFS не содержит sce_sys/param.sfo");
                 }
-                installStagingTree(stagedDirectory, finalDirectory, metadataStagingRoot);
-                registered = true;
-
-                if (result.ebootExtracted) {
-                    return activity.getString(R.string.import_pkg_registered,
-                            displayTitle(result.title, result.titleId));
+                String extractedTitleId = normalizeTitleId(
+                        PkgInstaller.sfoString(readFileLimited(stagedSfo, MAX_SFO_BYTES),
+                                "TITLE_ID"));
+                if (!isValidTitleId(extractedTitleId)) {
+                    throw new IOException("некорректный TITLE_ID в распакованном PKG");
                 }
-                return activity.getString(R.string.import_pkg_metadata_only,
-                        displayTitle(result.title, result.titleId));
+                String extractedTitle = cleanSfoString(
+                        PkgInstaller.sfoString(readFileLimited(stagedSfo, MAX_SFO_BYTES),
+                                "TITLE"));
+                File appRoot = appInstallRoot();
+                ensureDirectory(appRoot);
+                File finalDirectory = checkedChild(appRoot, extractedTitleId);
+                writeInstallManifest(stagedDirectory, extractedTitleId, extractedTitle,
+                        uri.toString(), true, "pkg-pfs-import", PLATFORM_PS4);
+                installPkgStagingTree(stagedDirectory, finalDirectory, metadataStagingRoot);
+                return activity.getString(R.string.import_pkg_registered,
+                        displayTitle(extractedTitle, extractedTitleId));
             } finally {
                 if (stagingHome.exists()) {
                     deleteTreeWithin(stagingHome, metadataStagingRoot);
                 }
             }
         } finally {
-            if (!registered && destination.exists()) {
-                destination.delete();
+            cleanupLegacyPkgInbox(inbox);
+        }
+    }
+
+    private static void cleanupLegacyPkgInbox(File inbox) {
+        File[] files = inbox.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (File file : files) {
+            if (file.isFile() && !Files.isSymbolicLink(file.toPath()) && !file.delete()) {
+                Log.w(TAG, "Cannot remove legacy temporary PKG " + file);
             }
         }
     }
 
     private List<GameEntry> scanInstalledGames() throws IOException {
         File home = homeDir();
-        File[] roots = new File[]{appInstallRoot(), checkedChild(home, "games")};
+        List<File> roots = new ArrayList<>();
+        if (SharedGameStorage.hasAccess()) {
+            roots.add(SharedGameStorage.gamesDirectory());
+        }
+        roots.add(appInstallRoot());
+        roots.add(checkedChild(home, "games"));
         List<GameEntry> merged = new ArrayList<>();
-        for (int rootPriority = 0; rootPriority < roots.length; rootPriority++) {
-            File[] children = roots[rootPriority].listFiles();
+        for (int rootPriority = 0; rootPriority < roots.size(); rootPriority++) {
+            File scanRoot = roots.get(rootPriority);
+            File[] children = scanRoot.listFiles();
             if (children == null) {
                 continue;
             }
@@ -848,11 +1468,11 @@ public final class LauncherUi {
                     continue;
                 }
                 try {
-                    ensureWithin(directory, roots[rootPriority]);
+                    ensureWithin(directory, scanRoot);
                 } catch (IOException escapedRoot) {
                     continue;
                 }
-                GameEntry candidate = readGameEntry(directory, rootPriority, roots[rootPriority]);
+                GameEntry candidate = readGameEntry(directory, rootPriority, scanRoot);
                 if (candidate == null) {
                     continue;
                 }
@@ -865,32 +1485,41 @@ public final class LauncherUi {
             }
         }
 
-        merged.sort(Comparator
-                .comparing((GameEntry entry) -> entry.title.toLowerCase(Locale.ROOT))
-                .thenComparing(entry -> entry.titleId));
+
+
+
+        merged.sort((left, right) -> GameLibraryOrder.compareInsertion(
+                left.addedAtMillis, left.titleId,
+                right.addedAtMillis, right.titleId));
         return merged;
     }
 
     private GameEntry readGameEntry(File directory, int rootPriority, File scanRoot) {
         try {
             ensureWithin(directory, scanRoot);
-            File eboot = new File(directory, "eboot.bin");
+            File expectedEboot = new File(directory, "eboot.bin");
+            File discoveredEboot = findInstalledEboot(directory);
+            File eboot = discoveredEboot == null ? expectedEboot : discoveredEboot;
             File sceSys = new File(directory, "sce_sys");
             File sfo = new File(sceSys, "param.sfo");
             File paramJson = new File(sceSys, "param.json");
             File manifest = new File(directory, "executor-installed.json");
-            boolean hasEboot = isPlausibleEboot(eboot, directory);
+            boolean hasEboot = discoveredEboot != null;
             boolean hasSfo = safeRegularFileWithin(sfo, directory);
             boolean hasParamJson = safeRegularFileWithin(paramJson, directory);
             boolean hasManifest = safeRegularFileWithin(manifest, directory);
             if (!hasEboot && !hasSfo && !hasParamJson && !hasManifest) {
                 return null;
             }
+            if (!hasEboot && hasManifest && isOrphanedMetadataInstall(manifest)) {
+                Log.w(TAG, "Ignoring incomplete restored game " + directory.getName());
+                return null;
+            }
 
-            String platform = hasParamJson ? PLATFORM_PS5 : PLATFORM_PS4;
             Ps5Metadata ps5Metadata = hasParamJson
                     ? readPs5Metadata(readFileLimited(paramJson, MAX_SFO_BYTES))
                     : null;
+            String platform = ps5Metadata != null ? PLATFORM_PS5 : PLATFORM_PS4;
             String titleId = ps5Metadata != null
                     ? ps5Metadata.titleId
                     : hasSfo ? readSfoValue(sfo, "TITLE_ID") : null;
@@ -907,9 +1536,13 @@ public final class LauncherUi {
                 title = titleId;
             }
             File icon = new File(sceSys, "icon0.png");
+            long addedAtMillis = hasManifest ? manifest.lastModified() : directory.lastModified();
+            if (addedAtMillis <= 0L) {
+                addedAtMillis = Long.MAX_VALUE;
+            }
             return new GameEntry(directory, eboot,
                     safeRegularFileWithin(icon, directory) ? icon : null,
-                    titleId, title, platform, hasEboot, rootPriority);
+                    titleId, title, platform, hasEboot, rootPriority, addedAtMillis);
         } catch (Exception ignored) {
             Log.w(TAG, "Skipping unreadable game directory " + directory, ignored);
             return null;
@@ -939,24 +1572,120 @@ public final class LauncherUi {
         return candidate.directory.lastModified() > existing.directory.lastModified();
     }
 
+    private List<String> savedGameOrder() {
+        List<String> order = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        String encoded = libraryLayoutPreferences.getString(KEY_GAME_ORDER, "");
+        if (encoded == null || encoded.isEmpty()) {
+            return order;
+        }
+        try {
+            JSONArray array = new JSONArray(encoded);
+            int count = Math.min(array.length(), 10_000);
+            for (int index = 0; index < count; ++index) {
+                String titleId = array.optString(index, "");
+                if (isValidTitleId(titleId) && seen.add(titleId)) {
+                    order.add(titleId);
+                }
+            }
+        } catch (Exception error) {
+            Log.w(TAG, "Ignoring invalid saved library order", error);
+        }
+        return order;
+    }
+
+    private void applySavedGameOrder(List<GameEntry> games) {
+        List<String> discovered = new ArrayList<>(games.size());
+        java.util.Map<String, GameEntry> byTitleId = new java.util.HashMap<>();
+        for (GameEntry game : games) {
+            discovered.add(game.titleId);
+            byTitleId.put(game.titleId, game);
+        }
+        List<String> merged = GameLibraryOrder.mergeRemembered(
+                discovered, savedGameOrder());
+        games.clear();
+        for (String titleId : merged) {
+            GameEntry game = byTitleId.get(titleId);
+            if (game != null) {
+                games.add(game);
+            }
+        }
+
+
+        persistGameOrder(games);
+    }
+
+    private void persistGameOrder(List<GameEntry> games) {
+        JSONArray array = new JSONArray();
+        for (GameEntry game : games) {
+            if (game != null && isValidTitleId(game.titleId)) {
+                array.put(game.titleId);
+            }
+        }
+        libraryLayoutPreferences.edit().putString(KEY_GAME_ORDER, array.toString()).apply();
+    }
+
+    private static boolean sameGame(GameEntry left, GameEntry right) {
+        return left != null && right != null && left.titleId.equals(right.titleId);
+    }
+
+    private static GameEntry findGame(List<GameEntry> games, String titleId) {
+        if (titleId == null) {
+            return null;
+        }
+        for (GameEntry game : games) {
+            if (titleId.equals(game.titleId)) {
+                return game;
+            }
+        }
+        return null;
+    }
+
     private void renderGameList(List<GameEntry> games) {
         if (gameList == null) {
             return;
         }
         List<GameEntry> orderedGames = new ArrayList<>(games);
-        orderedGames.sort(Comparator
-                .comparingInt((GameEntry entry) -> compatibilityRepository
-                        .statusOf(entry.titleId).librarySortPriority())
-                .thenComparing(entry -> entry.title.toLowerCase(Locale.ROOT))
-                .thenComparing(entry -> entry.titleId));
+        applySavedGameOrder(orderedGames);
         latestGames = orderedGames;
-        if (selectedGame != null && !orderedGames.contains(selectedGame)) {
-            selectedGame = null;
-            updateRemoveAction();
+        SharedPreferences libraryPreferences = SettingsActivity.prefs(activity);
+        List<GameProfileSettings.GameTitle> installedTitles =
+                new ArrayList<>(orderedGames.size());
+        for (GameEntry game : orderedGames) {
+            installedTitles.add(new GameProfileSettings.GameTitle(
+                    game.titleId, game.title));
+        }
+        GameProfileSettings.replaceInstalledTitles(libraryPreferences, installedTitles);
+        if (selectedGame != null) {
+            selectedGame = findGame(orderedGames, selectedGame.titleId);
+            if (selectedGame == null) {
+                updateRemoveAction();
+            }
+        }
+        renderVisibleGames();
+    }
+
+    private void renderVisibleGames() {
+        if (gameList == null) {
+            return;
+        }
+        List<GameEntry> visibleGames = GameLibraryView.visible(latestGames,
+                sortMode, sortReversed, searchQuery, game -> game.title,
+                game -> compatibilityRepository.statusOf(game.titleId));
+        if (homeView != null) {
+            homeView.setItems(homeItems(visibleGames));
+            if (homeStyle != STYLE_LIST) {
+                return;
+            }
         }
         gameList.removeAllViews();
-        if (orderedGames.isEmpty()) {
-            TextView empty = label(activity.getString(R.string.library_empty),
+        for (PlayStationHomeView.Item item : homeItems(Collections.emptyList())) {
+            if (item.device) continue;
+            gameList.addView(utilityRow(item), matchWrapWithMargins(0, 0, 0, 8));
+        }
+        if (visibleGames.isEmpty()) {
+            TextView empty = label(activity.getString(latestGames.isEmpty()
+                            ? R.string.library_empty : R.string.library_search_empty),
                     14, 0xffc5cbd3);
             empty.setGravity(Gravity.CENTER);
             empty.setPadding(dp(22), dp(34), dp(22), dp(34));
@@ -964,9 +1693,36 @@ public final class LauncherUi {
             gameList.addView(empty, matchWrap());
             return;
         }
-        for (GameEntry game : orderedGames) {
+        for (GameEntry game : visibleGames) {
             gameList.addView(gameRow(game), matchWrapWithMargins(0, 0, 0, 10));
         }
+    }
+
+    private View utilityRow(PlayStationHomeView.Item item) {
+        LinearLayout row = new LinearLayout(activity);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(12), dp(10), dp(12), dp(10));
+        row.setMinimumHeight(dp(64));
+        row.setBackground(roundedBackground(0xff1b2026, 0xff2a313a, 18));
+        ImageView icon = new ImageView(activity);
+        icon.setImageResource(item.device ? R.drawable.ic_device : R.drawable.ic_compatibility);
+        icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        icon.setPadding(dp(8), dp(8), dp(8), dp(8));
+        icon.setBackground(roundedBackground(0xff263543, 0xff45627a, 12));
+        icon.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(dp(44), dp(44));
+        iconLp.setMargins(0, 0, dp(14), 0);
+        row.addView(icon, iconLp);
+        TextView title = label(item.title, 14, 0xffeef2f6);
+        title.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+        row.addView(title, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        row.setContentDescription(item.title);
+        row.setClickable(true);
+        row.setFocusable(true);
+        row.setOnClickListener(v -> launchFromHome(item));
+        return row;
     }
 
     private View gameRow(GameEntry game) {
@@ -974,7 +1730,7 @@ public final class LauncherUi {
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(12), dp(12), dp(12), dp(12));
-        boolean selected = selectedGame == game;
+        boolean selected = sameGame(selectedGame, game);
         GameCompatibilityStatus compatibility = compatibilityRepository.statusOf(game.titleId);
         int fill = game.launchable ? 0xff1b2026 : 0xff171b20;
         int stroke = 0xff2a313a;
@@ -986,8 +1742,8 @@ public final class LauncherUi {
             stroke = 0xff8c4f43;
         }
         row.setBackground(roundedBackground(
-                selected ? 0xff203754 : fill,
-                selected ? 0xff6fb4ff : stroke, 18));
+                selected ? 0xff352844 : fill,
+                selected ? 0xffc18cff : stroke, 18));
         row.setElevation(dp(2));
 
         FrameLayout iconHost = new FrameLayout(activity);
@@ -1028,10 +1784,6 @@ public final class LauncherUi {
                 android.graphics.Typeface.BOLD);
         textColumn.addView(title);
         textColumn.addView(label(game.titleId, 12, 0xff7f8a97));
-        TextView holdHint = label(activity.getString(R.string.game_hold_waiting),
-                11, 0xff7f8a97);
-        holdHint.setPadding(0, dp(5), 0, 0);
-        textColumn.addView(holdHint);
         ProgressBar holdProgress = new ProgressBar(
                 activity, null, android.R.attr.progressBarStyleHorizontal);
         holdProgress.setMax((int) GameHoldAction.MARK_SUPPORTED_MS);
@@ -1054,6 +1806,9 @@ public final class LauncherUi {
         row.addView(textColumn, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
+        FrameLayout endHost = new FrameLayout(activity);
+        LinearLayout.LayoutParams endHostLp = new LinearLayout.LayoutParams(dp(42), dp(42));
+        endHostLp.setMargins(dp(8), 0, 0, 0);
         if (compatibility != GameCompatibilityStatus.UNCLASSIFIED) {
             TextView compatibilityMark = label(
                     compatibility == GameCompatibilityStatus.SUPPORTED ? "\u2713" : "\u00d7",
@@ -1065,23 +1820,37 @@ public final class LauncherUi {
                     compatibility == GameCompatibilityStatus.SUPPORTED
                             ? R.string.game_status_supported
                             : R.string.game_status_unsupported));
-            LinearLayout.LayoutParams markLp =
-                    new LinearLayout.LayoutParams(dp(34), dp(34));
-            markLp.setMargins(dp(8), 0, 0, 0);
-            row.addView(compatibilityMark, markLp);
+            endHost.addView(compatibilityMark, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER));
         }
+        TextView holdCountdown = label("3", 17, 0xffffffff);
+        holdCountdown.setGravity(Gravity.CENTER);
+        holdCountdown.setAlpha(0.78f);
+        holdCountdown.setBackground(roundedBackground(0xb8242b34, 0x996f7c8b, 21));
+        holdCountdown.setVisibility(View.GONE);
+        endHost.addView(holdCountdown, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER));
+        row.addView(endHost, endHostLp);
+
+        TextView gameSettings = label("\u2630", 22, 0xffb8c5d4);
+        gameSettings.setGravity(Gravity.CENTER);
+        gameSettings.setMinWidth(dp(44));
+        gameSettings.setMinHeight(dp(44));
+        gameSettings.setPadding(dp(8), 0, dp(4), 0);
+        gameSettings.setClickable(true);
+        gameSettings.setFocusable(true);
+        gameSettings.setContentDescription(activity.getString(
+                R.string.game_individual_settings_open, game.title));
+        gameSettings.setOnClickListener(view -> openGameSettings(game));
+        row.addView(gameSettings, new LinearLayout.LayoutParams(dp(48), dp(48)));
 
         row.setClickable(true);
         row.setFocusable(true);
-        row.setOnClickListener(view -> {
-            if (selectedGame != null) {
-                selectedGame = game;
-                updateRemoveAction();
-                renderGameList(latestGames);
-            } else if (game.launchable) {
-                launch(game);
-            }
-        });
+        row.setOnClickListener(view -> handleGameTap(game));
+        row.setOnDragListener((view, event) -> handleGameDragTarget(
+                view, event, game));
         int statusText = compatibility == GameCompatibilityStatus.SUPPORTED
                 ? R.string.game_status_supported
                 : compatibility == GameCompatibilityStatus.UNSUPPORTED
@@ -1089,8 +1858,118 @@ public final class LauncherUi {
                 : R.string.game_status_unclassified;
         row.setContentDescription(activity.getString(R.string.game_item_accessibility,
                 game.title, game.titleId, activity.getString(statusText)));
-        row.setOnTouchListener(new GameHoldTouchListener(game, holdHint, holdProgress));
+        row.setOnTouchListener(new GameHoldTouchListener(
+                game, holdProgress, holdCountdown));
         return row;
+    }
+
+    private AlertDialog openGameSettings(GameEntry game) {
+        if (game == null) return null;
+        boolean classified = compatibilityRepository.statusOf(game.titleId)
+                != GameCompatibilityStatus.UNCLASSIFIED;
+        String[] actions = classified
+                ? new String[]{activity.getString(R.string.report_game_settings),
+                        activity.getString(R.string.report_action)}
+                : new String[]{activity.getString(R.string.report_game_settings)};
+        return new AlertDialog.Builder(activity).setTitle(game.title)
+                .setItems(actions, (dialog, which) -> {
+                    if (which == 0) openIndividualGameSettings(game);
+                    else if (compatibilityRepository.statusOf(game.titleId)
+                            != GameCompatibilityStatus.UNCLASSIFIED) {
+                        activity.startActivity(new Intent(activity, CompatibilityReportActivity.class)
+                                .putExtra("title", game.title).putExtra("title_id", game.titleId)
+                                .putExtra("platform", PLATFORM_PS5.equals(game.platform) ? "PS5" : "PS4"));
+                    }
+                }).show();
+    }
+
+    private void openIndividualGameSettings(GameEntry game) {
+        if (game == null) {
+            return;
+        }
+        GameProfileSettings.rememberTitle(
+                SettingsActivity.prefs(activity), game.titleId, game.title);
+        Intent intent = new Intent(activity, SettingsActivity.class);
+        intent.putExtra(GameProfileSettings.EXTRA_GAME_TITLE_ID, game.titleId);
+        intent.putExtra(GameProfileSettings.EXTRA_GAME_TITLE, game.title);
+        activity.startActivity(intent);
+    }
+
+    private void handleGameTap(GameEntry game) {
+        if (game == null) {
+            return;
+        }
+        if (selectedGame != null) {
+            moveSelectedGameTo(game);
+            return;
+        }
+        if (game.launchable) {
+            launch(game);
+        }
+    }
+
+    private void moveSelectedGameTo(GameEntry target) {
+        GameEntry source = selectedGame;
+        if (source == null || target == null) {
+            return;
+        }
+        if (sameGame(source, target)) {
+            return;
+        }
+        if (sortMode != GameLibraryView.MANUAL || sortReversed || !searchQuery.trim().isEmpty()) {
+            selectedGame = null;
+            updateRemoveAction();
+            toast(activity.getString(R.string.library_move_manual_only));
+            renderVisibleGames();
+            return;
+        }
+        List<String> currentOrder = new ArrayList<>(latestGames.size());
+        java.util.Map<String, GameEntry> byTitleId = new java.util.HashMap<>();
+        for (GameEntry game : latestGames) {
+            currentOrder.add(game.titleId);
+            byTitleId.put(game.titleId, game);
+        }
+        List<String> movedOrder = GameLibraryOrder.moveBefore(
+                currentOrder, source == null ? null : source.titleId,
+                target == null ? null : target.titleId);
+        List<GameEntry> reordered = new ArrayList<>(movedOrder.size());
+        for (String titleId : movedOrder) {
+            GameEntry game = byTitleId.get(titleId);
+            if (game != null) {
+                reordered.add(game);
+            }
+        }
+        selectedGame = null;
+        updateRemoveAction();
+        persistGameOrder(reordered);
+        toast(activity.getString(R.string.game_move_completed, source.title));
+        renderGameList(reordered);
+    }
+
+    private boolean handleGameDragTarget(View view, DragEvent event, GameEntry target) {
+        if (selectedGame == null) {
+            return false;
+        }
+        switch (event.getAction()) {
+        case DragEvent.ACTION_DRAG_STARTED:
+            return event.getClipDescription() != null
+                    && selectedGame.titleId.equals(event.getLocalState());
+        case DragEvent.ACTION_DRAG_ENTERED:
+            if (!sameGame(selectedGame, target)) {
+                view.setAlpha(0.72f);
+            }
+            return true;
+        case DragEvent.ACTION_DRAG_EXITED:
+        case DragEvent.ACTION_DRAG_ENDED:
+            view.setAlpha(1f);
+            return true;
+        case DragEvent.ACTION_DROP:
+            view.setAlpha(1f);
+            moveSelectedGameTo(target);
+            return true;
+        default:
+            return true;
+        }
     }
 
     private void handleGameHoldAction(GameEntry game, GameHoldAction action) {
@@ -1098,14 +1977,18 @@ public final class LauncherUi {
         switch (action) {
         case TAP:
             return;
-        case SELECT_FOR_REMOVAL:
-            boolean selected = selectedGame != game;
-            selectedGame = selected ? game : null;
+        case SELECT:
+            selectedGame = game;
             updateRemoveAction();
-            toast(activity.getString(selected
-                    ? R.string.game_selected_for_removal
-                    : R.string.game_selection_cleared, game.title));
+            toast(activity.getString(R.string.game_move_selected, game.title));
             renderGameList(latestGames);
+            return;
+        case CLEAR_SELECTION:
+            if (selectedGame != null) {
+                selectedGame = null;
+                updateRemoveAction();
+                renderGameList(latestGames);
+            }
             return;
         case MARK_SUPPORTED:
             status = GameCompatibilityStatus.SUPPORTED;
@@ -1127,16 +2010,14 @@ public final class LauncherUi {
 
     private final class GameHoldTouchListener implements View.OnTouchListener {
         private final GameEntry game;
-        private final TextView holdHint;
         private final ProgressBar holdProgress;
+        private final TextView holdCountdown;
         private View pressedView;
         private android.graphics.drawable.Drawable restingBackground;
         private long downAtMs;
         private float downX;
         private float downY;
         private boolean active;
-        private GameHoldAction reachedAction = GameHoldAction.TAP;
-        private int currentStageText = R.string.game_hold_waiting;
 
         private final Runnable elapsedTicker = new Runnable() {
             @Override
@@ -1148,29 +2029,72 @@ public final class LauncherUi {
                         android.os.SystemClock.uptimeMillis() - downAtMs);
                 holdProgress.setProgress((int) Math.min(
                         elapsedMs, GameHoldAction.MARK_SUPPORTED_MS));
-                double seconds =
-                        Math.min(elapsedMs, GameHoldAction.MARK_SUPPORTED_MS) / 1000.0;
-                holdHint.setText(activity.getString(R.string.game_hold_elapsed,
-                        seconds, activity.getString(currentStageText)));
+                if (elapsedMs >= GameHoldAction.CLEAR_SELECTION_MS) {
+                    int targetSecond = elapsedMs < GameHoldAction.MARK_UNSUPPORTED_MS
+                            ? 3 : elapsedMs < GameHoldAction.MARK_SUPPORTED_MS ? 4 : 5;
+                    holdCountdown.setText(Integer.toString(targetSecond));
+                    holdCountdown.setContentDescription(activity.getString(
+                            R.string.game_hold_countdown, targetSecond));
+                    holdCountdown.setVisibility(View.VISIBLE);
+                } else {
+                    holdCountdown.setVisibility(View.GONE);
+                }
                 holdHandler.postDelayed(this, 100L);
             }
         };
 
-        private final Runnable selectionCue = () -> showHoldStage(
-                GameHoldAction.SELECT_FOR_REMOVAL, R.string.game_hold_release_remove, 0xff6fb4ff,
-                0xff203754, 0xff6fb4ff, HapticFeedbackConstants.CLOCK_TICK);
-        private final Runnable unsupportedCue = () -> showHoldStage(
-                GameHoldAction.MARK_UNSUPPORTED, R.string.game_hold_release_unsupported, 0xffff806f,
-                0xff2b201d, 0xffb85d50, HapticFeedbackConstants.CLOCK_TICK);
-        private final Runnable supportedCue = () -> showHoldStage(
-                GameHoldAction.MARK_SUPPORTED, R.string.game_hold_release_supported, 0xff67d391,
-                0xff192820, 0xff4f9a6c, HapticFeedbackConstants.LONG_PRESS);
+        private final Runnable selectionCue = () -> {
+            onSelectionThreshold();
+        };
+        private final Runnable clearSelectionCue = () -> {
+            onClearSelectionThreshold();
+        };
+        private final Runnable unsupportedCue = () -> {
+            onCompatibilityThreshold(GameCompatibilityStatus.UNSUPPORTED,
+                    0xff2b201d, 0xffb85d50, HapticFeedbackConstants.CLOCK_TICK);
+        };
+        private final Runnable supportedCue = () -> {
+            onCompatibilityThreshold(GameCompatibilityStatus.SUPPORTED,
+                    0xff192820, 0xff4f9a6c, HapticFeedbackConstants.LONG_PRESS);
+        };
 
-        GameHoldTouchListener(GameEntry game, TextView holdHint,
-                              ProgressBar holdProgress) {
+        GameHoldTouchListener(GameEntry game, ProgressBar holdProgress,
+                              TextView holdCountdown) {
             this.game = game;
-            this.holdHint = holdHint;
             this.holdProgress = holdProgress;
+            this.holdCountdown = holdCountdown;
+        }
+
+        private void onSelectionThreshold() {
+            if (!active) {
+                return;
+            }
+            selectedGame = game;
+            updateRemoveAction();
+            showHoldStage(0xff203754, 0xff6fb4ff,
+                    HapticFeedbackConstants.CLOCK_TICK);
+        }
+
+        private void onClearSelectionThreshold() {
+            if (!active) {
+                return;
+            }
+            if (sameGame(selectedGame, game)) {
+                selectedGame = null;
+                updateRemoveAction();
+            }
+            showHoldStage(0xff252a31, 0xff65717e,
+                    HapticFeedbackConstants.CLOCK_TICK);
+        }
+
+        private void onCompatibilityThreshold(GameCompatibilityStatus status,
+                                              int fillColor, int strokeColor,
+                                              int feedbackConstant) {
+            if (!active) {
+                return;
+            }
+            compatibilityRepository.setStatus(game.titleId, status);
+            showHoldStage(fillColor, strokeColor, feedbackConstant);
         }
 
         @Override
@@ -1184,24 +2108,18 @@ public final class LauncherUi {
                 downX = event.getX();
                 downY = event.getY();
                 active = true;
-                reachedAction = GameHoldAction.TAP;
                 if (view.getParent() != null) {
                     view.getParent().requestDisallowInterceptTouchEvent(true);
                 }
-                currentStageText = R.string.game_hold_waiting;
-                holdHint.setTypeface(android.graphics.Typeface.DEFAULT,
-                        android.graphics.Typeface.BOLD);
-                holdHint.setTextColor(0xff9aa6b2);
-                holdHint.setPadding(dp(8), dp(6), dp(8), dp(6));
-                holdHint.setBackground(roundedBackground(0xff151a20, 0xff39424d, 10));
-                holdHint.setVisibility(View.VISIBLE);
                 holdProgress.setProgress(0);
                 holdProgress.setProgressTintList(
                         android.content.res.ColorStateList.valueOf(0xff6fb4ff));
                 holdProgress.setVisibility(View.VISIBLE);
                 elapsedTicker.run();
                 holdHandler.postDelayed(selectionCue,
-                        GameHoldAction.SELECT_FOR_REMOVAL_MS);
+                        GameHoldAction.SELECT_MS);
+                holdHandler.postDelayed(clearSelectionCue,
+                        GameHoldAction.CLEAR_SELECTION_MS);
                 holdHandler.postDelayed(unsupportedCue,
                         GameHoldAction.MARK_UNSUPPORTED_MS);
                 holdHandler.postDelayed(supportedCue,
@@ -1209,9 +2127,23 @@ public final class LauncherUi {
                 return true;
             case MotionEvent.ACTION_MOVE:
                 long moveElapsedMs = android.os.SystemClock.uptimeMillis() - downAtMs;
-                if (active && moveElapsedMs < GameHoldAction.SELECT_FOR_REMOVAL_MS
-                        && (Math.abs(event.getX() - downX) > touchSlop * 5
-                        || Math.abs(event.getY() - downY) > touchSlop * 5)) {
+                boolean moved = Math.abs(event.getX() - downX) > touchSlop
+                        || Math.abs(event.getY() - downY) > touchSlop;
+                if (active && moved && sameGame(selectedGame, game)) {
+                    ClipData data = ClipData.newPlainText(
+                            "lsx4-game-title-id", game.titleId);
+                    View.DragShadowBuilder shadow = new View.DragShadowBuilder(view);
+                    boolean started;
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        started = view.startDragAndDrop(data, shadow, game.titleId, 0);
+                    } else {
+                        started = view.startDrag(data, shadow, game.titleId, 0);
+                    }
+                    if (started) {
+                        cancel();
+                    }
+                } else if (active && moveElapsedMs < GameHoldAction.SELECT_MS
+                        && moved) {
                     cancel();
                 }
                 return true;
@@ -1245,39 +2177,27 @@ public final class LauncherUi {
             }
         }
 
-        private void showHoldStage(GameHoldAction action, int textResource,
-                                   int textColor, int fillColor,
-                                   int strokeColor, int feedbackConstant) {
+        private void showHoldStage(int fillColor, int strokeColor,
+                                   int feedbackConstant) {
             if (!active || pressedView == null) {
                 return;
             }
-            reachedAction = action;
-            holdHint.setText(textResource);
-            currentStageText = textResource;
-            holdHint.setTextColor(textColor);
-            holdHint.setVisibility(View.VISIBLE);
-            holdProgress.setProgressTintList(
-                    android.content.res.ColorStateList.valueOf(textColor));
+            holdProgress.setProgressTintList(android.content.res.ColorStateList.valueOf(
+                    strokeColor));
             pressedView.setBackground(roundedBackground(fillColor, strokeColor, 18));
             cue(feedbackConstant);
         }
 
         private void cancel() {
             active = false;
-            reachedAction = GameHoldAction.TAP;
             holdHandler.removeCallbacks(selectionCue);
+            holdHandler.removeCallbacks(clearSelectionCue);
             holdHandler.removeCallbacks(unsupportedCue);
             holdHandler.removeCallbacks(supportedCue);
             holdHandler.removeCallbacks(elapsedTicker);
-            holdHint.setText(R.string.game_hold_waiting);
-            holdHint.setTypeface(android.graphics.Typeface.DEFAULT,
-                    android.graphics.Typeface.NORMAL);
-            holdHint.setTextColor(0xff7f8a97);
-            holdHint.setPadding(0, dp(5), 0, 0);
-            holdHint.setBackground(null);
-            holdHint.setVisibility(View.VISIBLE);
             holdProgress.setProgress(0);
             holdProgress.setVisibility(View.GONE);
+            holdCountdown.setVisibility(View.GONE);
             if (pressedView != null && restingBackground != null) {
                 pressedView.setBackground(restingBackground);
             }
@@ -1304,6 +2224,20 @@ public final class LauncherUi {
         if (removeAction != null) {
             removeAction.setVisibility(selectedGame == null ? View.GONE : View.VISIBLE);
         }
+    }
+
+    private void confirmRemoveSelectedGame() {
+        final GameEntry game = selectedGame;
+        if (game == null) {
+            return;
+        }
+        new AlertDialog.Builder(activity)
+                .setTitle(R.string.game_remove_title)
+                .setMessage(activity.getString(R.string.game_remove_message, game.title))
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(R.string.game_remove_confirm,
+                        (dialog, which) -> removeSelectedGame())
+                .show();
     }
 
     private void removeSelectedGame() {
@@ -1361,7 +2295,7 @@ public final class LauncherUi {
             return;
         }
         Intent intent = new Intent(activity, GameActivity.class);
-        intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        intent.addFlags(MainActivity.crossProcessTaskFlags());
         intent.putExtra("autoload_existing_runtime", true);
         intent.putExtra("autoinit_runtime", true);
         String launchPath = PLATFORM_PS5.equals(game.platform)
@@ -1370,16 +2304,25 @@ public final class LauncherUi {
         intent.putExtra("scan_game_path", launchPath);
         intent.putExtra("launch_game_path", launchPath);
         intent.putExtra(EXTRA_GAME_PLATFORM, game.platform);
+        intent.putExtra(GameProfileSettings.EXTRA_GAME_TITLE_ID, game.titleId);
+        intent.putExtra(GameProfileSettings.EXTRA_GAME_TITLE, game.title);
         intent.putExtra("fullscreen_render", true);
         intent.putExtra(EXTRA_EMBEDDED_AARCH64_JIT_BACKEND, true);
+        SharedPreferences launchPreferences = SettingsActivity.prefsForGame(
+                activity, game.titleId);
         intent.putExtra(MainActivity.EXTRA_RENDER_RESOLUTION_MODE,
-                SettingsActivity.prefs(activity).getInt(
+                launchPreferences.getInt(
                         SettingsActivity.K_RES_MODE, SettingsActivity.DEFAULT_RES_MODE));
         try {
-            activity.startActivity(intent);
+            activity.routeIntentToGameActivity(intent);
+            finishLauncherAfterGameHandoff();
         } catch (ActivityNotFoundException e) {
             toast(activity.getString(R.string.game_activity_unavailable));
         }
+    }
+
+    private void finishLauncherAfterGameHandoff() {
+        MainActivity.retireProcessAfterTaskHandoff(activity, "launcher");
     }
 
     private void copySafDirectory(Uri treeUri, Uri sourceDirectory, File destination,
@@ -1740,6 +2683,7 @@ public final class LauncherUi {
         try {
             JSONObject json = new JSONObject(new String(data, StandardCharsets.UTF_8));
             String titleId = normalizeTitleId(json.optString("titleId", ""));
+            if (!GamePlatformMetadata.isPs5TitleId(titleId)) return null;
             String title = "";
             JSONObject localized = json.optJSONObject("localizedParameters");
             if (localized != null) {
@@ -1911,6 +2855,86 @@ public final class LauncherUi {
         return elf || ps4Self;
     }
 
+    private static File findInstalledEboot(File directory) {
+        File exact = new File(directory, "eboot.bin");
+        if (isUsableInstalledBinary(exact, directory)) {
+            return exact;
+        }
+        File[] children = directory.listFiles();
+        if (children == null) {
+            return null;
+        }
+        for (File child : children) {
+            if ("eboot.bin".equalsIgnoreCase(child.getName())
+                    && isUsableInstalledBinary(child, directory)) {
+                return child;
+            }
+        }
+        return null;
+    }
+
+    private static boolean isUsableInstalledBinary(File file, File boundary) {
+        return safeRegularFileWithin(file, boundary) && file.length() >= 4;
+    }
+
+    private static boolean isOrphanedMetadataInstall(File manifest) {
+        try {
+            JSONObject json = new JSONObject(new String(
+                    readFileLimited(manifest, MAX_SFO_BYTES), StandardCharsets.UTF_8));
+            if (json.optBoolean("ebootExtracted", false)) {
+                return true;
+            }
+            String source = json.optString("source", "").trim();
+            if (source.isEmpty() || source.contains("://")) {
+                return false;
+            }
+            File sourceFile = new File(source);
+            return sourceFile.isAbsolute() && !sourceFile.isFile();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private void installPkgStagingTree(File staging, File destination, File stagingRoot)
+            throws Exception {
+        ensureWithin(staging, stagingRoot);
+        ensureWithin(destination, appInstallRoot());
+        if (!destination.exists()) {
+            installStagingTree(staging, destination, stagingRoot);
+            return;
+        }
+        if (!destination.isDirectory() || Files.isSymbolicLink(destination.toPath())
+                || findInstalledEboot(destination) != null) {
+            throw new IOException("игра " + destination.getName()
+                    + " уже установлена; её файлы не будут изменены");
+        }
+
+        File backup = checkedChild(stagingRoot,
+                destination.getName() + "-metadata-backup-"
+                        + Long.toUnsignedString(System.nanoTime()));
+        moveDirectory(destination, backup);
+        boolean installed = false;
+        try {
+            installStagingTree(staging, destination, stagingRoot);
+            installed = true;
+        } finally {
+            if (!installed && backup.exists() && !destination.exists()) {
+                moveDirectory(backup, destination);
+            }
+            if (installed && backup.exists()) {
+                deleteTreeWithin(backup, stagingRoot);
+            }
+        }
+    }
+
+    private static void moveDirectory(File source, File target) throws IOException {
+        try {
+            Files.move(source.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException ignored) {
+            Files.move(source.toPath(), target.toPath());
+        }
+    }
+
     private void checkCancelled() throws IOException {
         if (destroyed || Thread.currentThread().isInterrupted()) {
             throw new IOException("импорт отменён: Activity закрыта");
@@ -1993,12 +3017,19 @@ public final class LauncherUi {
         if (status != null) {
             status.setText(message);
         }
+        if (homeView != null) {
+            homeView.setStatus(message, busy);
+        }
     }
 
     private void setStatus(String message) {
         postUi(() -> {
             if (status != null) {
                 status.setText(message);
+            }
+            if (homeView != null) {
+                homeView.setStatus(message, progress != null
+                        && progress.getVisibility() == View.VISIBLE);
             }
         });
     }
@@ -2070,9 +3101,11 @@ public final class LauncherUi {
         final String platform;
         final boolean launchable;
         final int rootPriority;
+        final long addedAtMillis;
 
         GameEntry(File directory, File eboot, File icon, String titleId, String title,
-                  String platform, boolean launchable, int rootPriority) {
+                  String platform, boolean launchable, int rootPriority,
+                  long addedAtMillis) {
             this.directory = directory;
             this.eboot = eboot;
             this.icon = icon;
@@ -2081,6 +3114,7 @@ public final class LauncherUi {
             this.platform = platform;
             this.launchable = launchable;
             this.rootPriority = rootPriority;
+            this.addedAtMillis = addedAtMillis;
         }
     }
 

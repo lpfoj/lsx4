@@ -41,6 +41,10 @@ struct alignas(32) CpuFrame {
     std::uint64_t deferred_flags_lhs{};
     std::uint64_t deferred_flags_meta{};
     std::uint64_t deferred_flags_rhs{};
+    std::uint64_t shadow_return_begin{};
+    std::uint64_t shadow_return_top{};
+    std::uint64_t shadow_return_end{};
+    std::uint64_t fixed_xmm_dirty_mask{};
 };
 
 static_assert(std::is_standard_layout_v<CpuFrame>);
@@ -57,7 +61,11 @@ static_assert(offsetof(CpuFrame, active_instruction) == 0x348);
 static_assert(offsetof(CpuFrame, deferred_flags_lhs) == 0x350);
 static_assert(offsetof(CpuFrame, deferred_flags_meta) == 0x358);
 static_assert(offsetof(CpuFrame, deferred_flags_rhs) == 0x360);
-static_assert(sizeof(CpuFrame) == 0x380);
+static_assert(offsetof(CpuFrame, shadow_return_begin) == 0x368);
+static_assert(offsetof(CpuFrame, shadow_return_top) == 0x370);
+static_assert(offsetof(CpuFrame, shadow_return_end) == 0x378);
+static_assert(offsetof(CpuFrame, fixed_xmm_dirty_mask) == 0x380);
+static_assert(sizeof(CpuFrame) == 0x3a0);
 
 inline constexpr std::uint64_t CarryFlag = 1ull << 0;
 inline constexpr std::uint64_t ParityFlag = 1ull << 2;

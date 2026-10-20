@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily retention and backup of LSX4 reports
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

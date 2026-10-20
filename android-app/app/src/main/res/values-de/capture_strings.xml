@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="capture_screenshot">Screenshot</string>
+    <string name="capture_record">Video aufnehmen</string>
+    <string name="capture_stop_recording">Aufnahme beenden</string>
+    <string name="capture_gallery">Galerie</string>
+    <string name="capture_share">Teilen</string>
+    <string name="capture_close">Schließen</string>
+    <string name="capture_cancel">Abbrechen</string>
+    <string name="capture_continue">Weiter</string>
+    <string name="capture_open_panel">Spielaufnahmen</string>
+    <string name="capture_gallery_loading">Aufnahmen werden geladen…</string>
+    <string name="capture_gallery_empty">Hier erscheinen Screenshots und Aufnahmen. Die Dateien bleiben in LSX4, bis du sie teilst.</string>
+    <string name="capture_image_label">Screenshot</string>
+    <string name="capture_video_label">Video</string>
+    <string name="capture_share_unavailable">Keine App zum Teilen dieser Datei verfügbar.</string>
+    <string name="capture_screenshot_saved">Screenshot in der Galerie gespeichert.</string>
+    <string name="capture_screenshot_failed">Das Spiel konnte nicht aufgenommen werden. Warte auf ein Spielbild und versuche es erneut.</string>
+    <string name="capture_video_saved">Aufnahme in der Galerie gespeichert.</string>
+    <string name="capture_recording_failed">Die Aufnahme konnte nicht gestartet oder abgeschlossen werden. Versuche es erneut und bestätige die Anfrage zur Bildschirmaufnahme.</string>
+    <string name="capture_storage_failed">Aufnahme konnte nicht gespeichert werden. Prüfe den freien Gerätespeicher.</string>
+    <string name="capture_recording">Spiel wird aufgenommen</string>
+    <string name="capture_recording_starting">Aufnahme startet…</string>
+    <string name="capture_finishing">Wird gespeichert…</string>
+    <string name="capture_video_only">Nur Video · ohne Ton</string>
+    <string name="capture_silent_status">● %1$s · ohne Ton</string>
+    <string name="capture_audio_explanation">Android nimmt den Bildschirm einschließlich Bedienelementen und sichtbarer Benachrichtigungen auf. Die Aufnahme endet, wenn LSX4 den Fokus verliert. Die Audioberechtigung erfasst nur die Wiedergabe von LSX4, niemals das Mikrofon.</string>
+    <string name="capture_allow_game_audio">Spielton erlauben</string>
+    <string name="capture_audio_denied">Die Berechtigung für Spielton wurde nicht erteilt. Video ohne Ton aufnehmen?</string>
+    <string name="capture_audio_requires_android10">Interner Spielton erfordert Android 10 oder neuer. Video ohne Ton aufnehmen?</string>
+    <string name="capture_notification_channel">Spielaufnahme</string>
+    <string name="capture_notification_detail">Bildschirmaufnahme; nur Wiedergabeton von LSX4. Zum Speichern auf Stopp tippen.</string>
+    <string name="game_menu_continue">Fortsetzen</string>
+    <string name="game_menu_paused_hint">Spiel pausiert. Setze es fort, wenn du bereit bist.</string>
+    <string name="game_menu_exiting">Spiel wird geschlossen…</string>
+    <string name="game_menu_audio_focus">Eine andere App verwendet die Audioausgabe. Tippe erneut auf Fortsetzen.</string>
+</resources>

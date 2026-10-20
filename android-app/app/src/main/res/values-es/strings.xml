@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="game_move_selected">%1$s seleccionado. Arrástralo o toca la posición de destino.</string>
+    <string name="game_move_completed">%1$s movido</string>
+    <string name="library_hold_hint">Mantén: 2 s seleccionar · 4 s no jugable · 5 s jugable. Arrastra la selección o toca su destino.</string>
+    <string name="library_hold_hint_dismiss">Ocultar ayuda de gestos de la lista</string>
+    <string name="game_hold_countdown">Objetivo de pulsación: %1$d s</string>
     <string name="app_name">LSX4</string>
     <string name="library_scanning">Buscando juegos instalados…</string>
     <string name="library_found">Juegos encontrados: %1$d</string>
@@ -9,10 +14,10 @@
     <string name="menu_import_pkg">Importar PKG</string>
     <string name="menu_settings">Ajustes</string>
     <string name="menu_add">Añadir juego</string>
-    <string name="menu_remove_game">Eliminar el juego seleccionado</string><string name="game_removing">Eliminando %1$s…</string><string name="game_removed">%1$s eliminado</string><string name="game_remove_failed">No se pudo eliminar %1$s</string>
-    <string name="game_selected_for_removal">%1$s seleccionado para eliminar</string><string name="game_selection_cleared">Selección de %1$s cancelada</string><string name="game_marked_unsupported">%1$s añadido a los juegos no compatibles</string><string name="game_marked_supported">%1$s añadido a los juegos compatibles</string>
-    <string name="game_status_unclassified">Sin clasificar</string><string name="game_status_unsupported">No compatible</string><string name="game_status_supported">Compatible</string>
-    <string name="game_item_accessibility">%1$s, %2$s. %3$s. Mantén pulsado 2 segundos para seleccionar y eliminar, 4 segundos para marcar como no compatible u 8 segundos para marcar como compatible.</string>
+    <string name="menu_remove_game">Eliminar el juego seleccionado</string><string name="game_remove_title">¿Eliminar el juego?</string><string name="game_remove_message">¿Eliminar %1$s y sus archivos instalados de este dispositivo?</string><string name="game_remove_confirm">Eliminar</string><string name="game_removing">Eliminando %1$s…</string><string name="game_removed">%1$s eliminado</string><string name="game_remove_failed">No se pudo eliminar %1$s</string>
+    <string name="game_selected_for_removal">%1$s seleccionado para eliminar</string><string name="game_selection_cleared">Selección de %1$s cancelada</string><string name="game_marked_unsupported">%1$s marcado como no jugable</string><string name="game_marked_supported">%1$s marcado como jugable</string>
+    <string name="game_status_unclassified">Sin clasificar</string><string name="game_status_unsupported">No jugable</string><string name="game_status_supported">Jugable</string>
+    <string name="game_item_accessibility">%1$s, %2$s. %3$s.</string>
     <string name="metadata_only">Solo metadatos · falta eboot</string>
     <string name="settings_title">Ajustes</string>
     <string name="settings_subtitle">Los cambios se guardan automáticamente</string>
@@ -26,7 +31,8 @@
     <string name="category_other">Otros</string><string name="category_other_summary">HUD de depuración</string>
     <string name="graphics_gpu">GPU</string><string name="graphics_gpu_summary">API gráfica y familia del dispositivo</string>
     <string name="graphics_patches">Parches</string><string name="graphics_patches_summary">Parches gráficos por juego</string>
-    <string name="graphics_resolution">Resolución de salida</string>
+    <string name="graphics_resolution">Resolución de renderizado interna</string>
+    <string name="graphics_upscaled_output_resolution">Resolución de salida reescalada</string>
     <string name="gpu_vulkan">Vulkan (Snapdragon, Mali potente)</string><string name="gpu_opengl">OpenGL (Mali, otros)</string>
     <string name="gpu_opengl_pending">En desarrollo</string>
     <string name="audio_enable">Activar salida de audio</string>
@@ -61,6 +67,10 @@
     <string name="surface_detached">Superficie desconectada.</string>
     <string name="surface_detach_failed">No se pudo desconectar la superficie: %1$s</string>
     <string name="aarch64_jit">JIT AArch64</string>
+    <string name="guest_cpu_backend_current">JIT AArch64 actual</string>
+    <string name="guest_cpu_backend_fex_experimental">FEX (experimental)</string>
+    <string name="optimization_guest_cpu_backend">Backend de CPU invitada</string>
+    <string name="optimization_guest_cpu_backend_hint">Current es la opción segura predeterminada. FEX es un backend experimental solo para el invitado y se aplica al reiniciar el proceso del juego. Las compilaciones incompatibles informan explícitamente el retorno a Current.</string>
     <string name="controls_gamepad_hint">Al conectar un mando compatible, el control en pantalla se oculta automáticamente. Se admiten mandos.</string>
     <string name="resolution_native">Nativa (dispositivo)</string>
     <string name="resolution_upscale_150">Escala 1,5× (2880×1620)</string>
@@ -75,11 +85,6 @@
     <string name="audio_ngs2_error_size">El módulo seleccionado es demasiado grande</string>
     <string name="audio_ngs2_error_name">Selecciona el módulo de firmware llamado %1$s</string>
     <string name="audio_ngs2_error_format">El archivo seleccionado no es un módulo de PS4 descifrado</string>
-    <string name="game_hold_waiting">Mantén: 2 s eliminar · 4 s no compatible · 8 s compatible</string>
-    <string name="game_hold_release_remove">Suelta ahora: seleccionar para eliminar</string>
-    <string name="game_hold_release_unsupported">Suelta ahora: marcar como no compatible</string>
-    <string name="game_hold_release_supported">Suelta ahora: marcar como compatible</string>
-    <string name="game_hold_elapsed">%1$.1f / 8.0 s · %2$s</string>
     <string name="game_menu_title">Controles rápidos</string>
     <string name="game_menu_hint">Desliza a la derecha o toca fuera para cerrar</string>
     <string name="game_menu_open">Abrir controles rápidos</string>
@@ -96,4 +101,30 @@
     <string name="optimization_coarse_fragment_2x2_hint">Ejecuta una invocación del fragment shader por cada grupo de píxeles 2×2. Puede reducir mucho la carga de la GPU, pero disminuye el detalle fino y puede alterar algunos efectos. Reinicia el juego después de cambiarla.</string>
     <string name="optimization_disable_vk_robustness">Desactivar comprobaciones Vulkan robustness</string>
     <string name="optimization_disable_vk_robustness_hint">Elimina la protección de límites de búferes e imágenes de la GPU. Puede acelerar juegos con sombreadores pesados, pero un acceso inválido puede corromper los gráficos o bloquear el controlador. Reinicia el juego después de cambiarla.</string>
+    <string name="controls_customize_overlay">Personalizar controles en pantalla</string>
+    <string name="controls_customize_overlay_summary">Mueve, redimensiona, oculta o restaura cada control.</string>
+    <string name="controls_optional_buttons">Botones opcionales</string>
+    <string name="controls_show_share">Mostrar Share</string>
+    <string name="controls_show_ps">Mostrar PS</string>
+    <string name="controls_show_touchpad">Mostrar panel táctil</string>
+    <string name="controls_phone_triggers">Gatillos del teléfono</string>
+    <string name="controls_phone_trigger_left">Gatillo izquierdo del teléfono</string>
+    <string name="controls_phone_trigger_right">Gatillo derecho del teléfono</string>
+    <string name="controls_phone_trigger_hint">Pulsa Detectar y después el gatillo físico. Una pulsación larga borra la asignación. La detección no depende del modelo del teléfono.</string>
+    <string name="controls_trigger_detect">Detectar gatillo</string>
+    <string name="controls_trigger_press_now">Pulsa el gatillo ahora…</string>
+    <string name="controls_trigger_detected">Detectado: %1$s</string>
+    <string name="overlay_editor_select_hint">Selecciona un control</string>
+    <string name="overlay_editor_selected">Seleccionado: %1$s</string>
+    <string name="overlay_editor_hide">Ocultar</string>
+    <string name="overlay_editor_add">Añadir</string>
+    <string name="overlay_editor_reset">Restablecer</string>
+    <string name="overlay_editor_done">Listo</string>
+    <string name="overlay_editor_none_hidden">Todos los controles ya están visibles.</string>
+    <string name="overlay_editor_reset_confirm">¿Restaurar posiciones, tamaños y visibilidad predeterminados?</string>
+    <string name="overlay_editor_gesture_hint">Arrastra para mover · pellizca para cambiar el tamaño · recupera controles ocultos con Añadir</string>
+    <string name="loading_active">Todo bien, cargando</string>
+    <string name="loading_waiting">Esperando al juego. Sin error confirmado</string>
+    <string name="loading_failed">Error detectado. Puedes cerrar el juego</string>
+    <string name="loading_blocks">Bloques: %1$,d</string>
 </resources>

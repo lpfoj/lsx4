@@ -1,0 +1,20 @@
+name: Vulkan capability guard
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  capability-bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Check Vulkan capability routes
+        run: python tools/check_vulkan_capability_bridge.py
+      - name: Test guard rejection patterns
+        run: python -m unittest tests/test_vulkan_capability_guard.py

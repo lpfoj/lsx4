@@ -5,9 +5,24 @@
 
 namespace Executor::AndroidPerformanceHint {
 
+
+
+
+void SetFullRate60HzTarget(bool enabled) noexcept;
+
 void SetEnabled(bool enabled) noexcept;
 [[nodiscard]] bool IsEnabled() noexcept;
 
+
+
+void MaintainSessionThreads() noexcept;
+
+
+
+void ReportProducerCycleComplete() noexcept;
+
+
+
 void ReportFramePresented() noexcept;
 
-} // namespace Executor::AndroidPerformanceHint
+}

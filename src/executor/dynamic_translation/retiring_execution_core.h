@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -28,8 +29,13 @@ void ConfigureHostFlagM(bool enabled) noexcept;
 [[nodiscard]] bool HostFlagMEnabled() noexcept;
 void ConfigureHostSve2(bool enabled) noexcept;
 [[nodiscard]] bool HostSve2Enabled() noexcept;
+[[nodiscard]] bool HostSve2EnabledForWidth(std::uint32_t minimum_vector_bytes) noexcept;
 void ConfigureHostRcpc(bool enabled) noexcept;
 [[nodiscard]] bool HostRcpcEnabled() noexcept;
+void ConfigureHostFeatureDisableMask(std::uint64_t mask) noexcept;
+void ConfigureGuestSpinWaitEvent(bool enabled) noexcept;
+[[nodiscard]] bool GuestSpinWaitEventEnabled() noexcept;
+void ConfigureJitRipProbesForDiagnostics(std::string_view spec) noexcept;
 
 enum class LsxGpr : std::uint8_t {
     Rax,
@@ -117,6 +123,10 @@ struct alignas(32) LsxMachineImage {
     std::uint64_t deferred_flags_lhs = 0;
     std::uint64_t deferred_flags_meta = 0;
     std::uint64_t deferred_flags_rhs = 0;
+    std::uint64_t shadow_return_begin = 0;
+    std::uint64_t shadow_return_top = 0;
+    std::uint64_t shadow_return_end = 0;
+    std::uint64_t fixed_xmm_dirty_mask = 0;
 };
 
 static_assert(std::is_standard_layout_v<LsxMachineImage>);
@@ -142,7 +152,11 @@ static_assert(offsetof(LsxMachineImage, native_fault_ir) == 0x348);
 static_assert(offsetof(LsxMachineImage, deferred_flags_lhs) == 0x350);
 static_assert(offsetof(LsxMachineImage, deferred_flags_meta) == 0x358);
 static_assert(offsetof(LsxMachineImage, deferred_flags_rhs) == 0x360);
-static_assert(sizeof(LsxMachineImage) == 0x380);
+static_assert(offsetof(LsxMachineImage, shadow_return_begin) == 0x368);
+static_assert(offsetof(LsxMachineImage, shadow_return_top) == 0x370);
+static_assert(offsetof(LsxMachineImage, shadow_return_end) == 0x378);
+static_assert(offsetof(LsxMachineImage, fixed_xmm_dirty_mask) == 0x380);
+static_assert(sizeof(LsxMachineImage) == 0x3a0);
 
 struct LsxEntryPacket {
     using Argument = std::uint64_t;
@@ -239,10 +253,12 @@ struct DecodeSummary {
     std::uint8_t operand_count_visible = 0;
     std::uint16_t implicit_gpr_read_mask = 0;
     std::uint16_t implicit_gpr_write_mask = 0;
+    std::uint16_t implicit_vector_read_mask = 0;
+    std::uint16_t implicit_vector_write_mask = 0;
 };
 
 static_assert(std::is_standard_layout_v<DecodeSummary>);
-static_assert(sizeof(DecodeSummary) == 24);
+static_assert(sizeof(DecodeSummary) == 32);
 
 using LsxRegisterCode = std::uint16_t;
 
@@ -424,7 +440,7 @@ struct LsxDecodedOp {
 };
 
 static_assert(std::is_standard_layout_v<LsxDecodedOp>);
-static_assert(sizeof(LsxDecodedOp) == 192);
+static_assert(sizeof(LsxDecodedOp) == 200);
 
 enum class RegionDecodeStatus : std::uint8_t {
     Ready,

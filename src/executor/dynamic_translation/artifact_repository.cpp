@@ -69,6 +69,8 @@ constexpr std::uint32_t kKnownNativeFlags =
     kJitNativeFlagSignalFaultDescriptorV30 |
     kJitNativeFlagVectorUpperZeroElisionV31;
 constexpr std::uint32_t kAarch64PointerMaterializationBytes = 4 * sizeof(std::uint32_t);
+constexpr std::uint32_t kAarch64LiteralRelocationMarkerBytes = 2 * sizeof(std::uint32_t);
+constexpr std::uint32_t kAarch64LiteralRelocationBytes = sizeof(std::uint64_t);
 
 constexpr std::uint16_t kBlockFlagCanJitInitial = 1u << 0;
 constexpr std::uint16_t kBlockFlagDecodeFailed = 1u << 1;
@@ -353,6 +355,12 @@ private:
            static_cast<std::uint8_t>(JitNativeRelocationKind::IndirectEdgeFanout);
 }
 
+[[nodiscard]] bool ValidNativeRelocationEncoding(
+    const JitNativeRelocationEncoding encoding) noexcept {
+    return static_cast<std::uint8_t>(encoding) <=
+           static_cast<std::uint8_t>(JitNativeRelocationEncoding::Literal64);
+}
+
 [[nodiscard]] std::uint32_t ReadLittleEndianU32(const std::uint8_t* bytes) noexcept {
     return static_cast<std::uint32_t>(bytes[0]) |
            static_cast<std::uint32_t>(bytes[1]) << 8 |
@@ -360,23 +368,74 @@ private:
            static_cast<std::uint32_t>(bytes[3]) << 24;
 }
 
-[[nodiscard]] bool ValidPointerMaterializationSequence(
-    const JitNativeSegment& segment, const JitNativeRelocation& relocation) noexcept {
-    constexpr std::uint32_t kImmediateMask = 0x001fffe0u;
-    const std::array<std::uint32_t, 4> expected = {
-        0xd2800000u | relocation.register_index,
-        0xf2a00000u | relocation.register_index,
-        0xf2c00000u | relocation.register_index,
-        0xf2e00000u | relocation.register_index,
-    };
-    for (std::size_t index = 0; index < expected.size(); ++index) {
-        const std::uint32_t instruction = ReadLittleEndianU32(
-            segment.bytes.data() + relocation.code_offset + index * sizeof(std::uint32_t));
-        if ((instruction & ~kImmediateMask) != expected[index]) {
+struct NativeRelocationSpan {
+    std::size_t begin = 0;
+    std::size_t end = 0;
+};
+
+[[nodiscard]] bool NativeRelocationSpanFor(const JitNativeSegment& segment,
+                                           const JitNativeRelocation& relocation,
+                                           NativeRelocationSpan& span) noexcept {
+    switch (relocation.encoding) {
+    case JitNativeRelocationEncoding::MovWide16:
+        if (relocation.code_offset % sizeof(std::uint32_t) != 0 ||
+            relocation.code_offset > segment.bytes.size() ||
+            segment.bytes.size() - relocation.code_offset <
+                kAarch64PointerMaterializationBytes) {
             return false;
         }
+        span.begin = relocation.code_offset;
+        span.end = relocation.code_offset + kAarch64PointerMaterializationBytes;
+        return true;
+    case JitNativeRelocationEncoding::Literal64:
+        if (relocation.code_offset % alignof(std::uint64_t) != 0 ||
+            relocation.code_offset < kAarch64LiteralRelocationMarkerBytes ||
+            relocation.code_offset > segment.bytes.size() ||
+            segment.bytes.size() - relocation.code_offset < kAarch64LiteralRelocationBytes) {
+            return false;
+        }
+        span.begin = relocation.code_offset - kAarch64LiteralRelocationMarkerBytes;
+        span.end = relocation.code_offset + kAarch64LiteralRelocationBytes;
+        return true;
     }
-    return true;
+    return false;
+}
+
+[[nodiscard]] bool ValidNativeRelocationSequence(
+    const JitNativeSegment& segment, const JitNativeRelocation& relocation) noexcept {
+    switch (relocation.encoding) {
+    case JitNativeRelocationEncoding::MovWide16: {
+        constexpr std::uint32_t kImmediateMask = 0x001fffe0u;
+        const std::array<std::uint32_t, 4> expected = {
+            0xd2800000u | relocation.register_index,
+            0xf2a00000u | relocation.register_index,
+            0xf2c00000u | relocation.register_index,
+            0xf2e00000u | relocation.register_index,
+        };
+        for (std::size_t index = 0; index < expected.size(); ++index) {
+            const std::uint32_t instruction = ReadLittleEndianU32(
+                segment.bytes.data() + relocation.code_offset + index * sizeof(std::uint32_t));
+            if ((instruction & ~kImmediateMask) != expected[index]) {
+                return false;
+            }
+        }
+        return true;
+    }
+    case JitNativeRelocationEncoding::Literal64: {
+        const std::size_t marker_offset =
+            relocation.code_offset - kAarch64LiteralRelocationMarkerBytes;
+        const std::uint32_t marker0 =
+            ReadLittleEndianU32(segment.bytes.data() + marker_offset);
+        const std::uint32_t marker1 = ReadLittleEndianU32(
+            segment.bytes.data() + marker_offset + sizeof(std::uint32_t));
+        return (marker0 & kJitNativeLiteralRelocationMarker0OpcodeMask) ==
+                   kJitNativeLiteralRelocationMarker0Base &&
+               (marker0 & kJitNativeLiteralRelocationMarker0RegisterMask) ==
+                   relocation.register_index &&
+               marker1 == kJitNativeLiteralRelocationMarker1;
+    }
+    }
+    return false;
 }
 
 [[nodiscard]] bool ValidateNativeSegments(const JitIrCacheRecord& record,
@@ -441,22 +500,22 @@ private:
         native_bytes += segment.bytes.size();
         native_relocations += segment.relocs.size();
 
-        std::vector<std::uint32_t> relocation_offsets;
-        relocation_offsets.reserve(segment.relocs.size());
+        std::vector<NativeRelocationSpan> relocation_spans;
+        relocation_spans.reserve(segment.relocs.size());
         for (const JitNativeRelocation& relocation : segment.relocs) {
-            if (!ValidNativeRelocationKind(relocation.kind) || relocation.register_index > 30) {
-                error = "invalid cached native relocation kind or register";
+            if (!ValidNativeRelocationKind(relocation.kind) ||
+                !ValidNativeRelocationEncoding(relocation.encoding) ||
+                relocation.register_index > 30) {
+                error = "invalid cached native relocation kind, encoding, or register";
                 return false;
             }
-            if (relocation.code_offset % sizeof(std::uint32_t) != 0 ||
-                relocation.code_offset > segment.bytes.size() ||
-                segment.bytes.size() - relocation.code_offset <
-                    kAarch64PointerMaterializationBytes) {
+            NativeRelocationSpan relocation_span{};
+            if (!NativeRelocationSpanFor(segment, relocation, relocation_span)) {
                 error = "cached native relocation patch sequence out of bounds";
                 return false;
             }
-            if (!ValidPointerMaterializationSequence(segment, relocation)) {
-                error = "cached native relocation lacks a fixed MOVZ/MOVK sequence";
+            if (!ValidNativeRelocationSequence(segment, relocation)) {
+                error = "cached native relocation sequence does not match its encoding";
                 return false;
             }
             switch (relocation.kind) {
@@ -506,12 +565,15 @@ private:
                 }
                 break;
             }
-            relocation_offsets.push_back(relocation.code_offset);
+            relocation_spans.push_back(relocation_span);
         }
-        std::sort(relocation_offsets.begin(), relocation_offsets.end());
-        for (std::size_t index = 1; index < relocation_offsets.size(); ++index) {
-            if (relocation_offsets[index] - relocation_offsets[index - 1] <
-                kAarch64PointerMaterializationBytes) {
+        std::sort(relocation_spans.begin(), relocation_spans.end(),
+                  [](const NativeRelocationSpan& lhs, const NativeRelocationSpan& rhs) {
+                      return lhs.begin < rhs.begin ||
+                             (lhs.begin == rhs.begin && lhs.end < rhs.end);
+                  });
+        for (std::size_t index = 1; index < relocation_spans.size(); ++index) {
+            if (relocation_spans[index].begin < relocation_spans[index - 1].end) {
                 error = "overlapping cached native relocation patch sequences";
                 return false;
             }
@@ -644,7 +706,8 @@ void WriteNativeRelocation(ByteWriter& writer,
                            const JitNativeRelocation& relocation) {
     writer.U8(static_cast<std::uint8_t>(relocation.kind));
     writer.U8(relocation.register_index);
-    writer.U16(0);
+    writer.U8(static_cast<std::uint8_t>(relocation.encoding));
+    writer.U8(0);
     writer.U32(relocation.code_offset);
     writer.U32(relocation.target_index);
     writer.U64(std::bit_cast<std::uint64_t>(relocation.addend));
@@ -654,18 +717,22 @@ void WriteNativeRelocation(ByteWriter& writer,
                                         JitNativeRelocation& relocation,
                                         std::string& error) {
     std::uint8_t kind = 0;
-    std::uint16_t reserved = 0;
+    std::uint8_t encoding = 0;
+    std::uint8_t reserved = 0;
     std::uint64_t addend = 0;
-    if (!reader.U8(kind) || !reader.U8(relocation.register_index) || !reader.U16(reserved) ||
+    if (!reader.U8(kind) || !reader.U8(relocation.register_index) || !reader.U8(encoding) ||
+        !reader.U8(reserved) ||
         !reader.U32(relocation.code_offset) || !reader.U32(relocation.target_index) ||
         !reader.U64(addend)) {
         error = "truncated cached native relocation";
         return false;
     }
     relocation.kind = static_cast<JitNativeRelocationKind>(kind);
+    relocation.encoding = static_cast<JitNativeRelocationEncoding>(encoding);
     relocation.addend = std::bit_cast<std::int64_t>(addend);
-    if (reserved != 0 || !ValidNativeRelocationKind(relocation.kind)) {
-        error = "invalid cached native relocation kind or reserved bits";
+    if (reserved != 0 || !ValidNativeRelocationKind(relocation.kind) ||
+        !ValidNativeRelocationEncoding(relocation.encoding)) {
+        error = "invalid cached native relocation kind, encoding, or reserved bits";
         return false;
     }
     return true;

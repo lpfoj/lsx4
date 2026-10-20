@@ -1,0 +1,20 @@
+[package]
+name = "lsx4-pkg-extractor"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+memmap2 = "0.9"
+orbis-pkg = { git = "https://github.com/videobitva/orbis.git", rev = "13f1294a87a53d54f82feec56acbfd03f50667a9" }
+orbis-pkg-util = { git = "https://github.com/videobitva/orbis.git", rev = "13f1294a87a53d54f82feec56acbfd03f50667a9", default-features = false }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "unwind"
+strip = "symbols"

@@ -1,5 +1,10 @@
 # Optional tiered JIT and trace compilation
 
+> [!IMPORTANT]
+> Before any device/FPS/playable measurement, run `scripts/preflight-vivo-performance-test.ps1`;
+> stale Android Studio process-trackers and known profiler loads make the result invalid. See the
+> mandatory [performance-test preflight](PERFORMANCE_TEST_PREFLIGHT.md).
+
 Status: implemented as an optional, fail-closed runtime feature.
 
 The implementation lives in the shared dynamic-translation source and is

@@ -1,0 +1,42 @@
+diff --git a/src/vulkan/vulkan-android.sym b/src/vulkan/vulkan-android.sym
+index 2d0be61112c..59af84ed2de 100644
+--- a/src/vulkan/vulkan-android.sym
++++ b/src/vulkan/vulkan-android.sym
+@@ -4,6 +4,14 @@
+ 		# instance of struct hwvulkan_module_t.
+ 		HMI;
+ 
++		# LSX4 packages Turnip as an app-private direct ICD instead of
++		# registering it as an Android HAL module.  Keep the normal HMI
++		# export while also exposing the standard loader handshake used by
++		# Vulkan-Loader and Mesa's VK_LUNARG_direct_driver_loading route.
++		vk_icdGetInstanceProcAddr;
++		vk_icdGetPhysicalDeviceProcAddr;
++		vk_icdNegotiateLoaderICDInterfaceVersion;
++
+	local:
+		# When static linking LLVM, all its symbols are public API.
+		# That may cause symbol collision, so explicitly demote everything.
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+index 69b979dc9dd..e1fce9bd807 100644
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -671,6 +671,18 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
+       ubwc_enabled = false;
+    }
+ 
++   /* Android's app-private loader may only expose the fallback gralloc API.
++    * In that case the imported native buffer has an explicit pitch but no
++    * reliable DRM modifier.  Treating an unknown modifier as UBWC makes
++    * Turnip write compression metadata into a buffer which SurfaceFlinger
++    * consumes as uncompressed, producing periodic vertical stripes.  Keep
++    * UBWC enabled for driver-owned images; only use the safe uncompressed
++    * layout for imported buffers whose modifier could not be identified.
++    */
++   if (plane_layouts && modifier == DRM_FORMAT_MOD_INVALID) {
++      ubwc_enabled = false;
++   }
++
+    /* Layout computation begins here */
+    enum a6xx_tile_mode tile_mode = TILE6_3;
+ #if DETECT_OS_LINUX || DETECT_OS_BSD

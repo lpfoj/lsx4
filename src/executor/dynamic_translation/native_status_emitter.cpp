@@ -217,7 +217,11 @@ void EmitBitIsolationStatus(Xbyak_aarch64::CodeGenerator& code,
                             const std::uint32_t width,
                             const bool carry_when_nonzero,
                             const X86FlagLayout& layout) {
-    code.tst(input, input);
+    if (width == 32) {
+        code.tst(WReg(input.getIdx()), WReg(input.getIdx()));
+    } else {
+        code.tst(input, input);
+    }
     code.cset(code.x13,
               carry_when_nonzero ? Xbyak_aarch64::NE : Xbyak_aarch64::EQ);
     if (width == 32) {

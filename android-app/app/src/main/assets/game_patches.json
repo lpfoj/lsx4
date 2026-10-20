@@ -1,20 +1,23 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "games": [
     {
       "name": "Bloodborne",
-      "titleIds": ["CUSA00207", "CUSA00900", "CUSA01363", "CUSA03023", "CUSA03173"],
+      "titleIds": [
+        "CUSA00207",
+        "CUSA00208",
+        "CUSA00299",
+        "CUSA00900",
+        "CUSA01363",
+        "CUSA03014",
+        "CUSA03023",
+        "CUSA03173"
+      ],
       "patches": [
         {
           "id": "dynamic_shadows",
           "title": "patch_dynamic_shadows",
           "preferenceKey": "disable_dynamic_shadows",
-          "inverted": true
-        },
-        {
-          "id": "ssao",
-          "title": "patch_ssao",
-          "preferenceKey": "disable_ssao",
           "inverted": true
         },
         {
@@ -24,10 +27,168 @@
           "inverted": true
         },
         {
-          "id": "depth_of_field",
-          "title": "patch_depth_of_field",
+          "id": "bloodborne_0109_disable_chromatic_aberration",
+          "label": "Disable Chromatic Aberration",
+          "preferenceKey": "disable_chromatic_aberration",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_disable_aa",
+          "label": "Disable AA",
+          "preferenceKey": "disable_anti_aliasing",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_performance_patch",
+          "label": "Performance Patch (perf increase)",
+          "preferenceKey": "bloodborne_0109_performance_patch",
+          "marker": "lsx4-bb-0109-performance-patch",
+          "conflicts": [
+            "bloodborne_0109_enable_ssr",
+            "bloodborne_0109_model_lod_2",
+            "bloodborne_0109_model_lod_1",
+            "bloodborne_0109_model_lod_minus_2",
+            "bloodborne_0109_30_fps_plus_plus",
+            "bloodborne_0109_60_fps_no_deltatime",
+            "bloodborne_0109_60_fps_plus_plus",
+            "bloodborne_0109_90_fps_plus_plus"
+          ],
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_disable_dof",
+          "label": "Disable DoF",
           "preferenceKey": "disable_depth_of_field",
-          "inverted": true
+          "marker": "run-disable-dof",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_disable_ssao",
+          "label": "Disable SSAO",
+          "preferenceKey": "disable_ssao",
+          "marker": "run-disable-ssao",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_enable_ssr",
+          "label": "Enable Screen Space Reflections (READ NOTE)",
+          "preferenceKey": "bloodborne_0109_enable_ssr",
+          "marker": "lsx4-bb-0109-enable-ssr",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_text_scale_50",
+          "label": "50% Text scale",
+          "preferenceKey": "bloodborne_0109_text_scale_50",
+          "marker": "lsx4-bb-0109-text-scale-50",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_fmod_crash_fix",
+          "label": "FMOD Crash Fix",
+          "preferenceKey": "bloodborne_0109_fmod_crash_fix",
+          "marker": "lsx4-bb-0109-fmod-crash-fix",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_model_lod_2",
+          "label": "Model LOD 2 (Lowest)",
+          "preferenceKey": "bloodborne_0109_model_lod_2",
+          "marker": "lsx4-bb-0109-model-lod-2",
+          "group": "model_lod",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_model_lod_1",
+          "label": "Model LOD 1 (Lower)",
+          "preferenceKey": "bloodborne_0109_model_lod_1",
+          "marker": "lsx4-bb-0109-model-lod-1",
+          "group": "model_lod",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_model_lod_minus_2",
+          "label": "Model LOD -2 (Highest)",
+          "preferenceKey": "bloodborne_0109_model_lod_minus_2",
+          "marker": "lsx4-bb-0109-model-lod-minus-2",
+          "group": "model_lod",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_increased_graphics_heap",
+          "label": "Increased Graphics Heap Sizes",
+          "preferenceKey": "bloodborne_0109_increased_graphics_heap",
+          "marker": "lsx4-bb-0109-increased-graphics-heap",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_intel_sfx_workaround",
+          "label": "Intel 12th Gen+ SFX workaround",
+          "preferenceKey": "bloodborne_0109_intel_sfx_workaround",
+          "marker": "lsx4-bb-0109-intel-sfx-workaround",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_intel_black_tonemap_fix",
+          "label": "Intel Black Tonemap Fix",
+          "preferenceKey": "bloodborne_0109_intel_black_tonemap_fix",
+          "marker": "lsx4-bb-0109-intel-black-tonemap-fix",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_disable_http_requests",
+          "label": "Disable HTTP Requests",
+          "preferenceKey": "bloodborne_0109_disable_http_requests",
+          "marker": "lsx4-bb-0109-disable-http-requests",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_ds1_like_physics",
+          "label": "DS1-like physics",
+          "preferenceKey": "bloodborne_0109_ds1_like_physics",
+          "marker": "lsx4-bb-0109-ds1-like-physics",
+          "group": "physics",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_lower_object_corpse_physics",
+          "label": "Lower object/corpse physics",
+          "preferenceKey": "bloodborne_0109_lower_object_corpse_physics",
+          "marker": "lsx4-bb-0109-lower-object-corpse-physics",
+          "group": "physics",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_30_fps_plus_plus",
+          "label": "30 FPS++",
+          "preferenceKey": "bloodborne_0109_30_fps_plus_plus",
+          "marker": "lsx4-bb-0109-30-fps-plus-plus",
+          "group": "fps",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_60_fps_no_deltatime",
+          "label": "60FPS (no deltatime)",
+          "preferenceKey": "bloodborne_0109_60_fps_no_deltatime",
+          "marker": "lsx4-bb-0109-60-fps-no-deltatime",
+          "group": "fps",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_60_fps_plus_plus",
+          "label": "60 FPS++",
+          "preferenceKey": "bloodborne_0109_60_fps_plus_plus",
+          "marker": "lsx4-bb-0109-60-fps-plus-plus",
+          "group": "fps",
+          "inverted": false
+        },
+        {
+          "id": "bloodborne_0109_90_fps_plus_plus",
+          "label": "90 FPS++",
+          "preferenceKey": "bloodborne_0109_90_fps_plus_plus",
+          "marker": "lsx4-bb-0109-90-fps-plus-plus",
+          "group": "fps",
+          "inverted": false
         }
       ]
     }

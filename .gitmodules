@@ -109,3 +109,19 @@
 	path = funnel-arm
 	url = https://github.com/llayerlinux/Funnel-arm.git
 	branch = main
+[submodule "externals/swanstation"]
+	path = externals/swanstation
+	url = https://github.com/libretro/swanstation.git
+[submodule "externals/libadrenotools"]
+	path = externals/libadrenotools
+	url = https://github.com/bylaws/libadrenotools.git
+	shallow = true
+[submodule "externals/NVIDIAImageScaling"]
+	path = externals/NVIDIAImageScaling
+	url = https://github.com/NVIDIAGameWorks/NVIDIAImageScaling.git
+[submodule "externals/snapdragon-gsr"]
+	path = externals/snapdragon-gsr
+	url = https://github.com/SnapdragonGameStudios/snapdragon-gsr.git
+[submodule "externals/arm-asr"]
+	path = externals/arm-asr
+	url = https://github.com/arm/accuracy-super-resolution-generic-library.git

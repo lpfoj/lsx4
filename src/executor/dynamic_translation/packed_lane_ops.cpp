@@ -345,6 +345,22 @@ PackedBitTestResult TestPackedBits(const void* const left,
     return {!intersection_nonzero, !masked_complement_nonzero};
 }
 
+PackedBitTestResult TestPackedSignBits(const void* const left,
+                                       const void* const right,
+                                       const std::size_t lane_width,
+                                       const std::size_t total_width) noexcept {
+    if (left == nullptr || right == nullptr ||
+        (lane_width != 4 && lane_width != 8) || !ValidWidth(total_width)) {
+        return {};
+    }
+    const std::uint64_t left_signs =
+        CollectSignMask(left, lane_width, total_width);
+    const std::uint64_t right_signs =
+        CollectSignMask(right, lane_width, total_width);
+    return {(left_signs & right_signs) == 0,
+            ((~left_signs) & right_signs) == 0};
+}
+
 bool SumAbsoluteByteGroups(void* const destination, const void* const left,
                            const void* const right,
                            const std::size_t total_width) noexcept {

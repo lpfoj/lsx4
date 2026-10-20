@@ -11,12 +11,15 @@
 #include "executor/dynamic_translation/runtime_bridge_api.h"
 #include "executor/dynamic_translation/runtime_gateway.h"
 #include "executor/dynamic_translation/hle_thunk_identity.h"
+#include "executor/dynamic_translation/host_isa_profile.h"
 #include "executor/dynamic_translation/live_state_port.h"
 #include "executor/dynamic_translation/retiring_execution_core.h"
 #include "executor/android_performance_hint.h"
 #include "executor/dynamic_translation/stack_windows.h"
+#include "executor/fex_backend_loader.h"
 #include "executor/ps5_desktop/backend_contract.h"
 #include "executor/ps5_desktop/bc7decomp.h"
+#include "executor/ps5_desktop/fex_contract.h"
 #include "executor/ps5_desktop/ps5_audio_scheduler.h"
 #include "executor/ps5_desktop/vulkan_presenter.h"
 #include "ps5_desktop/nextgen_loader.h"
@@ -41,6 +44,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <sstream>
 #include <span>
 #include <string>
@@ -54,6 +58,7 @@
 #endif
 
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <ucontext.h>
@@ -83,7 +88,7 @@ constexpr std::uint64_t Ps5ImageBase = 0x900000000ull;
 constexpr std::uint64_t Ps5ImageSessionStride = 0x20000000ull;
 constexpr std::uint64_t Ps5ImageSessionSlots = 32;
 constexpr std::size_t Ps5HleSlabSize = 0x100000;
-constexpr std::size_t Ps5HleStubSize = 0x100;
+constexpr std::size_t Ps5HleStubSize = Executor::Ps5Fex::HleGuestStubSize;
 constexpr std::uint64_t Ps5TlsRegionHint = 0x8d0000000ull;
 constexpr std::uint64_t Ps5TlsRegionStride = 0x100000ull;
 constexpr std::uint64_t Ps5HleDataHint = 0x8e0000000ull;
@@ -93,9 +98,9 @@ constexpr std::size_t Ps5MutexObjectPoolOffset = 0x4000;
 constexpr std::size_t Ps5MutexObjectSize = 0x100;
 constexpr std::uint64_t Ps5DirectMapHint = 0x2000000000ull;
 constexpr std::uint64_t Ps5DirectMapStride = 0x20000000ull;
-// Gen5's flexible virtual allocator starts below the direct-memory aperture.
-// Keeping it in the 0x20... direct-map range eventually exhausts every coarse
-// search slot in games which map large direct heaps during startup.
+
+
+
 constexpr std::uint64_t Ps5FlexibleMapHint = 0x600000000ull;
 constexpr std::uint64_t Ps5LibcHeapHint = 0x3000000000ull;
 constexpr std::uint64_t Ps5LibcHeapStride = 0x20000000ull;
@@ -211,6 +216,16 @@ public:
 
     [[nodiscard]] std::uint64_t Generation() const noexcept {
         return generation_.load(std::memory_order_acquire);
+    }
+
+    template <typename Visitor>
+    void ForEach(Visitor&& visitor) const {
+        for (const auto* const index : {&narrow_, &wide_}) {
+            for (const auto& [key, mapping] : *index) {
+                (void)key;
+                visitor(mapping);
+            }
+        }
     }
 
 private:
@@ -468,9 +483,9 @@ bool UseFullGen5Graphics() {
     return false;
 #endif
 }
-// A gameplay frame commonly references more than 24 atlas textures.  Keeping
-// less than one full working set makes the FIFO cache decode the same BC
-// atlases again on every submit.
+
+
+
 constexpr std::uint32_t AgcCpuTextureCacheLimit = 64u;
 
 struct AgcDiagnosticDraw {
@@ -682,6 +697,142 @@ struct RuntimeState {
 
 RuntimeState g_runtime;
 
+
+
+
+
+std::atomic<bool> g_runtime_pause_requested{};
+std::mutex g_runtime_pause_mutex;
+std::condition_variable g_runtime_pause_changed;
+std::atomic<std::uint64_t> g_runtime_pause_waits{};
+std::atomic<std::uint64_t> g_runtime_pause_transitions{};
+std::atomic<std::uint64_t> g_runtime_resume_transitions{};
+std::atomic<std::uint64_t> g_runtime_pause_idempotent{};
+std::atomic<std::uint32_t> g_runtime_pause_parked{};
+
+[[nodiscard]] bool WaitForRuntimeResume() noexcept {
+    if (!g_runtime_pause_requested.load(std::memory_order_acquire)) {
+        return false;
+    }
+    std::unique_lock lock{g_runtime_pause_mutex};
+    if (!g_runtime_pause_requested.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    g_runtime_pause_waits.fetch_add(1u, std::memory_order_relaxed);
+    g_runtime_pause_parked.fetch_add(1u, std::memory_order_relaxed);
+    g_runtime_pause_changed.wait(lock, [] {
+        return !g_runtime_pause_requested.load(std::memory_order_acquire) ||
+               g_runtime.shutdown_requested.load(std::memory_order_acquire);
+    });
+    g_runtime_pause_parked.fetch_sub(1u, std::memory_order_relaxed);
+    return true;
+}
+
+void ClearRuntimePauseForShutdown() noexcept {
+    {
+        std::scoped_lock lock{g_runtime_pause_mutex};
+        if (g_runtime_pause_requested.exchange(false, std::memory_order_acq_rel)) {
+            g_runtime_resume_transitions.fetch_add(1u, std::memory_order_relaxed);
+        }
+    }
+    g_runtime_pause_changed.notify_all();
+    Lsx4::Ps5Desktop::SetPs5AudioSessionPaused(false);
+}
+
+enum class Ps5GuestCpuBackend : std::uint32_t {
+    Current = 0,
+    FexExperimental = 1,
+};
+
+std::mutex g_guest_cpu_backend_mutex;
+std::atomic<Ps5GuestCpuBackend> g_requested_guest_cpu_backend{Ps5GuestCpuBackend::Current};
+std::atomic<Ps5GuestCpuBackend> g_effective_guest_cpu_backend{Ps5GuestCpuBackend::Current};
+std::atomic<bool> g_guest_cpu_backend_selection_locked{};
+std::mutex g_ps5_fex_activation_mutex;
+std::vector<Lsx4FexExecutableRangeV5> g_ps5_fex_published_ranges;
+std::uint64_t g_ps5_fex_range_generation{1};
+std::atomic<std::uint64_t> g_ps5_fex_published_mapping_generation{};
+std::atomic<std::uint64_t> g_ps5_fex_callback_id{1};
+thread_local std::uint32_t g_ps5_fex_bound_depth{};
+thread_local std::uint64_t g_ps5_fex_bound_guest_thread{};
+thread_local std::uint64_t g_ps5_fex_bound_fs_base{};
+struct Ps5FexGuestExitRequest {
+    bool requested{};
+    std::uint64_t code{};
+};
+thread_local Ps5FexGuestExitRequest g_ps5_fex_guest_exit_request{};
+bool g_guest_cpu_backend_supported{true};
+std::string g_guest_cpu_backend_fallback_reason{"none"};
+std::string g_guest_cpu_backend_status =
+    R"({"schema":"lsx4.guest-cpu-backend.v1","platform":"ps5","requested":"current-aarch64-jit","effective":"current-aarch64-jit","supported":true,"fallbackReason":"none","selectionLocked":false})";
+
+const char* Ps5GuestCpuBackendName(const Ps5GuestCpuBackend backend) {
+    return backend == Ps5GuestCpuBackend::FexExperimental ? "fex-experimental"
+                                                          : "current-aarch64-jit";
+}
+
+bool CompletePs5GuestExecution(const std::uint64_t value) {
+    if (g_effective_guest_cpu_backend.load(std::memory_order_acquire) ==
+            Ps5GuestCpuBackend::FexExperimental &&
+        g_ps5_fex_bound_depth != 0) {
+        g_ps5_fex_guest_exit_request = {
+            .requested = true,
+            .code = value,
+        };
+        return true;
+    }
+    return Lsx4::Translation::CompleteCurrentGuestExecution(value);
+}
+
+std::string EscapeBackendStatusJson(const std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (const char character : value) {
+        if (character == '"' || character == '\\') {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(character);
+    }
+    return escaped;
+}
+
+void RefreshGuestCpuBackendStatusLocked() {
+    const auto requested =
+        g_requested_guest_cpu_backend.load(std::memory_order_acquire);
+    const auto effective =
+        g_effective_guest_cpu_backend.load(std::memory_order_acquire);
+    const auto loader = Executor::Fex::Status();
+    std::ostringstream status;
+    status << R"({"schema":"lsx4.guest-cpu-backend.v1","platform":"ps5","requested":")"
+           << Ps5GuestCpuBackendName(requested)
+           << R"(","effective":")" << Ps5GuestCpuBackendName(effective)
+           << R"(","supported":)"
+           << (g_guest_cpu_backend_supported ? "true" : "false")
+           << R"(,"fallbackReason":")"
+           << EscapeBackendStatusJson(g_guest_cpu_backend_fallback_reason)
+           << R"(","adapterAbi":")"
+           << EscapeBackendStatusJson(
+                  loader.adapter_name.empty()
+                      ? std::string_view{}
+                      : std::string_view{loader.adapter_name})
+           << R"(","mappedEntryAbi":")"
+           << (loader.state == Executor::Fex::LoaderState::Empty ? "" : "v5")
+           << R"(","cacheNamespace":")"
+           << EscapeBackendStatusJson(loader.cache_namespace)
+           << R"(","guestCpuProfile":")"
+           << EscapeBackendStatusJson(loader.guest_cpu_profile)
+           << R"(","loaderState":)"
+           << static_cast<std::uint32_t>(loader.state)
+           << R"(,"providedCapabilities":)" << loader.provided_capabilities
+           << R"(,"selectionLocked":)"
+           << (g_guest_cpu_backend_selection_locked.load(
+                   std::memory_order_acquire)
+                   ? "true"
+                   : "false")
+           << "}";
+    g_guest_cpu_backend_status = status.str();
+}
+
 bool EntryDirectlyCallsInitializer(
     const Funnel::Ps5Desktop::LoadedImage& image,
     const std::span<const std::uint64_t> initializers) {
@@ -740,7 +891,7 @@ const auto g_ps5_process_start =
 std::atomic<std::uint64_t> g_ps5_pad_timestamp{};
 std::atomic<std::uint64_t> g_hle_binding_generation{1};
 std::atomic<std::uint64_t> g_event_flag_generation{1};
-std::array<std::atomic_bool, 19> g_ps5_managed_optimizations{};
+std::array<std::atomic_bool, 20> g_ps5_managed_optimizations{};
 std::atomic<std::uint64_t> g_ps5_managed_optimization_epoch{1};
 std::atomic<std::uint64_t> g_ps5_readback_cache_hits{};
 std::atomic<std::uint64_t> g_ps5_readback_cache_misses{};
@@ -1039,7 +1190,8 @@ void Ps5DiagnosticFaultHandler(
 }
 
 void InstallPs5DiagnosticFaultHandlers() {
-    if (!Ps5DiagnosticFaultProbeEnabled()) {
+    if (!Ps5DiagnosticFaultProbeEnabled() ||
+        Executor::Fex::ActiveApiForSignal() != nullptr) {
         return;
     }
     static std::mutex install_mutex;
@@ -1065,7 +1217,8 @@ void InstallPs5DiagnosticFaultHandlers() {
 }
 
 void RestorePs5DiagnosticFaultHandlers() {
-    if (!g_ps5_diagnostic_fault_handlers_installed) {
+    if (!g_ps5_diagnostic_fault_handlers_installed ||
+        Executor::Fex::ActiveApiForSignal() != nullptr) {
         return;
     }
     for (std::size_t index = 0;
@@ -1107,9 +1260,9 @@ struct GuestAccessCacheEntry {
     std::uint32_t protection{};
 };
 
-// Guest code routinely alternates between its stack, TLS and heap mappings.
-// A single-entry cache turns that normal pattern into a global runtime mutex
-// acquisition for almost every HLE copy.
+
+
+
 thread_local std::array<GuestAccessCacheEntry, 32>
     g_guest_access_cache{};
 thread_local std::size_t g_guest_access_cache_cursor{};
@@ -1644,44 +1797,17 @@ bool RemoveThreadContextLocked(
 
 void EmitPs5HleStub(std::uint8_t* const code,
                     const std::uint64_t thunk) {
-    std::fill_n(code, Ps5HleStubSize, std::uint8_t{0xcc});
-    std::size_t cursor{};
-    const auto emit = [&](const std::initializer_list<std::uint8_t> bytes) {
-        std::ranges::copy(bytes, code + cursor);
-        cursor += bytes.size();
-    };
-    const auto emit_u64 = [&](const std::uint64_t value) {
-        std::memcpy(code + cursor, &value, sizeof(value));
-        cursor += sizeof(value);
-    };
-
-    emit({0x48, 0x81, 0xec, 0x88, 0x00, 0x00, 0x00});
-    emit({0x48, 0xb8});
-    emit_u64(thunk);
-    emit({0x48, 0x89, 0x44, 0x24, 0x08});
-    emit({0x48, 0x89, 0x7c, 0x24, 0x10});
-    emit({0x48, 0x89, 0x74, 0x24, 0x18});
-    emit({0x48, 0x89, 0x54, 0x24, 0x20});
-    emit({0x48, 0x89, 0x4c, 0x24, 0x28});
-    emit({0x4c, 0x89, 0x44, 0x24, 0x30});
-    emit({0x4c, 0x89, 0x4c, 0x24, 0x38});
-    emit({0x48, 0x8d, 0x84, 0x24, 0x88, 0x00, 0x00, 0x00});
-    emit({0x48, 0x89, 0x44, 0x24, 0x40});
-    emit({0x4c, 0x89, 0x5c, 0x24, 0x48});
-    emit({0x48, 0x89, 0x5c, 0x24, 0x50});
-    emit({0x48, 0x89, 0x6c, 0x24, 0x58});
-    emit({0x4c, 0x89, 0x64, 0x24, 0x60});
-    emit({0x4c, 0x89, 0x6c, 0x24, 0x68});
-    emit({0x4c, 0x89, 0x74, 0x24, 0x70});
-    emit({0x4c, 0x89, 0x7c, 0x24, 0x78});
-    emit({0x48, 0x8b, 0x00});
-    emit({0x48, 0x89, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00});
-    emit({0x48, 0x89, 0xe7});
-    emit({0x0f, 0x3f});
-    std::ranges::copy(
-        Lsx4::Translation::TranslationThunkIdentity, code + cursor);
-    cursor += Lsx4::Translation::TranslationThunkIdentity.size();
-    (void)cursor;
+    const auto backend =
+        g_effective_guest_cpu_backend.load(std::memory_order_acquire);
+    auto output =
+        std::span<std::uint8_t, Ps5HleStubSize>{code, Ps5HleStubSize};
+    if (backend == Ps5GuestCpuBackend::FexExperimental) {
+        (void)Executor::Ps5Fex::BuildHleGuestStub(
+            output, thunk, Lsx4::Translation::FexThunkIdentity);
+        return;
+    }
+    (void)Executor::Ps5Fex::BuildCurrentHleGuestStub(
+        output, thunk, Lsx4::Translation::TranslationThunkIdentity);
 }
 
 std::uint64_t EnsureHleSlabLocked() {
@@ -1702,15 +1828,27 @@ std::uint64_t EnsureHleSlabLocked() {
     const auto address = reinterpret_cast<std::uint64_t>(allocation);
     if ((address & (LSX4_PS5_GUEST_PAGE_SIZE - 1u)) != 0 ||
         address >= g_runtime.guest_address_limit ||
-        Ps5HleSlabSize > g_runtime.guest_address_limit - address ||
-        !RegisterMappingLocked(
-            address, Ps5HleSlabSize,
-            LSX4_PS5_GUEST_READ | LSX4_PS5_GUEST_EXECUTE,
-            "ps5-hle-thunks", true)) {
+        Ps5HleSlabSize > g_runtime.guest_address_limit - address) {
         munmap(allocation, Ps5HleSlabSize);
         return 0;
     }
-    g_runtime.hle_slab = static_cast<std::uint8_t*>(allocation);
+    auto* const slab = static_cast<std::uint8_t*>(allocation);
+    for (std::size_t offset = 0; offset != Ps5HleSlabSize;
+         offset += Ps5HleStubSize) {
+        EmitPs5HleStub(slab + offset, address + offset);
+    }
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(slab),
+        reinterpret_cast<char*>(slab + Ps5HleSlabSize));
+    if (mprotect(allocation, Ps5HleSlabSize,
+                 PROT_READ | PROT_EXEC) != 0 ||
+        !RegisterMappingLocked(
+            address, Ps5HleSlabSize, LSX4_PS5_GUEST_READ,
+            "ps5-hle-thunk-reservation", true)) {
+        munmap(allocation, Ps5HleSlabSize);
+        return 0;
+    }
+    g_runtime.hle_slab = slab;
     g_runtime.hle_slab_used = 0;
     return address;
 }
@@ -1726,8 +1864,11 @@ std::uint64_t CreateHleStubLocked(
                    pair.second.symbol == requested;
         });
     if (existing != g_runtime.hle_bindings.end()) {
-        if (native_function != 0) {
+        if (native_function != 0 &&
+            existing->second.native_function != native_function) {
             existing->second.native_function = native_function;
+            g_hle_binding_generation.fetch_add(
+                1, std::memory_order_release);
         }
         return existing->first;
     }
@@ -1740,19 +1881,10 @@ std::uint64_t CreateHleStubLocked(
     auto* const code =
         g_runtime.hle_slab + g_runtime.hle_slab_used;
     const auto thunk = reinterpret_cast<std::uint64_t>(code);
-    const auto host_page_size = HostPageSize();
-    const auto page = thunk & ~(static_cast<std::uint64_t>(
-                                    host_page_size) - 1u);
-    if (mprotect(reinterpret_cast<void*>(page), host_page_size,
-                 PROT_READ | PROT_WRITE) != 0) {
-        return 0;
-    }
-    EmitPs5HleStub(code, thunk);
-    __builtin___clear_cache(
-        reinterpret_cast<char*>(code),
-        reinterpret_cast<char*>(code + Ps5HleStubSize));
-    if (mprotect(reinterpret_cast<void*>(page), host_page_size,
-                 PROT_READ | PROT_EXEC) != 0) {
+    if (!RegisterMappingLocked(
+            thunk, Ps5HleStubSize,
+            LSX4_PS5_GUEST_READ | LSX4_PS5_GUEST_EXECUTE,
+            "ps5-hle-thunks", true)) {
         return 0;
     }
 #ifdef __ANDROID__
@@ -1771,6 +1903,8 @@ std::uint64_t CreateHleStubLocked(
     g_runtime.hle_bindings.emplace(
         thunk, HleBinding{
                    owner_handle, native_function, std::string{requested}});
+    g_hle_binding_generation.fetch_add(
+        1, std::memory_order_release);
     return thunk;
 }
 
@@ -1898,7 +2032,11 @@ int LoaderBindImport(void* const opaque_context,
             const std::lock_guard lock{g_runtime.mutex};
             if (const auto found = g_runtime.hle_bindings.find(thunk);
                 found != g_runtime.hle_bindings.end()) {
-                found->second.native_function = native_function;
+                if (found->second.native_function != native_function) {
+                    found->second.native_function = native_function;
+                    g_hle_binding_generation.fetch_add(
+                        1, std::memory_order_release);
+                }
             }
         }
         *value = thunk;
@@ -2348,8 +2486,8 @@ struct ActiveSubmitResourceSnapshot {
             }
         }
 
-        // Re-capture the union when pages overlap.  This keeps one coherent
-        // submit snapshot instead of accumulating duplicate resource copies.
+
+
         for (auto iterator = ranges.begin();
              iterator != ranges.end();) {
             const auto existing_end =
@@ -2381,9 +2519,9 @@ struct ActiveSubmitResourceSnapshot {
         return true;
     }
 
-    bool Read(const std::uint64_t address,
-              void* const destination,
-              const std::size_t byte_count) {
+    bool ReadCaptured(const std::uint64_t address,
+                      void* const destination,
+                      const std::size_t byte_count) const {
         const auto contained =
             [&](const Range& range) {
                 return address >= range.address &&
@@ -2392,19 +2530,9 @@ struct ActiveSubmitResourceSnapshot {
                         static_cast<std::size_t>(
                             address - range.address);
             };
-        auto found = std::ranges::find_if(ranges, contained);
+        const auto found = std::ranges::find_if(ranges, contained);
         if (found == ranges.end()) {
-            if (!Capture(address, byte_count)) {
-                g_ps5_readback_batch.fallbacks.fetch_add(
-                    1u, std::memory_order_relaxed);
-                return false;
-            }
-            found = std::ranges::find_if(ranges, contained);
-            if (found == ranges.end()) {
-                g_ps5_readback_batch.fallbacks.fetch_add(
-                    1u, std::memory_order_relaxed);
-                return false;
-            }
+            return false;
         }
         std::memcpy(
             destination,
@@ -2455,21 +2583,14 @@ public:
         const std::size_t byte_count,
         const bool enabled)
         : previous_{g_active_submit_resource_snapshot} {
-        if (!enabled || address == 0u || byte_count == 0u) {
+        if (!enabled) {
             return;
         }
+        (void)address;
+        (void)byte_count;
         g_active_submit_resource_snapshot = &snapshot_;
         g_ps5_readback_batch.snapshots.fetch_add(
             1u, std::memory_order_relaxed);
-        try {
-            if (!snapshot_.Capture(address, byte_count)) {
-                g_ps5_readback_batch.fallbacks.fetch_add(
-                    1u, std::memory_order_relaxed);
-            }
-        } catch (...) {
-            g_ps5_readback_batch.fallbacks.fetch_add(
-                1u, std::memory_order_relaxed);
-        }
     }
 
     ~ScopedSubmitResourceSnapshot() {
@@ -2532,11 +2653,12 @@ bool TryReadGuestBytes(
     if (destination == nullptr || byte_count == 0) {
         return byte_count == 0;
     }
-    if (auto* const snapshot =
+    if (const auto* const snapshot =
             g_active_submit_resource_snapshot;
-        snapshot != nullptr) {
-        return snapshot->Read(
-            address, destination, byte_count);
+        snapshot != nullptr &&
+        snapshot->ReadCaptured(
+            address, destination, byte_count)) {
+        return true;
     }
     const auto& span = g_active_guest_read_span;
     if (span.generation != 0 &&
@@ -2827,6 +2949,773 @@ bool TryResolveGuestPath(
         const std::lock_guard lock{g_runtime.mutex};
         g_runtime.resolved_guest_paths.insert_or_assign(
             std::string{guest_path}, host_path);
+    }
+    return true;
+}
+
+struct Ps5FexEntryStorage {
+    std::vector<Lsx4FexMappedSegmentV5> segments;
+    std::vector<Lsx4FexExecutableRangeV5> executable_ranges;
+    Lsx4FexExecutableRangeSnapshotV5 range_snapshot{};
+    std::uint64_t mapping_generation{};
+};
+
+std::uint32_t Ps5ProtectionToPosix(const std::uint32_t protection) {
+    std::uint32_t result{};
+    if ((protection & LSX4_PS5_GUEST_READ) != 0) {
+        result |= PROT_READ;
+    }
+    if ((protection & LSX4_PS5_GUEST_WRITE) != 0) {
+        result |= PROT_WRITE;
+    }
+    if ((protection & LSX4_PS5_GUEST_EXECUTE) != 0) {
+        result |= PROT_EXEC;
+    }
+    return result;
+}
+
+std::uint32_t Ps5FexRangeFlags(const std::uint32_t protection) {
+    std::uint32_t flags{};
+    if ((protection & PROT_EXEC) != 0) {
+        flags |= LSX4_FEX_RANGE_EXECUTABLE;
+    }
+    if ((protection & PROT_WRITE) != 0) {
+        flags |= LSX4_FEX_RANGE_WRITABLE;
+    }
+    if ((flags & (LSX4_FEX_RANGE_EXECUTABLE |
+                  LSX4_FEX_RANGE_WRITABLE)) ==
+        (LSX4_FEX_RANGE_EXECUTABLE |
+         LSX4_FEX_RANGE_WRITABLE)) {
+        flags |= LSX4_FEX_RANGE_SELF_MODIFYING;
+    }
+    return flags;
+}
+
+bool BuildPs5FexEntryStorage(Ps5FexEntryStorage& storage,
+                             std::string& error) {
+    storage = {};
+    std::vector<RegisteredMapping> mappings;
+    std::uint64_t hle_slab_base{};
+    std::uint64_t hle_slab_used{};
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        if (!g_runtime.initialized) {
+            error = "PS5 runtime is not initialized";
+            return false;
+        }
+        mappings.reserve(g_runtime.mappings.Size());
+        g_runtime.mappings.ForEach(
+            [&](const RegisteredMapping& mapping) {
+                mappings.push_back(mapping);
+            });
+        hle_slab_base =
+            reinterpret_cast<std::uint64_t>(g_runtime.hle_slab);
+        hle_slab_used = g_runtime.hle_slab_used;
+        storage.mapping_generation = g_runtime.mappings.Generation();
+    }
+    if (mappings.empty()) {
+        error = "PS5 FEX snapshot has no guest mappings";
+        return false;
+    }
+    if ((hle_slab_base == 0 && hle_slab_used != 0) ||
+        hle_slab_used > Ps5HleSlabSize ||
+        (hle_slab_used % Ps5HleStubSize) != 0) {
+        error = "PS5 FEX HLE slab geometry is invalid";
+        return false;
+    }
+    std::size_t hle_mapping_count{};
+    for (const auto& mapping : mappings) {
+        if (mapping.label != "ps5-hle-thunks") {
+            continue;
+        }
+        if (hle_slab_base == 0 ||
+            mapping.byte_count != Ps5HleStubSize ||
+            mapping.address < hle_slab_base ||
+            mapping.address - hle_slab_base >= hle_slab_used ||
+            ((mapping.address - hle_slab_base) % Ps5HleStubSize) != 0) {
+            error = "PS5 FEX HLE thunk mapping is invalid";
+            return false;
+        }
+        ++hle_mapping_count;
+    }
+    if (hle_mapping_count != hle_slab_used / Ps5HleStubSize) {
+        error = "PS5 FEX HLE thunk mapping count is inconsistent";
+        return false;
+    }
+
+    std::vector<std::uint64_t> boundaries;
+    boundaries.reserve(mappings.size() * 2);
+    for (const auto& mapping : mappings) {
+        if (!RangeIsRepresentable(mapping.address, mapping.byte_count)) {
+            error = "PS5 FEX snapshot contains an invalid mapping";
+            return false;
+        }
+        boundaries.push_back(mapping.address);
+        boundaries.push_back(mapping.address + mapping.byte_count);
+    }
+    std::ranges::sort(boundaries);
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()),
+                     boundaries.end());
+
+    struct CanonicalRange {
+        std::uint64_t address{};
+        std::uint64_t size{};
+        std::uint32_t protection{};
+        bool hle_slab{};
+    };
+    std::vector<CanonicalRange> canonical;
+    canonical.reserve(boundaries.size());
+    for (std::size_t index = 1; index < boundaries.size(); ++index) {
+        const auto begin = boundaries[index - 1];
+        const auto end = boundaries[index];
+        if (begin == end) {
+            continue;
+        }
+        std::uint32_t protection{};
+        bool hle_slab{};
+        for (const auto& mapping : mappings) {
+            if (begin >= mapping.address &&
+                end <= mapping.address + mapping.byte_count) {
+                protection |= Ps5ProtectionToPosix(mapping.protection);
+                hle_slab = hle_slab ||
+                           mapping.label == "ps5-hle-thunks";
+            }
+        }
+        if (protection == 0) {
+            continue;
+        }
+        if (!canonical.empty() &&
+            !hle_slab &&
+            canonical.back().address + canonical.back().size == begin &&
+            canonical.back().protection == protection &&
+            canonical.back().hle_slab == hle_slab) {
+            canonical.back().size += end - begin;
+        } else {
+            canonical.push_back({begin, end - begin, protection, hle_slab});
+        }
+    }
+
+    storage.segments.reserve(canonical.size());
+    storage.executable_ranges.reserve(canonical.size());
+    for (const auto& range : canonical) {
+        auto flags = Ps5FexRangeFlags(range.protection);
+        if (range.hle_slab) {
+            flags |= LSX4_FEX_RANGE_HLE_TRAMPOLINE;
+        }
+        storage.segments.push_back({
+            .address = range.address,
+            .size = range.size,
+            .range_cookie = Executor::Ps5Fex::StableRangeCookie(
+                range.address, range.size, range.protection, flags),
+            .protection = range.protection,
+            .range_flags = flags,
+        });
+        if ((flags & LSX4_FEX_RANGE_EXECUTABLE) != 0) {
+            storage.executable_ranges.push_back({
+                .address = range.address,
+                .size = range.size,
+                .range_cookie = Executor::Ps5Fex::StableRangeCookie(
+                    range.address, range.size, range.protection, flags),
+                .protection = range.protection,
+                .range_flags = flags,
+            });
+        }
+    }
+    std::ranges::sort(
+        storage.executable_ranges, {},
+        &Lsx4FexExecutableRangeV5::address);
+    for (std::size_t index = 1;
+         index < storage.executable_ranges.size(); ++index) {
+        const auto& previous = storage.executable_ranges[index - 1];
+        if (previous.address + previous.size >
+            storage.executable_ranges[index].address) {
+            error = "PS5 FEX executable ranges overlap";
+            return false;
+        }
+    }
+    storage.range_snapshot = {
+        .struct_size = sizeof(Lsx4FexExecutableRangeSnapshotV5),
+        .abi_version = LSX4_FEX_EXECUTABLE_RANGE_ABI_V5,
+        .generation = g_ps5_fex_range_generation,
+        .ranges = storage.executable_ranges.empty()
+            ? nullptr
+            : storage.executable_ranges.data(),
+        .capacity = static_cast<std::uint32_t>(
+            storage.executable_ranges.size()),
+        .range_count = static_cast<std::uint32_t>(
+            storage.executable_ranges.size()),
+        .snapshot_flags = 0,
+        .reserved = 0,
+    };
+    return true;
+}
+
+struct Ps5FexGuestMemoryLease {
+    explicit Ps5FexGuestMemoryLease(std::mutex& mutex) : lock{mutex} {}
+    std::unique_lock<std::mutex> lock;
+};
+
+std::int32_t AcquirePs5FexGuestMemoryLease(
+    void*, const std::uint64_t guest_address, const std::uint64_t size,
+    const std::uint32_t access_flags, std::uint64_t* const lease_token) {
+    constexpr std::uint32_t KnownFlags =
+        LSX4_FEX_GUEST_MEMORY_ACCESS_READ |
+        LSX4_FEX_GUEST_MEMORY_ACCESS_WRITE |
+        LSX4_FEX_GUEST_MEMORY_ACCESS_NO_HOST_REENTRY;
+    if (lease_token == nullptr || size == 0 ||
+        (access_flags & ~KnownFlags) != 0 ||
+        (access_flags & (LSX4_FEX_GUEST_MEMORY_ACCESS_READ |
+                         LSX4_FEX_GUEST_MEMORY_ACCESS_WRITE)) == 0) {
+        return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+    }
+    auto* const lease = new (std::nothrow)
+        Ps5FexGuestMemoryLease{g_runtime.mutex};
+    if (lease == nullptr) {
+        return LSX4_FEX_STATUS_BACKEND_FAILURE;
+    }
+    std::uint32_t protection{};
+    if ((access_flags & LSX4_FEX_GUEST_MEMORY_ACCESS_READ) != 0) {
+        protection |= LSX4_PS5_GUEST_READ;
+    }
+    if ((access_flags & LSX4_FEX_GUEST_MEMORY_ACCESS_WRITE) != 0) {
+        protection |= LSX4_PS5_GUEST_WRITE;
+    }
+    if (g_runtime.mappings.Find(guest_address, size, protection) == nullptr) {
+        delete lease;
+        return LSX4_FEX_STATUS_NOT_FOUND;
+    }
+    *lease_token = reinterpret_cast<std::uint64_t>(lease);
+    return LSX4_FEX_STATUS_OK;
+}
+
+void ReleasePs5FexGuestMemoryLease(
+    void*, const std::uint64_t lease_token) {
+    delete reinterpret_cast<Ps5FexGuestMemoryLease*>(lease_token);
+}
+
+void SetRuntimeStatus(std::string status);
+bool SynchronizePs5FexExecutableRangesLocked(std::string& error);
+
+std::int32_t DispatchPs5FexHle(void*, const Lsx4FexHleCallFrameV3* const call,
+                               Lsx4FexHleResultFrameV3* const result) {
+    if (call == nullptr || result == nullptr || result->struct_size < sizeof(*result) ||
+        result->abi_version != LSX4_FEX_BACKEND_ABI_V3) {
+        return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+    }
+    Lsx4::Translation::HleBridgeRequest request{};
+    if (!Executor::Ps5Fex::BuildHleBridgeRequest(*call, request)) {
+        return LSX4_FEX_STATUS_INVALID_ARGUMENT;
+    }
+    const auto previous_exit_request = std::exchange(g_ps5_fex_guest_exit_request, {});
+    try {
+        const auto value = Lsx4::Translation::InvokeRuntimeHle(request);
+        const auto exit_request =
+            std::exchange(g_ps5_fex_guest_exit_request, previous_exit_request);
+        if (g_runtime.mappings.Generation() != g_ps5_fex_published_mapping_generation) {
+            std::string range_error;
+            const std::lock_guard activation_lock{g_ps5_fex_activation_mutex};
+            if (!SynchronizePs5FexExecutableRangesLocked(range_error)) {
+                result->status = LSX4_FEX_STATUS_BACKEND_FAILURE;
+                SetRuntimeStatus("PS5 FEX HLE mapping synchronization failed: " + range_error);
+                return LSX4_FEX_STATUS_BACKEND_FAILURE;
+            }
+        }
+        const auto callbacks = SnapshotCallbacks();
+        const int fp_result_kind =
+            callbacks.hle_fp_result_kind != nullptr
+                ? callbacks.hle_fp_result_kind(callbacks.context, call->native_function)
+                : 0;
+        Executor::Ps5Fex::CompleteHleResult(*call, value, fp_result_kind, *result);
+        if (exit_request.requested) {
+            result->result_flags |= LSX4_FEX_HLE_RESULT_GUEST_EXIT;
+            result->rax = exit_request.code;
+        }
+        return LSX4_FEX_STATUS_OK;
+    } catch (...) {
+        g_ps5_fex_guest_exit_request = previous_exit_request;
+        result->status = LSX4_FEX_STATUS_BACKEND_FAILURE;
+        return LSX4_FEX_STATUS_BACKEND_FAILURE;
+    }
+}
+
+void LogPs5Fex(void*, const std::int32_t priority, const char* const component,
+               const char* const message) {
+#ifdef __ANDROID__
+    __android_log_print(priority, "LSX4-PS5-FEX", "%s: %s",
+                        component != nullptr ? component : "runtime",
+                        message != nullptr ? message : "");
+#else
+    std::fprintf(stderr, "PS5_FEX %s: %s\n", component != nullptr ? component : "runtime",
+                 message != nullptr ? message : "");
+#endif
+}
+
+void FatalPs5Fex(void*, const std::int32_t status,
+                 const char* const message) {
+#ifdef __ANDROID__
+    __android_log_print(
+        ANDROID_LOG_ERROR, "LSX4-PS5-FEX",
+        "fatal status=%d detail=%s", status,
+        message != nullptr ? message : "");
+#else
+    std::fprintf(stderr, "PS5_FEX_FATAL status=%d detail=%s\n", status,
+                 message != nullptr ? message : "");
+#endif
+}
+
+const Lsx4FexHostCallbacksV3& Ps5FexHostCallbacks() {
+    static const Lsx4FexHostCallbacksV3 callbacks{
+        .struct_size = sizeof(Lsx4FexHostCallbacksV3),
+        .abi_version = LSX4_FEX_BACKEND_ABI_V3,
+        .callback_context = nullptr,
+        .log = &LogPs5Fex,
+        .dispatch_hle = &DispatchPs5FexHle,
+        .thread_event = nullptr,
+        .fatal_error = &FatalPs5Fex,
+        .acquire_guest_memory_lease =
+            &AcquirePs5FexGuestMemoryLease,
+        .release_guest_memory_lease =
+            &ReleasePs5FexGuestMemoryLease,
+    };
+    return callbacks;
+}
+
+constexpr std::array Ps5FexOwnedSignals{
+    SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGURG};
+std::array<struct sigaction, Ps5FexOwnedSignals.size()>
+    g_ps5_fex_previous_signal_actions{};
+std::array<bool, Ps5FexOwnedSignals.size()>
+    g_ps5_fex_signal_action_installed{};
+bool g_ps5_fex_signal_handlers_prepared{};
+
+void ChainPs5FexSignal(const int signal, siginfo_t* const information,
+                       void* const raw_context,
+                       const struct sigaction& previous);
+
+void Ps5FexSignalHandler(const int signal, siginfo_t* const information,
+                         void* const raw_context) {
+    const auto* const api = Executor::Fex::ActiveApiForSignal();
+    if (api != nullptr && api->handle_host_signal != nullptr &&
+        api->handle_host_signal(api->backend_context, signal, information,
+                                raw_context) ==
+            LSX4_FEX_HOST_SIGNAL_HANDLED) {
+        return;
+    }
+    for (std::size_t index = 0;
+         index != Ps5FexOwnedSignals.size(); ++index) {
+        if (Ps5FexOwnedSignals[index] == signal) {
+            ChainPs5FexSignal(
+                signal, information, raw_context,
+                g_ps5_fex_previous_signal_actions[index]);
+            return;
+        }
+    }
+}
+
+void ChainPs5FexSignal(const int signal, siginfo_t* const information,
+                       void* const raw_context,
+                       const struct sigaction& previous) {
+    if ((previous.sa_flags & SA_SIGINFO) != 0 &&
+        previous.sa_sigaction != nullptr &&
+        previous.sa_sigaction != &Ps5FexSignalHandler) {
+        previous.sa_sigaction(signal, information, raw_context);
+        return;
+    }
+    if (previous.sa_handler == SIG_IGN) {
+        return;
+    }
+    if (previous.sa_handler != nullptr &&
+        previous.sa_handler != SIG_DFL) {
+        previous.sa_handler(signal);
+        return;
+    }
+    if (signal == SIGURG) {
+        return;
+    }
+    (void)sigaction(signal, &previous, nullptr);
+    (void)raise(signal);
+}
+
+void RollbackPs5FexSignalHandlers() {
+    if (!g_ps5_fex_signal_handlers_prepared) {
+        return;
+    }
+    for (std::size_t index = 0;
+         index != Ps5FexOwnedSignals.size(); ++index) {
+        if (g_ps5_fex_signal_action_installed[index]) {
+            (void)sigaction(
+                Ps5FexOwnedSignals[index],
+                &g_ps5_fex_previous_signal_actions[index], nullptr);
+            g_ps5_fex_signal_action_installed[index] = false;
+        }
+    }
+    g_ps5_fex_signal_handlers_prepared = false;
+}
+
+bool PreparePs5FexSignalHandlers() {
+    if (g_ps5_fex_signal_handlers_prepared) {
+        return true;
+    }
+    struct sigaction action {};
+    action.sa_sigaction = &Ps5FexSignalHandler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    for (std::size_t index = 0;
+         index != Ps5FexOwnedSignals.size(); ++index) {
+        if (sigaction(Ps5FexOwnedSignals[index], nullptr,
+                      &g_ps5_fex_previous_signal_actions[index]) != 0 ||
+            sigaction(Ps5FexOwnedSignals[index], &action, nullptr) != 0) {
+            g_ps5_fex_signal_handlers_prepared = true;
+            RollbackPs5FexSignalHandlers();
+            return false;
+        }
+        g_ps5_fex_signal_action_installed[index] = true;
+    }
+    g_ps5_fex_signal_handlers_prepared = true;
+    return true;
+}
+
+bool SynchronizePs5FexExecutableRangesLocked(std::string& error) {
+    const auto* const api = Executor::Fex::ActiveApi();
+    if (api == nullptr || api->bulk_register_executable_ranges_v5 == nullptr) {
+        error = "PS5 FEX active API is unavailable";
+        return false;
+    }
+    Ps5FexEntryStorage storage{};
+    if (!BuildPs5FexEntryStorage(storage, error)) {
+        return false;
+    }
+    if (storage.mapping_generation ==
+        g_ps5_fex_published_mapping_generation) {
+        return true;
+    }
+    const auto delta = Executor::Ps5Fex::PlanExecutableRangeUpdate(
+        g_ps5_fex_published_ranges, storage.executable_ranges);
+    const auto& removed = delta.removed;
+    const auto& added = delta.added;
+    if (removed.empty() && added.empty()) {
+        g_ps5_fex_published_mapping_generation =
+            storage.mapping_generation;
+        return true;
+    }
+    auto generation = g_ps5_fex_range_generation;
+    if (!removed.empty()) {
+        std::uint64_t next_generation{};
+        const auto status = api->invalidate_executable_ranges_v5(
+            api->backend_context, removed.data(),
+            static_cast<std::uint32_t>(removed.size()),
+            LSX4_FEX_RANGE_INVALIDATE_TRANSLATIONS |
+                LSX4_FEX_RANGE_REMOVE_REGISTRATIONS,
+            generation, &next_generation);
+        if (status != LSX4_FEX_STATUS_OK ||
+            next_generation <= generation) {
+            error = "PS5 FEX executable range invalidation failed";
+            return false;
+        }
+        generation = next_generation;
+        g_ps5_fex_range_generation = generation;
+        std::erase_if(
+            g_ps5_fex_published_ranges,
+            [&](const auto& published) {
+                return std::ranges::any_of(
+                    removed, [&](const auto& stale) {
+                        return published.address == stale.address &&
+                               published.size == stale.size &&
+                               published.range_cookie == stale.range_cookie &&
+                               published.protection == stale.protection &&
+                               published.range_flags == stale.range_flags;
+                    });
+            });
+    }
+    if (!added.empty()) {
+        std::uint64_t next_generation{};
+        const auto status = api->bulk_register_executable_ranges_v5(
+            api->backend_context, added.data(),
+            static_cast<std::uint32_t>(added.size()), generation,
+            &next_generation);
+        if (status != LSX4_FEX_STATUS_OK ||
+            next_generation <= generation) {
+            error = "PS5 FEX executable range registration failed";
+            return false;
+        }
+        generation = next_generation;
+        g_ps5_fex_range_generation = generation;
+        g_ps5_fex_published_ranges.insert(
+            g_ps5_fex_published_ranges.end(), added.begin(), added.end());
+        std::ranges::sort(
+            g_ps5_fex_published_ranges, {},
+            &Lsx4FexExecutableRangeV5::address);
+    }
+    g_ps5_fex_published_mapping_generation =
+        storage.mapping_generation;
+    return true;
+}
+
+bool EnsurePs5FexActive(std::string& error) {
+    std::lock_guard activation_lock{g_ps5_fex_activation_mutex};
+    {
+        const std::lock_guard runtime_lock{g_runtime.mutex};
+        if (EnsureHleSlabLocked() == 0) {
+            error = "PS5 FEX HLE slab allocation failed";
+            return false;
+        }
+    }
+    if (Executor::Fex::ActiveApi() != nullptr) {
+        return SynchronizePs5FexExecutableRangesLocked(error);
+    }
+    const auto loader = Executor::Fex::Status();
+    if (loader.state != Executor::Fex::LoaderState::Configured) {
+        error = loader.error.empty()
+            ? "PS5 FEX loader is not configured"
+            : loader.error;
+        return false;
+    }
+    Ps5FexEntryStorage storage{};
+    if (!BuildPs5FexEntryStorage(storage, error)) {
+        return false;
+    }
+    if (!PreparePs5FexSignalHandlers()) {
+        error = "PS5 FEX signal handler preparation failed";
+        return false;
+    }
+    if (!Executor::Fex::StageActivation(
+            Ps5FexHostCallbacks(), &storage.range_snapshot)) {
+        const auto failed = Executor::Fex::Status();
+        error = failed.error.empty()
+            ? "PS5 FEX activation failed"
+            : failed.error;
+        RollbackPs5FexSignalHandlers();
+        return false;
+    }
+    if (!Executor::Fex::CommitActivation() ||
+        Executor::Fex::ActiveApiForSignal() == nullptr) {
+        error = "PS5 FEX activation commit failed";
+        RollbackPs5FexSignalHandlers();
+        return false;
+    }
+    g_ps5_fex_published_ranges = storage.executable_ranges;
+    g_ps5_fex_range_generation = storage.range_snapshot.generation;
+    g_ps5_fex_published_mapping_generation =
+        storage.mapping_generation;
+    return true;
+}
+
+void ReleasePs5FexGuestThread(const std::uint64_t guest_thread) {
+    const auto* const api = Executor::Fex::ActiveApi();
+    if (guest_thread == 0 || api == nullptr ||
+        api->release_guest_thread == nullptr) {
+        return;
+    }
+    Lsx4FexThreadIdentityV3 identity{
+        .struct_size = sizeof(Lsx4FexThreadIdentityV3),
+        .abi_version = LSX4_FEX_BACKEND_ABI_V3,
+        .guest_thread = guest_thread,
+    };
+    (void)api->release_guest_thread(api->backend_context, &identity);
+}
+
+bool InvalidateAllPs5FexExecutableRanges() {
+    std::lock_guard activation_lock{g_ps5_fex_activation_mutex};
+    const auto* const api = Executor::Fex::ActiveApi();
+    if (api == nullptr || g_ps5_fex_published_ranges.empty()) {
+        g_ps5_fex_published_ranges.clear();
+        g_ps5_fex_published_mapping_generation = 0;
+        return true;
+    }
+    std::uint64_t next_generation{};
+    const auto status = api->invalidate_executable_ranges_v5(
+        api->backend_context, g_ps5_fex_published_ranges.data(),
+        static_cast<std::uint32_t>(g_ps5_fex_published_ranges.size()),
+        LSX4_FEX_RANGE_INVALIDATE_TRANSLATIONS |
+            LSX4_FEX_RANGE_REMOVE_REGISTRATIONS,
+        g_ps5_fex_range_generation, &next_generation);
+    if (status != LSX4_FEX_STATUS_OK) {
+        return false;
+    }
+    g_ps5_fex_published_ranges.clear();
+    g_ps5_fex_range_generation = next_generation;
+    g_ps5_fex_published_mapping_generation = 0;
+    return true;
+}
+
+bool ExecutePs5FexGuest(const Lsx4Ps5GuestEntry& entry,
+                        const std::uint64_t execution_thread_handle,
+                        const std::uint64_t pthread_handle,
+                        Lsx4Ps5GuestResult& output,
+                        std::string& error) {
+    if (entry.argument_count > LSX4_FEX_HLE_GPR_ARGUMENT_COUNT) {
+        error = "PS5 FEX entry has unsupported stack arguments";
+        return false;
+    }
+    if (!EnsurePs5FexActive(error)) {
+        return false;
+    }
+    const auto* const api = Executor::Fex::ActiveApi();
+    if (api == nullptr || api->bind_host_thread == nullptr ||
+        api->set_guest_tls == nullptr ||
+        api->run_guest_callback == nullptr ||
+        api->unbind_host_thread == nullptr) {
+        error = "PS5 FEX active API is incomplete";
+        return false;
+    }
+
+    const bool nested = g_ps5_fex_bound_depth != 0;
+    std::uint64_t guest_rsp{};
+    struct AutomaticGuestStack final {
+        Executor::Jit::LsxStackLease lease{};
+
+        ~AutomaticGuestStack() {
+            Executor::Jit::ReturnGuestStackWindow(lease);
+        }
+    } automatic_stack;
+    if (entry.stack_base != 0 || entry.stack_size != 0) {
+        if (entry.stack_base == 0 || entry.stack_size < 0x4000 ||
+            entry.stack_base > UINT64_MAX - entry.stack_size) {
+            error = "PS5 FEX entry stack geometry is invalid";
+            return false;
+        }
+        {
+            const std::lock_guard lock{g_runtime.mutex};
+            if (!HasAccessLocked(
+                    entry.stack_base, entry.stack_size,
+                    LSX4_PS5_GUEST_READ | LSX4_PS5_GUEST_WRITE)) {
+                error = "PS5 FEX entry stack is not registered read/write";
+                return false;
+            }
+        }
+        const auto aligned_stack_top =
+            (entry.stack_base + entry.stack_size) & ~UINT64_C(15);
+        if (!nested) {
+            guest_rsp = aligned_stack_top - sizeof(std::uint64_t);
+        }
+    }
+    if (!nested && guest_rsp == 0) {
+
+
+
+
+
+
+        automatic_stack.lease =
+            Executor::Jit::BorrowGuestStackWindow();
+        const auto aligned_stack_top =
+            automatic_stack.lease.current_sp & ~UINT64_C(15);
+        if (aligned_stack_top <
+            automatic_stack.lease.stack_low + 2 * sizeof(std::uint64_t)) {
+            error = "PS5 FEX automatic guest stack is too small";
+            return false;
+        }
+        guest_rsp = aligned_stack_top - sizeof(std::uint64_t);
+    }
+
+    const std::uint64_t guest_thread = execution_thread_handle != 0
+        ? execution_thread_handle
+        : (entry.fs_base != 0
+               ? entry.fs_base
+               : UINT64_C(0x5053350000000001));
+    if (nested &&
+        (g_ps5_fex_bound_guest_thread != guest_thread ||
+         g_ps5_fex_bound_fs_base != entry.fs_base)) {
+        error = "PS5 FEX nested entry changed guest thread identity";
+        return false;
+    }
+
+    Lsx4FexThreadIdentityV3 identity{
+        .struct_size = sizeof(Lsx4FexThreadIdentityV3),
+        .abi_version = LSX4_FEX_BACKEND_ABI_V3,
+        .guest_thread = guest_thread,
+        .pthread_handle = pthread_handle,
+        .host_tid = static_cast<std::int64_t>(syscall(SYS_gettid)),
+        .backend_thread = 0,
+    };
+    if (!nested) {
+        const auto bind_status = api->bind_host_thread(
+            api->backend_context, &identity);
+        if (bind_status != LSX4_FEX_STATUS_OK) {
+            error = "PS5 FEX host-thread bind failed";
+            return false;
+        }
+        Lsx4FexGuestTlsStateV3 tls{
+            .struct_size = sizeof(Lsx4FexGuestTlsStateV3),
+            .abi_version = LSX4_FEX_BACKEND_ABI_V3,
+            .target = {
+                .struct_size = sizeof(Lsx4FexThreadIdentityV3),
+                .abi_version = LSX4_FEX_BACKEND_ABI_V3,
+                .guest_thread = guest_thread,
+            },
+            .fs_base = entry.fs_base,
+            .gs_base = entry.fs_base,
+            .tcb_base = entry.fs_base,
+            .tls_image_address = 0,
+            .tls_image_size = 0,
+            .tls_module_id = 0,
+            .tls_flags = 0,
+            .reserved = 0,
+        };
+        if (api->set_guest_tls(api->backend_context, &tls) !=
+            LSX4_FEX_STATUS_OK) {
+            (void)api->unbind_host_thread(api->backend_context);
+            error = "PS5 FEX guest TLS bind failed";
+            return false;
+        }
+        g_ps5_fex_bound_guest_thread = guest_thread;
+        g_ps5_fex_bound_fs_base = entry.fs_base;
+    }
+
+    Lsx4FexGuestCallbackRequestV3 request{};
+    request.struct_size = sizeof(request);
+    request.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+    request.callback_id =
+        g_ps5_fex_callback_id.fetch_add(1, std::memory_order_relaxed);
+    if (request.callback_id == 0) {
+        request.callback_id =
+            g_ps5_fex_callback_id.fetch_add(1, std::memory_order_relaxed);
+    }
+    request.guest_function = entry.address;
+    request.guest_rsp = guest_rsp;
+    std::copy_n(entry.arguments, entry.argument_count, request.gpr);
+
+    Lsx4FexGuestCallbackResultV3 callback_result{};
+    callback_result.struct_size = sizeof(callback_result);
+    callback_result.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+    callback_result.call_id = request.callback_id;
+    ++g_ps5_fex_bound_depth;
+    const auto call_status = api->run_guest_callback(
+        api->backend_context, &request, &callback_result);
+    --g_ps5_fex_bound_depth;
+
+    int unbind_status = LSX4_FEX_STATUS_OK;
+    if (!nested) {
+        g_ps5_fex_bound_guest_thread = 0;
+        g_ps5_fex_bound_fs_base = 0;
+        unbind_status = api->unbind_host_thread(api->backend_context);
+    }
+    if (call_status != LSX4_FEX_STATUS_OK ||
+        callback_result.status != LSX4_FEX_STATUS_OK ||
+        callback_result.call_id != request.callback_id ||
+        (callback_result.result_flags &
+         ~LSX4_FEX_HLE_RESULT_GUEST_EXIT) != 0 ||
+        unbind_status != LSX4_FEX_STATUS_OK) {
+        std::ostringstream detail;
+        detail << "PS5 FEX guest callback failed: call=" << call_status
+               << " result=" << callback_result.status
+               << " request-id=" << request.callback_id
+               << " result-id=" << callback_result.call_id
+               << " flags=0x" << std::hex << callback_result.result_flags
+               << std::dec << " unbind=" << unbind_status
+               << " guest-rip=0x" << std::hex << entry.address
+               << " guest-rsp=0x" << guest_rsp;
+        error = detail.str();
+        return false;
+    }
+    output.value = callback_result.rax;
+    if (nested &&
+        (callback_result.result_flags &
+         LSX4_FEX_HLE_RESULT_GUEST_EXIT) != 0) {
+        g_ps5_fex_guest_exit_request = {
+            .requested = true,
+            .code = callback_result.rax,
+        };
     }
     return true;
 }
@@ -6444,10 +7333,10 @@ bool TryAgcTextureSourceProbe(
         return false;
     }
 
-    // GameMaker reuses the same GPU allocation for unrelated texture pages
-    // across rooms. Sparse probes can miss those atlas updates completely,
-    // leaving menu/title data visible in gameplay. Hash the whole source,
-    // but only periodically at the cache call site below.
+
+
+
+
     constexpr std::size_t ProbeBytes = 64u * 1024u;
     static thread_local std::vector<std::uint8_t> sample;
     sample.resize(static_cast<std::size_t>(
@@ -9066,11 +9955,11 @@ bool TryCompositeAgcCpuDraw(
         gpu_draw.texture_height = draw.texture_height;
         gpu_draw.instance_count = draw.instance_count;
         gpu_draw.require_target_source = target_source;
-        // SharpEmu/AGC defines CB_BLEND_CONTROL.ENABLE at bit 30.
-        // The factor fields remain populated while blending is disabled
-        // (notably 0x25040504 on GameMaker render-target copies), so using
-        // SRC_BLEND==0 as the enable test incorrectly alpha-composites the
-        // final surface over its previous contents.
+
+
+
+
+
         const auto blend_enabled =
             ((draw.cx_blend0_control >> 30u) & 1u) != 0u;
         const auto color_source_factor =
@@ -9103,9 +9992,9 @@ bool TryCompositeAgcCpuDraw(
                 blend_enabled && color_source_factor == 1u &&
                 color_destination_factor == 1u;
         } else {
-            // Preserve the pre-GameMaker path used by the first PS5 title.
-            // Its 0x60040008 pass keeps populated blend fields with a
-            // destination factor of zero and must not become an opaque draw.
+
+
+
             gpu_draw.opaque =
                 (draw.cx_blend0_control & UINT32_C(0x1f)) == 0u;
             gpu_draw.premultiplied_alpha =
@@ -10839,6 +11728,14 @@ void StartGuestVblankThreadLocked() {
         constexpr auto Period = std::chrono::microseconds(16667);
         while (!g_runtime.shutdown_requested.load(
             std::memory_order_acquire)) {
+            if (WaitForRuntimeResume()) {
+
+                next = std::chrono::steady_clock::now();
+            }
+            if (g_runtime.shutdown_requested.load(
+                    std::memory_order_acquire)) {
+                break;
+            }
             next += Period;
             std::this_thread::sleep_until(next);
             bool notify{};
@@ -11065,11 +11962,11 @@ void ObserveAgcFlip(const std::int32_t handle,
         ? port.buffer_addresses[
               static_cast<std::size_t>(buffer_index)]
         : 0u;
-    // A degenerate diagnostic draw must not hide the real scanout buffer.
-    // Large titles can emit a one-pixel setup primitive before their actual
-    // display pass; treating it as a complete software frame produces an
-    // indefinitely black image even though the registered VideoOut buffer is
-    // being updated.
+
+
+
+
+
     if (cpu_frame != nullptr &&
         cpu_frame->covered_pixels <= 4u &&
         cpu_frame->rendered_draws <= 3u) {
@@ -11428,12 +12325,6 @@ bool TryAgcDriverSubmitDcb(
     if (cpu_texture_cache_epoch != runtime_texture_cache_epoch) {
         cpu_texture_cache.clear();
         cpu_texture_cache_epoch = runtime_texture_cache_epoch;
-    }
-    if (!Ps5ManagedOptimizationEnabled(7) &&
-        !cpu_texture_cache.empty()) {
-        cpu_texture_cache.clear();
-        g_ps5_readback_cache_resets.fetch_add(
-            1u, std::memory_order_relaxed);
     }
     if (gen5_route_epoch != runtime_texture_cache_epoch) {
         gen5_only_shader_pairs.clear();
@@ -12049,8 +12940,8 @@ skip_packet_diagnostic_log:
                 TryReadGuestValue(
                     packet_address + 12u, address_high) &&
                 (base_index & 0xfu) == 1u) {
-                // libSceAgc encodes Gnmp::ShaderType in PM4 header bit 1:
-                // zero is draw, one is dispatch.
+
+
                 const auto shader_type = (header >> 1u) & 0x3u;
                 if (shader_type == 1u) {
                     dispatch_indirect_args_base =
@@ -12098,15 +12989,15 @@ skip_packet_diagnostic_log:
                 std::uint32_t initiator{};
                 if (opcode == AgcItDispatchIndirect) {
                     if (length >= 4u) {
-                        // ACB packet: absolute 64-bit argument address.
+
                         (void)TryReadGuestValue(
                             packet_address + 4u,
                             dimensions_address);
                         (void)TryReadGuestValue(
                             packet_address + 12u, initiator);
                     } else {
-                        // DCB packet: 32-bit byte offset from the
-                        // dispatch argument base established by SET_BASE.
+
+
                         std::uint32_t data_offset{};
                         (void)TryReadGuestValue(
                             packet_address + 4u, data_offset);
@@ -13985,9 +14876,7 @@ skip_packet_diagnostic_log:
                         draw.render_target_address;
                     const auto prior_draws =
                         accumulated->gpu_frame->draws.size();
-                    const bool delta_frame =
-                        Ps5ManagedOptimizationEnabled(8) &&
-                        prior_draws != 0u;
+                    const bool delta_frame = prior_draws != 0u;
                     accumulated->gpu_frame->base_batch_id =
                         delta_frame
                         ? accumulated->gpu_frame->batch_id
@@ -13996,15 +14885,13 @@ skip_packet_diagnostic_log:
                         delta_frame ? prior_draws : 0u;
                     accumulated->gpu_frame->preserve_target =
                         delta_frame;
-                    if (delta_frame) {
+                    if (delta_frame &&
+                        Ps5ManagedOptimizationEnabled(8)) {
                         g_ps5_driver_delta_frames.fetch_add(
                             1u, std::memory_order_relaxed);
                         g_ps5_driver_draws_elided.fetch_add(
                             prior_draws,
                             std::memory_order_relaxed);
-                    } else if (prior_draws != 0u) {
-                        g_ps5_driver_full_replays.fetch_add(
-                            1u, std::memory_order_relaxed);
                     }
                 }
                 cpu_frame = std::move(accumulated);
@@ -14209,9 +15096,9 @@ skip_packet_diagnostic_log:
                 snapshots.emplace_back(begin, end);
             }
         }
-        // Capture every source range into the single submit snapshot before
-        // publishing any DMA destination.  Overlapping guest copies therefore
-        // retain GPU DMA/memmove semantics without a second vector snapshot.
+
+
+
         for (const auto [begin, end] : snapshots) {
             if (g_active_submit_resource_snapshot == nullptr ||
                 end <= begin ||
@@ -14412,9 +15299,9 @@ skip_packet_diagnostic_log:
                             return draw.extended_blend_contract;
                         });
                 if (!extended_frame) {
-                    // The original single-pass contract publishes only the
-                    // completed final blit below. Publishing its intermediate
-                    // display surfaces exposes alternating partial frames.
+
+
+
                     continue;
                 }
                 const auto incoming_complete =
@@ -15483,7 +16370,7 @@ bool TryGuestMutexOperation(
             }
         }
         result = 0;
-        (void)Lsx4::Translation::CompleteCurrentGuestExecution(0);
+        (void)CompletePs5GuestExecution(0);
         return true;
     }
     if (symbol == "tn3VlD0hG60" ||
@@ -15613,7 +16500,7 @@ bool TryGuestSemaphoreOperation(
                 std::memory_order_acquire)) {
             lock.unlock();
             result = 0;
-            (void)Lsx4::Translation::CompleteCurrentGuestExecution(0);
+            (void)CompletePs5GuestExecution(0);
             return true;
         }
         if (semaphore->deleted ||
@@ -15895,7 +16782,7 @@ bool TryGuestConditionVariableOperation(
 
     if (!ReacquireGuestMutex(guest_mutex)) {
         result = 0;
-        (void)Lsx4::Translation::CompleteCurrentGuestExecution(0);
+        (void)CompletePs5GuestExecution(0);
         return true;
     }
     result = signaled ? 0 : OrbisError(TimedOut);
@@ -16452,10 +17339,10 @@ bool TryHandleGuestFiber(
                    argument_on_run, next)) {
         return fail(ErrorInvalid);
     }
-    // Fibers may migrate between PS5 job-worker threads.  The saved CPU
-    // continuation belongs to the fiber, while FS/GS belong to the thread
-    // executing it (native setjmp/longjmp does not replace kernel TLS).
-    // Preserve the destination worker's segment origins on every transfer.
+
+
+
+
     if (const auto current =
             Lsx4::Translation::PublishedLiveState()) {
         next.fs_origin = current.ReadScalar(
@@ -16791,9 +17678,9 @@ bool TryHandleGuestEventFlag(
     }
 #endif
 
-    // PS5 job-system flags are commonly set a few microseconds after the
-    // waiter reaches this point.  A short adaptive spin avoids a kernel
-    // futex sleep plus a producer-side futex wake for those hand-offs.
+
+
+
     if (timeout_output == 0 || timeout_microseconds >= 50u) {
         for (std::uint32_t spin = 0; spin < 192u; ++spin) {
 #if defined(__aarch64__) || defined(__arm__)
@@ -17945,9 +18832,9 @@ bool TryReadGameMakerTransform(
                     })) {
                 return false;
             }
-            // GameMaker supplies a conventional column-major perspective
-            // projection followed by a view matrix. Validate the contract,
-            // not title-specific values.
+
+
+
             return candidate[0] > 0.01f &&
                 candidate[0] < 100.0f &&
                 candidate[5] > 0.01f &&
@@ -18471,7 +19358,7 @@ bool TryInvokeBuiltinHle(
     if (g_runtime.shutdown_requested.load(
             std::memory_order_acquire)) {
         result = 0;
-        (void)Lsx4::Translation::CompleteCurrentGuestExecution(0);
+        (void)CompletePs5GuestExecution(0);
         return true;
     }
     struct NegativeDispatchCache {
@@ -18493,9 +19380,9 @@ bool TryInvokeBuiltinHle(
         return false;
     }
     const auto symbol = HleSymbol(request.function);
-    // These are the dominant per-draw AGC calls. Keep them ahead of the
-    // general compatibility dispatcher so every draw doesn't scan hundreds
-    // of unrelated NIDs before reaching the AGC block near its tail.
+
+
+
     if (symbol == "V++UgBtQhn0") {
         return TryAgcGetDataPacketPayload(request, result);
     }
@@ -18583,9 +19470,9 @@ bool TryInvokeBuiltinHle(
         return true;
     }
     if (symbol == "lQOCF84lvzw") {
-        // Match the offline PS4 contract. Reporting success without an
-        // HTTP response leaves the title's response factory uninitialized
-        // and it later calls a null interface method.
+
+
+
         result = OrbisError(UINT32_C(0x80553407));
         return true;
     }
@@ -18704,8 +19591,8 @@ bool TryInvokeBuiltinHle(
         return true;
     }
     if (symbol == "T72hz6ffq08") {
-        // Release the host core for a guest yield. Returning immediately
-        // turns idle guest worker loops into mobile-CPU busy loops.
+
+
         std::this_thread::sleep_for(std::chrono::microseconds(50));
         result = 0;
         return true;
@@ -19014,7 +19901,7 @@ bool TryInvokeBuiltinHle(
             static_cast<unsigned long long>(result),
             static_cast<unsigned long long>(request.guest_stack));
 #endif
-        (void)Lsx4::Translation::CompleteCurrentGuestExecution(result);
+        (void)CompletePs5GuestExecution(result);
         return true;
     }
     if (symbol == "tIhsqj0qsFE") {
@@ -19390,9 +20277,9 @@ bool TryInvokeBuiltinHle(
             std::this_thread::sleep_for(
                 std::chrono::microseconds(microseconds));
         } else {
-            // Android's sched_yield keeps large guest worker pools runnable
-            // and can starve the render thread. A short timed park preserves
-            // zero-delay semantics while releasing a core to the main guest.
+
+
+
             std::this_thread::sleep_for(
                 std::chrono::microseconds(50));
         }
@@ -21354,7 +22241,7 @@ bool TryInvokeBuiltinHle(
         result = 0;
         if (g_runtime.shutdown_requested.load(
                 std::memory_order_acquire)) {
-            (void)Lsx4::Translation::CompleteCurrentGuestExecution(0);
+            (void)CompletePs5GuestExecution(0);
         }
         return true;
     }
@@ -21375,7 +22262,7 @@ bool TryInvokeBuiltinHle(
             static_cast<unsigned long long>(result),
             static_cast<unsigned long long>(request.guest_stack));
 #endif
-        (void)Lsx4::Translation::CompleteCurrentGuestExecution(result);
+        (void)CompletePs5GuestExecution(result);
         return true;
     }
     if (symbol == "pO96TwzOm5E") {
@@ -22109,9 +22996,237 @@ extern "C" int executor_lsx4_ps5_runtime_set_pad_axis(
     return LSX4_PS5_EXECUTE_OK;
 }
 
+extern "C" int executor_lsx4_ps5_runtime_set_guest_cpu_backend(
+    const int requested_backend, const char* const adapter_path,
+    const char* const runtime_root) {
+    const auto requested = requested_backend == 1
+        ? Ps5GuestCpuBackend::FexExperimental
+        : Ps5GuestCpuBackend::Current;
+    std::lock_guard lock{g_guest_cpu_backend_mutex};
+    g_requested_guest_cpu_backend.store(requested,
+                                        std::memory_order_release);
+    const auto effective = g_effective_guest_cpu_backend.load(
+        std::memory_order_acquire);
+    if (g_guest_cpu_backend_selection_locked.load(
+            std::memory_order_acquire)) {
+        if (requested != effective) {
+            g_guest_cpu_backend_supported = false;
+            g_guest_cpu_backend_fallback_reason = "late-change";
+        }
+        RefreshGuestCpuBackendStatusLocked();
+        return static_cast<int>(effective);
+    }
+
+    const auto loader = Executor::Fex::Status();
+    if (requested == Ps5GuestCpuBackend::Current) {
+        if (loader.state == Executor::Fex::LoaderState::ActivationStaged ||
+            loader.state == Executor::Fex::LoaderState::Active ||
+            loader.state ==
+                Executor::Fex::LoaderState::ActivationStranded) {
+            g_effective_guest_cpu_backend.store(
+                Ps5GuestCpuBackend::FexExperimental,
+                std::memory_order_release);
+            g_guest_cpu_backend_supported = false;
+            g_guest_cpu_backend_fallback_reason =
+                "fex-process-lifetime-restart-required";
+            RefreshGuestCpuBackendStatusLocked();
+            return static_cast<int>(
+                Ps5GuestCpuBackend::FexExperimental);
+        }
+        g_effective_guest_cpu_backend.store(
+            Ps5GuestCpuBackend::Current, std::memory_order_release);
+        g_guest_cpu_backend_supported = true;
+        g_guest_cpu_backend_fallback_reason = "none";
+        RefreshGuestCpuBackendStatusLocked();
+        return static_cast<int>(Ps5GuestCpuBackend::Current);
+    }
+
+    const std::filesystem::path adapter =
+        adapter_path != nullptr ? adapter_path : "";
+    const std::filesystem::path root =
+        runtime_root != nullptr ? runtime_root : "";
+    std::error_code filesystem_error;
+    if (adapter.empty() ||
+        !std::filesystem::is_regular_file(adapter, filesystem_error)) {
+        g_effective_guest_cpu_backend.store(
+            Ps5GuestCpuBackend::Current, std::memory_order_release);
+        g_guest_cpu_backend_supported = false;
+        g_guest_cpu_backend_fallback_reason = "adapter-missing";
+        RefreshGuestCpuBackendStatusLocked();
+        return static_cast<int>(Ps5GuestCpuBackend::Current);
+    }
+    if (root.empty()) {
+        g_effective_guest_cpu_backend.store(
+            Ps5GuestCpuBackend::Current, std::memory_order_release);
+        g_guest_cpu_backend_supported = false;
+        g_guest_cpu_backend_fallback_reason = "invalid-request";
+        RefreshGuestCpuBackendStatusLocked();
+        return static_cast<int>(Ps5GuestCpuBackend::Current);
+    }
+
+    const auto& host = Executor::Jit::GetHostIsaProfile();
+    Executor::Fex::PreflightRequest preflight{};
+    preflight.adapter_path = adapter.string();
+    preflight.runtime_root = root.string();
+    preflight.host_build_id = "lsx4-ps5-runtime-abi7";
+    preflight.platform_mask = LSX4_FEX_PLATFORM_PS5;
+    preflight.guest_cpu_profile =
+        Executor::Fex::GuestCpuProfileKind::Ps5Zen2;
+    if (!Executor::Jit::HostFlagMEnabled()) {
+        preflight.host_isa_feature_mask &=
+            ~(LSX4_FEX_HOST_ISA_FLAGM | LSX4_FEX_HOST_ISA_FLAGM2);
+    }
+    if (!Executor::Jit::HostRcpcEnabled()) {
+        preflight.host_isa_feature_mask &=
+            ~(LSX4_FEX_HOST_ISA_LRCPC | LSX4_FEX_HOST_ISA_ILRCPC |
+              LSX4_FEX_HOST_ISA_LRCPC3);
+    }
+    if (!Executor::Jit::HostSve2EnabledForWidth(16)) {
+        preflight.host_isa_feature_mask &=
+            ~(LSX4_FEX_HOST_ISA_SVE | LSX4_FEX_HOST_ISA_SVE2);
+        preflight.host_os_feature_mask &=
+            ~LSX4_FEX_HOST_OS_SVE_CONTEXT;
+        preflight.max_sve_vector_bytes = 0;
+    } else {
+        preflight.max_sve_vector_bytes = host.sve_vector_bytes;
+    }
+    preflight.host_isa_feature_mask &=
+        ~(LSX4_FEX_HOST_ISA_FCMA | LSX4_FEX_HOST_ISA_FRINTTS |
+          LSX4_FEX_HOST_ISA_ECV);
+    const auto effective_host_isa =
+        host.features & preflight.host_isa_feature_mask;
+    preflight.cache_namespace =
+        Executor::Fex::BuildPlatformCacheNamespace(
+            "fex-2608", preflight.platform_mask,
+            preflight.guest_cpu_profile, 1, effective_host_isa,
+            preflight.max_sve_vector_bytes);
+    if (preflight.cache_namespace.empty()) {
+        g_effective_guest_cpu_backend.store(
+            Ps5GuestCpuBackend::Current, std::memory_order_release);
+        g_guest_cpu_backend_supported = false;
+        g_guest_cpu_backend_fallback_reason =
+            "invalid-platform-cache-namespace";
+        RefreshGuestCpuBackendStatusLocked();
+        return static_cast<int>(Ps5GuestCpuBackend::Current);
+    }
+    if (!Executor::Fex::Preflight(preflight)) {
+        const auto failed = Executor::Fex::Status();
+        if (failed.state ==
+            Executor::Fex::LoaderState::ActivationStranded) {
+            g_effective_guest_cpu_backend.store(
+                Ps5GuestCpuBackend::FexExperimental,
+                std::memory_order_release);
+            g_guest_cpu_backend_fallback_reason =
+                "fex-activation-stranded-restart-required";
+        } else {
+            g_effective_guest_cpu_backend.store(
+                Ps5GuestCpuBackend::Current,
+                std::memory_order_release);
+            g_guest_cpu_backend_fallback_reason = failed.error.empty()
+                ? "adapter-preflight-failed"
+                : failed.error;
+        }
+        g_guest_cpu_backend_supported = false;
+        RefreshGuestCpuBackendStatusLocked();
+        return static_cast<int>(
+            g_effective_guest_cpu_backend.load(
+                std::memory_order_acquire));
+    }
+    g_effective_guest_cpu_backend.store(
+        Ps5GuestCpuBackend::FexExperimental,
+        std::memory_order_release);
+    g_guest_cpu_backend_supported = true;
+    g_guest_cpu_backend_fallback_reason = "none";
+    RefreshGuestCpuBackendStatusLocked();
+    return static_cast<int>(Ps5GuestCpuBackend::FexExperimental);
+}
+
+extern "C" const char*
+executor_lsx4_ps5_runtime_guest_cpu_backend_status() {
+    static thread_local std::string snapshot;
+    std::lock_guard lock{g_guest_cpu_backend_mutex};
+    RefreshGuestCpuBackendStatusLocked();
+    snapshot = g_guest_cpu_backend_status;
+    return snapshot.c_str();
+}
+
+extern "C" void executor_lsx4_ps5_runtime_wait_if_paused() noexcept {
+    (void)WaitForRuntimeResume();
+}
+
+extern "C" int executor_lsx4_ps5_runtime_set_paused(const int paused) {
+    const bool requested = paused != 0;
+
+
+    if (requested) {
+        Lsx4::Ps5Desktop::SetPs5AudioSessionPaused(true);
+    }
+    {
+        const std::lock_guard lock{g_runtime_pause_mutex};
+        const bool current =
+            g_runtime_pause_requested.load(std::memory_order_relaxed);
+        if (current == requested) {
+            g_runtime_pause_idempotent.fetch_add(
+                1u, std::memory_order_relaxed);
+            return 0;
+        }
+        g_runtime_pause_requested.store(
+            requested, std::memory_order_release);
+        if (requested) {
+            g_runtime_pause_transitions.fetch_add(
+                1u, std::memory_order_relaxed);
+        } else {
+            g_runtime_resume_transitions.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+    }
+    if (!requested) {
+        g_runtime_pause_changed.notify_all();
+        Lsx4::Ps5Desktop::SetPs5AudioSessionPaused(false);
+    }
+    return 0;
+}
+
+extern "C" const char* executor_lsx4_ps5_runtime_lifecycle_status() {
+    static thread_local std::string snapshot;
+    const auto backend = g_effective_guest_cpu_backend.load(
+        std::memory_order_acquire);
+    std::ostringstream out;
+    out << "{"
+        << R"("schema":"lsx4.runtime-lifecycle.v1",)"
+        << R"("platform":"ps5",)"
+        << R"("backend":")"
+        << Ps5GuestCpuBackendName(backend)
+        << R"(","supported":true,"preemptive":false,"coverage":")"
+        << (backend == Ps5GuestCpuBackend::FexExperimental
+                ? "entry-vblank-hle"
+                : "entry-vblank-sparse-jit-safepoint")
+        << R"(",)"
+        << R"("requested":)"
+        << (g_runtime_pause_requested.load(
+                std::memory_order_acquire)
+                ? "true" : "false")
+        << R"(,"parkedThreads":)"
+        << g_runtime_pause_parked.load(std::memory_order_relaxed)
+        << R"(,"waits":)"
+        << g_runtime_pause_waits.load(std::memory_order_relaxed)
+        << R"(,"pauseTransitions":)"
+        << g_runtime_pause_transitions.load(
+               std::memory_order_relaxed)
+        << R"(,"resumeTransitions":)"
+        << g_runtime_resume_transitions.load(
+               std::memory_order_relaxed)
+        << R"(,"idempotentTransitions":)"
+        << g_runtime_pause_idempotent.load(
+               std::memory_order_relaxed)
+        << "}";
+    snapshot = out.str();
+    return snapshot.c_str();
+}
+
 extern "C" int executor_lsx4_ps5_runtime_hud_stats(
     std::uint64_t* const values, const std::size_t value_count) {
-    constexpr std::size_t ValueCount = 92u;
+    constexpr std::size_t ValueCount = 99u;
     if (values == nullptr || value_count < ValueCount) {
         return -1;
     }
@@ -22124,7 +23239,39 @@ extern "C" int executor_lsx4_ps5_runtime_hud_stats(
         draw_count = g_runtime.agc_draw_count;
         submit_count = g_runtime.agc_submit_count;
     }
-    values[0] = cpu.decoded_regions;
+    const Lsx4FexBackendApiV3* const fex_api = Executor::Fex::ActiveApi();
+    std::uint64_t translated_blocks = cpu.decoded_regions;
+    std::uint64_t fex_code_cache_generation{};
+    std::uint64_t fex_code_cache_current_segments{};
+    std::uint64_t fex_code_cache_used_bytes{};
+    std::uint64_t fex_code_cache_capacity_bytes{};
+    std::uint64_t fex_jit_compilations{};
+    std::uint64_t fex_jit_compile_time_ns{};
+    if (fex_api != nullptr && fex_api->query != nullptr) {
+        Lsx4FexQueryRequestV3 request{};
+        request.struct_size = sizeof(request);
+        request.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+        request.request_cookie = UINT64_C(0x5053354645580001);
+        Lsx4FexQueryResultV3 result{};
+        result.struct_size = sizeof(result);
+        result.abi_version = LSX4_FEX_BACKEND_ABI_V3;
+        result.request_cookie = request.request_cookie;
+        const std::int32_t status =
+            fex_api->query(fex_api->backend_context, &request, &result);
+        if (status == LSX4_FEX_STATUS_OK &&
+            result.status == LSX4_FEX_STATUS_OK &&
+            result.struct_size >= sizeof(result) &&
+            result.request_cookie == request.request_cookie) {
+            translated_blocks = result.published_executable_blocks;
+            fex_code_cache_generation = result.code_cache_generation;
+            fex_code_cache_current_segments = result.code_cache_current_segments;
+            fex_code_cache_used_bytes = result.code_cache_used_bytes;
+            fex_code_cache_capacity_bytes = result.code_cache_capacity_bytes;
+            fex_jit_compilations = result.jit_compilations;
+            fex_jit_compile_time_ns = result.jit_compile_time_ns;
+        }
+    }
+    values[0] = translated_blocks;
     values[1] = cpu.native_regions;
     values[2] = cpu.semantic_regions;
     values[3] = cpu.unsupported_regions;
@@ -22271,6 +23418,13 @@ extern "C" int executor_lsx4_ps5_runtime_hud_stats(
     values[89] = cpu.tier1_loop_osr_handoffs;
     values[90] = cpu.tier1_compile_time_us;
     values[91] = cpu.tier1_generated_bytes;
+    values[92] = fex_api != nullptr ? 1u : 0u;
+    values[93] = fex_code_cache_generation;
+    values[94] = fex_code_cache_current_segments;
+    values[95] = fex_code_cache_used_bytes;
+    values[96] = fex_code_cache_capacity_bytes;
+    values[97] = fex_jit_compilations;
+    values[98] = fex_jit_compile_time_ns;
     return static_cast<int>(ValueCount);
 }
 
@@ -22288,12 +23442,17 @@ extern "C" int executor_lsx4_ps5_runtime_set_managed_optimization(
     bool effective = active;
     switch (option) {
     case 1:
+        break;
     case 2:
+        Lsx4::Ps5Desktop::SetVulkanCoarseFragmentShadingEnabled(active);
+        effective =
+            Lsx4::Ps5Desktop::IsVulkanCoarseFragmentShadingEnabled();
+        break;
     case 3:
         break;
     case LimitAnisotropy2x:
         break;
-    case 7: { // decoded-texture/readback reuse across AGC submits
+    case 7: {
         const std::lock_guard lock{g_runtime.mutex};
         ++g_runtime.agc_cpu_texture_cache_epoch;
         ResetPs5ManagedOptimizationStats(option);
@@ -22302,25 +23461,25 @@ extern "C" int executor_lsx4_ps5_runtime_set_managed_optimization(
             active);
         break;
     }
-    case 8: // Vulkan state/barrier/render-scope/submit deduplication
+    case 8:
         ResetPs5ManagedOptimizationStats(option);
         Lsx4::Ps5Desktop::SetVulkanDriverOptimizationEnabled(active);
         effective =
             Lsx4::Ps5Desktop::IsVulkanDriverOptimizationEnabled();
         break;
-    case 9: // asynchronous shader/pipeline replacement
+    case 9:
         Lsx4::Ps5Desktop::ResetVulkanAsyncPipelineStats();
         Lsx4::Ps5Desktop::SetVulkanAsyncPipelineEnabled(active);
         effective =
             Lsx4::Ps5Desktop::IsVulkanAsyncPipelineEnabled();
         break;
-    case 10: // adaptive mobile-GPU policy
+    case 10:
         Lsx4::Ps5Desktop::ResetVulkanMobileGpuStats();
         Lsx4::Ps5Desktop::SetVulkanMobileGpuEnabled(active);
         effective =
             Lsx4::Ps5Desktop::IsVulkanMobileGpuEnabled();
         break;
-    case 11: // converter A/B; shared scheduler/API stay identical
+    case 11:
         Libraries::AudioOut::ResetAudioOptimizationStats();
         Libraries::AudioOut::SetManagedAudioSimdEnabled(active);
         effective =
@@ -22329,32 +23488,36 @@ extern "C" int executor_lsx4_ps5_runtime_set_managed_optimization(
             status = LSX4_PS5_EXECUTE_BACKEND_NOT_READY;
         }
         break;
-    case 12: // force exact 1x sampler mode
+    case 12:
         effective = active;
         break;
-    case 13: // experimental direct stack-relative loads/stores; strict elsewhere
+    case 13:
         Executor::Jit::ConfigureFastGuestMemory(active);
         effective = Executor::Jit::FastGuestMemoryEnabled();
         break;
-    case 14: // optional scalar MUL+ADD contraction; strict rounding by default
+    case 14:
         Executor::Jit::ConfigureRelaxedFpFusion(active);
         effective = Executor::Jit::RelaxedFpFusionEnabled();
         break;
-    case 15: // Android Dynamic Performance Framework frame workload session
+    case 15:
         Executor::AndroidPerformanceHint::SetEnabled(active);
         effective = Executor::AndroidPerformanceHint::IsEnabled();
         break;
-    case 16: // FEAT_FlagM/FlagM2 JIT lowering, baseline fallback otherwise
+    case 16:
         Executor::Jit::ConfigureHostFlagM(active);
         effective = Executor::Jit::HostFlagMEnabled();
         break;
-    case 17: // FEAT_SVE2 JIT lowering, NEON fallback otherwise
+    case 17:
         Executor::Jit::ConfigureHostSve2(active);
         effective = Executor::Jit::HostSve2Enabled();
         break;
-    case 18: // FEAT_LRCPC host-acquire lowering, LDAR fallback otherwise
+    case 18:
         Executor::Jit::ConfigureHostRcpc(active);
         effective = Executor::Jit::HostRcpcEnabled();
+        break;
+    case 19:
+        Executor::Jit::ConfigureGuestSpinWaitEvent(active);
+        effective = Executor::Jit::GuestSpinWaitEventEnabled();
         break;
     case TieredJit:
         if (!active) {
@@ -22412,7 +23575,7 @@ extern "C" int executor_lsx4_ps5_runtime_set_managed_optimization(
         "managed optimization option=%d requested=%d effective=%d status=%d "
         "tiered=%d trace=%d readback=%d driver=%d async=%d mobile=%d "
         "audio=%d fastMemory=%d relaxedFpFusion=%d adpf=%d "
-        "flagm=%d sve2=%d rcpc=%d epoch=%llu",
+        "flagm=%d sve2=%d rcpc=%d guestSpinWaitEvent=%d epoch=%llu",
         option, active ? 1 : 0, effective ? 1 : 0, status,
         Executor::Jit::TieredJitEnabled() ? 1 : 0,
         Executor::Jit::JitTraceCompilationEnabled() ? 1 : 0,
@@ -22432,6 +23595,7 @@ extern "C" int executor_lsx4_ps5_runtime_set_managed_optimization(
         Executor::Jit::HostFlagMEnabled() ? 1 : 0,
         Executor::Jit::HostSve2Enabled() ? 1 : 0,
         Executor::Jit::HostRcpcEnabled() ? 1 : 0,
+        Executor::Jit::GuestSpinWaitEventEnabled() ? 1 : 0,
         static_cast<unsigned long long>(epoch));
 #endif
     return status;
@@ -22456,6 +23620,25 @@ extern "C" int executor_lsx4_ps5_runtime_initialize(
         : std::string{};
     const auto configured_executable_identity =
         config->executable_identity;
+    {
+        const std::lock_guard backend_lock{g_guest_cpu_backend_mutex};
+        g_guest_cpu_backend_selection_locked.store(
+            true, std::memory_order_release);
+        if (g_effective_guest_cpu_backend.load(
+                std::memory_order_acquire) ==
+            Ps5GuestCpuBackend::FexExperimental) {
+            const auto loader = Executor::Fex::Status();
+            if (loader.state != Executor::Fex::LoaderState::Configured &&
+                loader.state != Executor::Fex::LoaderState::Active) {
+                g_guest_cpu_backend_supported = false;
+                g_guest_cpu_backend_fallback_reason =
+                    "fex-loader-not-configured-at-initialize";
+                RefreshGuestCpuBackendStatusLocked();
+                return LSX4_PS5_EXECUTE_BACKEND_NOT_READY;
+            }
+        }
+        RefreshGuestCpuBackendStatusLocked();
+    }
     Common::InitializeAndroidThreadAffinity();
     executor_lsx4_ps5_runtime_reset();
     g_ps5_pad_buttons.store(0, std::memory_order_relaxed);
@@ -22557,7 +23740,14 @@ extern "C" int executor_lsx4_ps5_runtime_execute(
     }
     *result = {};
 
+    (void)WaitForRuntimeResume();
+    if (g_runtime.shutdown_requested.load(std::memory_order_acquire)) {
+        result->status = LSX4_PS5_EXECUTE_NOT_INITIALIZED;
+        return result->status;
+    }
+
     std::uint64_t execution_thread_handle{};
+    std::uint64_t execution_pthread_handle{};
     {
         const std::lock_guard lock{g_runtime.mutex};
         if (!g_runtime.initialized) {
@@ -22573,6 +23763,7 @@ extern "C" int executor_lsx4_ps5_runtime_execute(
             &GuestThreadContext::fs_base);
         if (thread != g_runtime.threads.end()) {
             execution_thread_handle = thread->handle;
+            execution_pthread_handle = thread->pthread_handle;
         }
     }
 
@@ -22605,8 +23796,34 @@ extern "C" int executor_lsx4_ps5_runtime_execute(
     const auto previous_fs_base = std::exchange(
         g_current_guest_fs_base, entry->fs_base);
     try {
-        result->value =
-            Lsx4::Translation::ExecuteGuest(entry->address, request);
+        if (g_effective_guest_cpu_backend.load(
+                std::memory_order_acquire) ==
+            Ps5GuestCpuBackend::FexExperimental) {
+            std::string fex_error;
+            if (!ExecutePs5FexGuest(
+                    *entry, execution_thread_handle,
+                    execution_pthread_handle, *result, fex_error)) {
+                g_current_guest_thread_handle = previous_thread_handle;
+                g_current_guest_fs_base = previous_fs_base;
+                result->status = LSX4_PS5_EXECUTE_BACKEND_NOT_READY;
+                {
+                    const std::lock_guard backend_lock{
+                        g_guest_cpu_backend_mutex};
+                    g_guest_cpu_backend_supported = false;
+                    g_guest_cpu_backend_fallback_reason =
+                        fex_error.empty()
+                            ? "fex-guest-execution-failed"
+                            : fex_error;
+                    RefreshGuestCpuBackendStatusLocked();
+                }
+                SetRuntimeStatus(
+                    "PS5 FEX guest execution failed: " + fex_error);
+                return result->status;
+            }
+        } else {
+            result->value =
+                Lsx4::Translation::ExecuteGuest(entry->address, request);
+        }
 #ifdef __ANDROID__
         __android_log_print(
             ANDROID_LOG_INFO, "LSX4-PS5-EXIT",
@@ -23124,6 +24341,10 @@ extern "C" int executor_lsx4_ps5_runtime_unload_eboot(
         return LSX4_PS5_EXECUTE_OK;
     }
 
+
+
+    g_runtime.shutdown_requested.store(true, std::memory_order_release);
+    ClearRuntimePauseForShutdown();
     std::vector<std::thread> guest_host_threads;
     std::vector<std::shared_ptr<GuestSemaphore>> guest_semaphores;
     std::vector<std::shared_ptr<GuestConditionVariable>>
@@ -23308,7 +24529,9 @@ extern "C" int executor_lsx4_ps5_runtime_unload_eboot(
             0, std::memory_order_release);
         g_runtime.save_data_dialog_dir_name.fill('\0');
     }
+    (void)InvalidateAllPs5FexExecutableRanges();
     for (const auto& thread : threads) {
+        ReleasePs5FexGuestThread(thread.handle);
         munmap(thread.allocation, thread.mapping_size);
     }
     const auto host = Ps5LoaderHost();
@@ -23707,11 +24930,16 @@ extern "C" int executor_lsx4_ps5_runtime_destroy_thread_context(
             return LSX4_PS5_EXECUTE_INVALID_ARGUMENT;
         }
     }
+    ReleasePs5FexGuestThread(thread_handle);
     munmap(removed.allocation, removed.mapping_size);
     return 0;
 }
 
 extern "C" void executor_lsx4_ps5_runtime_reset() {
+
+
+    g_runtime.shutdown_requested.store(true, std::memory_order_release);
+    ClearRuntimePauseForShutdown();
     bool had_runtime_session{};
     std::vector<std::thread> guest_host_threads;
     std::vector<std::shared_ptr<GuestSemaphore>> guest_semaphores;
@@ -23918,12 +25146,14 @@ extern "C" void executor_lsx4_ps5_runtime_reset() {
         ANativeWindow_release(android_window);
     }
 #endif
+    (void)InvalidateAllPs5FexExecutableRanges();
     const auto host = Ps5LoaderHost();
     for (auto& program : programs) {
         Funnel::Ps5Desktop::UnloadNextGenExecutable(
             host, program.image);
     }
     for (const auto& thread : threads) {
+        ReleasePs5FexGuestThread(thread.handle);
         munmap(thread.allocation, thread.mapping_size);
     }
     for (const auto& mapping : owned_guest_mappings) {
@@ -23976,6 +25206,12 @@ extern "C" bool ExecutorJitIsExecutableGuestAddress(
     const std::uint64_t address) {
     const std::lock_guard lock{g_runtime.mutex};
     return HasAccessLocked(address, 1, LSX4_PS5_GUEST_EXECUTE);
+}
+
+extern "C" bool ExecutorJitIsWritableGuestAddress(
+    const std::uint64_t address) {
+    const std::lock_guard lock{g_runtime.mutex};
+    return HasAccessLocked(address, 1, LSX4_PS5_GUEST_WRITE);
 }
 
 extern "C" bool ExecutorJitReadGuestBytes(
@@ -24211,6 +25447,10 @@ extern "C" int executor_lsx4_android_dispatch_deferred_guest_signal(
 namespace Lsx4::Translation {
 
 std::uint64_t InvokeRuntimeHle(const HleBridgeRequest& request) {
+
+
+
+    (void)WaitForRuntimeResume();
     const auto callbacks = SnapshotCallbacks();
     std::uint64_t builtin_result{};
     const auto handled =

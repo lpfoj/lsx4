@@ -1,0 +1,9 @@
+{
+  "schema": "lsx4-bloodborne-proof-input/v1",
+  "id": "candidate-static-no-input",
+  "kind": "static",
+  "gameplayInputAllowed": false,
+  "crossAllowed": false,
+  "fpsVerdictAllowed": false,
+  "purpose": "Read-only expected-state bootstrap; this file defines no workload input."
+}

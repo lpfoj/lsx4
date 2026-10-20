@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="capture_screenshot">Capture d’écran</string>
+    <string name="capture_record">Enregistrer une vidéo</string>
+    <string name="capture_stop_recording">Arrêter la capture</string>
+    <string name="capture_gallery">Galerie</string>
+    <string name="capture_share">Partager</string>
+    <string name="capture_close">Fermer</string>
+    <string name="capture_cancel">Annuler</string>
+    <string name="capture_continue">Continuer</string>
+    <string name="capture_open_panel">Captures du jeu</string>
+    <string name="capture_gallery_loading">Chargement des captures…</string>
+    <string name="capture_gallery_empty">Les captures et vidéos apparaîtront ici. Les fichiers restent dans LSX4 tant que vous ne les partagez pas.</string>
+    <string name="capture_image_label">Capture</string>
+    <string name="capture_video_label">Vidéo</string>
+    <string name="capture_share_unavailable">Aucune application ne permet de partager ce fichier.</string>
+    <string name="capture_screenshot_saved">Capture enregistrée dans la galerie.</string>
+    <string name="capture_screenshot_failed">Impossible de capturer le jeu. Attendez une image du jeu et réessayez.</string>
+    <string name="capture_video_saved">Vidéo enregistrée dans la galerie.</string>
+    <string name="capture_recording_failed">Impossible de démarrer ou de terminer l’enregistrement. Réessayez et acceptez la demande d’enregistrement de l’écran.</string>
+    <string name="capture_storage_failed">Impossible d’enregistrer la capture. Vérifiez l’espace libre sur l’appareil.</string>
+    <string name="capture_recording">Enregistrement du jeu</string>
+    <string name="capture_recording_starting">Démarrage de la capture…</string>
+    <string name="capture_finishing">Enregistrement…</string>
+    <string name="capture_video_only">Vidéo seule · sans son</string>
+    <string name="capture_silent_status">● %1$s · sans son</string>
+    <string name="capture_audio_explanation">Android enregistre l’écran, y compris les commandes et les notifications visibles. L’enregistrement s’arrête lorsque LSX4 perd le focus. L’autorisation audio capture uniquement le son de LSX4, jamais le microphone.</string>
+    <string name="capture_allow_game_audio">Autoriser le son du jeu</string>
+    <string name="capture_audio_denied">L’autorisation pour le son du jeu a été refusée. Continuer avec une vidéo sans son ?</string>
+    <string name="capture_audio_requires_android10">Le son interne du jeu nécessite Android 10 ou ultérieur. Continuer avec une vidéo sans son ?</string>
+    <string name="capture_notification_channel">Capture du jeu</string>
+    <string name="capture_notification_detail">Enregistrement de l’écran ; son de LSX4 uniquement. Touchez Arrêter pour enregistrer.</string>
+    <string name="game_menu_continue">Reprendre</string>
+    <string name="game_menu_paused_hint">Jeu en pause. Reprenez quand vous le souhaitez.</string>
+    <string name="game_menu_exiting">Fermeture du jeu…</string>
+    <string name="game_menu_audio_focus">Une autre application utilise la sortie audio. Appuyez à nouveau sur Reprendre.</string>
+</resources>

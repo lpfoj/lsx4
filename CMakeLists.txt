@@ -16,6 +16,22 @@ if (NOT ANDROID)
     message(FATAL_ERROR "LSX4 native runtime must be configured with the Android NDK toolchain")
 endif()
 
+# The packaged arm64 runtime supports Android 8.0+ (API 26). Building it against
+# a newer Bionic silently permits newer ELF imports and TLS relocations: such a
+# library packages normally but fails in the Android 8/9 linker before our
+# runtime can report an error. Keep the compile-time ABI equal to the app's
+# minSdk; optional newer Android APIs must be resolved dynamically at runtime.
+if(DEFINED ANDROID_PLATFORM)
+    string(REGEX REPLACE "^android-" "" LSX4_ANDROID_PLATFORM_LEVEL
+           "${ANDROID_PLATFORM}")
+    if(LSX4_ANDROID_PLATFORM_LEVEL MATCHES "^[0-9]+$" AND
+       LSX4_ANDROID_PLATFORM_LEVEL GREATER 26)
+        message(FATAL_ERROR
+            "LSX4 Android runtimes must target android-26; received "
+            "${ANDROID_PLATFORM}. Resolve newer APIs dynamically instead.")
+    endif()
+endif()
+
 set(LSX4_ARM_DESKTOP_LAYER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/funnel-arm" CACHE PATH
     "Funnel ARM desktop layer source directory")
 option(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT
@@ -28,6 +44,27 @@ if(NOT EXISTS "${LSX4_ARM_DESKTOP_LAYER_MANIFEST}")
         "Funnel ARM desktop layer is unavailable; initialize the funnel-arm submodule")
 endif()
 include("${LSX4_ARM_DESKTOP_LAYER_MANIFEST}")
+
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+set(LSX4_VULKAN_CAPABILITY_GUARD
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_vulkan_capability_bridge.py")
+set(LSX4_VULKAN_CAPABILITY_GUARD_ARGS
+    --root "${CMAKE_CURRENT_SOURCE_DIR}"
+    --funnel-root "${LSX4_ARM_DESKTOP_SOURCE_DIR}")
+if(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    list(APPEND LSX4_VULKAN_CAPABILITY_GUARD_ARGS --allow-historical-funnel)
+endif()
+add_custom_target(lsx4_vulkan_capability_guard
+    COMMAND "${Python3_EXECUTABLE}" "${LSX4_VULKAN_CAPABILITY_GUARD}"
+            ${LSX4_VULKAN_CAPABILITY_GUARD_ARGS}
+    DEPENDS
+        "${LSX4_VULKAN_CAPABILITY_GUARD}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/AGENTS.md"
+        "${CMAKE_CURRENT_SOURCE_DIR}/docs/ANDROID_VULKAN_CAPABILITY_BRIDGE.md"
+        "${LSX4_ARM_DESKTOP_SOURCE_DIR}/video_core/renderer_vulkan/vk_capability_profile.h"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    COMMENT "Checking Vulkan capability bridge invariants"
+    VERBATIM)
 
 if(UNIX AND NOT APPLE)
     set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
@@ -312,6 +349,7 @@ lsx4_assert_arm_desktop_ownership(${LSX4_NATIVE_CORE_SOURCES})
 
 
 set(LSX4_JIT_COMMON_SOURCES
+    src/executor/android_glob_compat.cpp
     src/executor/dynamic_translation/address_resolver.cpp
     src/executor/dynamic_translation/native_address_emitter.cpp
     src/executor/dynamic_translation/atomic_memory.cpp
@@ -321,6 +359,7 @@ set(LSX4_JIT_COMMON_SOURCES
     src/executor/dynamic_translation/decode_frontend.cpp
     src/executor/dynamic_translation/diagnostic_probe_policy.cpp
     src/executor/dynamic_translation/edge_portal.cpp
+    src/executor/dynamic_translation/executable_range_registry.cpp
     src/executor/dynamic_translation/execution_context.cpp
     src/executor/dynamic_translation/execution_driver.cpp
     src/executor/dynamic_translation/live_state_port.cpp
@@ -365,15 +404,55 @@ add_library(lsx4_executor_android SHARED
     ${LSX4_NATIVE_CORE_SOURCES}
     ${LSX4_JIT_COMMON_SOURCES}
     src/executor/android_performance_hint.cpp
+    src/executor/fex_backend_loader.cpp
+    src/executor/fex_fiber_hle_bridge.cpp
+    src/executor/fex_hle_integration_seam.cpp
     src/executor/native_runtime_api.cpp
+    src/executor/ps1_classic_runtime.cpp
     src/executor/ps4_jit_platform.cpp
     src/executor/runtime_death_catcher.cpp
 )
+
+# Arm ASR's generic library ships prebuilt Vulkan shader permutations, so the
+# Android runtime does not need the Windows-only FidelityFX shader compiler.
+# Keep the upstream implementation in its own warning-isolated target and link
+# the official Vulkan backend into the PS4 presenter.
+set(LSX4_ARM_ASR_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/externals/arm-asr")
+add_library(lsx4_arm_asr STATIC
+    "${LSX4_ARM_ASR_ROOT}/src/shared/ffxm_assert.cpp"
+    "${LSX4_ARM_ASR_ROOT}/src/shared/ffxm_object_management.cpp"
+    "${LSX4_ARM_ASR_ROOT}/src/components/fsr2/ffxm_fsr2.cpp"
+    "${LSX4_ARM_ASR_ROOT}/src/backends/shared/ffxm_shader_blobs.cpp"
+    "${LSX4_ARM_ASR_ROOT}/src/backends/shared/blob_accessors/ffxm_fsr2_shaderblobs.cpp"
+    "${LSX4_ARM_ASR_ROOT}/src/backends/vk/ffxm_hash.cpp"
+    "${LSX4_ARM_ASR_ROOT}/src/backends/vk/ffxm_vk.cpp")
+target_compile_definitions(lsx4_arm_asr PRIVATE FFXM_FSR=1)
+target_compile_options(lsx4_arm_asr PRIVATE -w)
+target_include_directories(lsx4_arm_asr PUBLIC
+    "${LSX4_ARM_ASR_ROOT}"
+    "${LSX4_ARM_ASR_ROOT}/include"
+    "${LSX4_ARM_ASR_ROOT}/include/host")
+target_include_directories(lsx4_arm_asr PRIVATE
+    "${LSX4_ARM_ASR_ROOT}/include/gpu"
+    "${LSX4_ARM_ASR_ROOT}/src/components"
+    "${LSX4_ARM_ASR_ROOT}/src/backends/shared"
+    "${LSX4_ARM_ASR_ROOT}/src/backends/shared/blob_accessors"
+    "${LSX4_ARM_ASR_ROOT}/src/backends/shared/blob_accessors/prebuilt_shaders"
+    "${LSX4_ARM_ASR_ROOT}/src/backends/vk")
+target_link_libraries(lsx4_arm_asr PUBLIC Vulkan::Headers)
 
 if(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
     target_compile_definitions(lsx4_executor_android PRIVATE
         LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT=1)
 endif()
+
+# LSX4_NATIVE_SIMD_EXTENDED is deliberately NOT defined for the PS4 target.
+# The lowerings it gates are FMA3 and AVX2 shapes, and the PS4's Jaguar has
+# neither, so a PS4 guest never issues them - the code would be dead. Enabling it
+# here once cost a 0-FPS regression at 89.9 s for no measurable gain, because the
+# only instructions Jaguar does have behind that gate, SSE4a EXTRQ/INSERTQ, share
+# it with MONITORX/MWAITX. Re-enable only EXTRQ/INSERTQ, on their own gate, and
+# only after confirming a PS4 guest actually executes them.
 
 if(LSX4_ENABLE_PS5_DESKTOP_PATH)
     lsx4_define_ps5_desktop_profile()
@@ -422,10 +501,12 @@ if(LSX4_ENABLE_PS5_DESKTOP_PATH)
         "${LSX4_ARM_DESKTOP_SOURCE_DIR}/core/libraries/audio/audio_mix.cpp"
         src/executor/ps5_desktop/backend_contract.cpp
         src/executor/ps5_desktop/bc7decomp.cpp
+        src/executor/ps5_desktop/fex_contract.cpp
         src/executor/ps5_desktop/gen5_compute_recompiler.cpp
         src/executor/ps5_desktop/ps5_audio_scheduler.cpp
         src/executor/ps5_desktop/vulkan_presenter.cpp
         src/executor/ps5_desktop/runtime_api.cpp
+        src/executor/fex_backend_loader.cpp
         src/executor/android_performance_hint.cpp)
     set_property(
         SOURCE "${LSX4_ARM_DESKTOP_SOURCE_DIR}/common/thread.cpp"
@@ -438,8 +519,11 @@ if(LSX4_ENABLE_PS5_DESKTOP_PATH)
     target_include_directories(lsx4_executor_ps5_android PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
         "${LSX4_ARM_DESKTOP_SOURCE_DIR}")
+    # Both macros here: the PS5 target keeps its behavioural branches and must
+    # also keep the lowerings once they move onto the narrower gate.
     target_compile_definitions(lsx4_executor_ps5_android PRIVATE
-        LSX4_PS5_DESKTOP_PATH=1)
+        LSX4_PS5_DESKTOP_PATH=1
+        LSX4_NATIVE_SIMD_EXTENDED=1)
     set_target_properties(lsx4_executor_ps5_android PROPERTIES
         OUTPUT_NAME lsx4_executor_ps5_android)
 endif()
@@ -567,7 +651,8 @@ endif()
 target_include_directories(lsx4_executor_android PRIVATE
     "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR}"
     "${LSX4_ARM_DESKTOP_SOURCE_DIR}"
-    "${LSX4_ARM_DESKTOP_LAYER_DIR}")
+    "${LSX4_ARM_DESKTOP_LAYER_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/externals/swanstation/dep/libretro-common/include")
 set_target_properties(lsx4_executor_android PROPERTIES
     OUTPUT_NAME lsx4_executor_android
 )
@@ -591,21 +676,31 @@ if(TARGET lsx4_executor_ps5_android)
         LINK_DEPENDS "${LSX4_EXECUTOR_PS5_ANDROID_EXPORT_MAP}")
 endif()
 
+option(LSX4_KEEP_ANDROID_NATIVE_SYMBOLS
+    "Keep an unstripped .symbols copy of the Android executor" ON)
 if(CMAKE_STRIP AND CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$")
-    add_custom_command(TARGET lsx4_executor_android POST_BUILD
-        COMMAND "${CMAKE_COMMAND}" -E copy
-            "$<TARGET_FILE:lsx4_executor_android>"
-            "$<TARGET_FILE:lsx4_executor_android>.symbols"
-        COMMAND "${CMAKE_STRIP}" --strip-unneeded "$<TARGET_FILE:lsx4_executor_android>"
-        COMMENT "Stripping private symbols from liblsx4_executor_android.so"
-        VERBATIM)
+    if(LSX4_KEEP_ANDROID_NATIVE_SYMBOLS)
+        add_custom_command(TARGET lsx4_executor_android POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy
+                "$<TARGET_FILE:lsx4_executor_android>"
+                "$<TARGET_FILE:lsx4_executor_android>.symbols"
+            COMMAND "${CMAKE_STRIP}" --strip-unneeded "$<TARGET_FILE:lsx4_executor_android>"
+            COMMENT "Preserving Android executor symbols and stripping the runtime library"
+            VERBATIM)
+    else()
+        add_custom_command(TARGET lsx4_executor_android POST_BUILD
+            COMMAND "${CMAKE_STRIP}" --strip-unneeded "$<TARGET_FILE:lsx4_executor_android>"
+            COMMENT "Stripping Android executor symbols without preserving a debug copy"
+            VERBATIM)
+    endif()
 endif()
 
 create_target_directory_groups(lsx4_executor_android)
-add_dependencies(lsx4_executor_android lsx_iced_decoder_build)
+add_dependencies(lsx4_executor_android lsx_iced_decoder_build lsx4_vulkan_capability_guard)
 if(TARGET lsx4_executor_ps5_android)
     create_target_directory_groups(lsx4_executor_ps5_android)
-    add_dependencies(lsx4_executor_ps5_android lsx_iced_decoder_build)
+    add_dependencies(lsx4_executor_ps5_android lsx_iced_decoder_build
+                     lsx4_vulkan_capability_guard)
 endif()
 
 set(LSX4_ANDROID_MEDIA_LIBS)
@@ -622,6 +717,10 @@ endif()
 target_link_libraries(lsx4_executor_android PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak RenderDoc::API ${LSX4_ANDROID_MEDIA_LIBS} Dear_ImGui gcn half::half ZLIB::ZLIB PNG::PNG)
 target_link_libraries(lsx4_executor_android PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash lsx_iced_decoder glslang::glslang SDL3::SDL3 SDL3_mixer::SDL3_mixer pugixml::pugixml)
 target_link_libraries(lsx4_executor_android PRIVATE stb::headers nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib)
+target_link_libraries(lsx4_executor_android PRIVATE lsx4_arm_asr)
+if(ANDROID)
+    target_link_libraries(lsx4_executor_android PRIVATE aaudio)
+endif()
 if(TARGET xbyak_aarch64::xbyak_aarch64)
     target_link_libraries(lsx4_executor_android PRIVATE xbyak_aarch64::xbyak_aarch64)
 endif()
@@ -640,7 +739,7 @@ if(TARGET lsx4_executor_ps5_android)
     endif()
 endif()
 if(ANDROID)
-    target_link_libraries(lsx4_executor_android PRIVATE android aaudio mediandk dl log EGL GLESv3)
+    target_link_libraries(lsx4_executor_android PRIVATE android aaudio mediandk dl log EGL GLESv3 vulkan)
     if(TARGET lsx4_executor_ps5_android)
         target_link_libraries(lsx4_executor_ps5_android PRIVATE android aaudio dl log vulkan)
     endif()
@@ -654,6 +753,107 @@ if(ANDROID)
         -Wl,--wrap=__stack_chk_fail
         -Wl,--wrap=__assert2
     )
+endif()
+
+add_executable(lsx4_fex_hle_dispatch_integration_smoke
+    tests/fex_hle_dispatch_integration_smoke.cpp)
+target_include_directories(lsx4_fex_hle_dispatch_integration_smoke PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${LSX4_ARM_DESKTOP_SOURCE_DIR}")
+target_link_libraries(lsx4_fex_hle_dispatch_integration_smoke PRIVATE
+    lsx4_executor_android
+    dl
+    log)
+
+add_executable(lsx4_fex_fiber_hle_bridge_smoke
+    tests/fex_fiber_hle_bridge_smoke.cpp
+    src/executor/fex_fiber_hle_bridge.cpp
+    src/executor/dynamic_translation/live_state_port.cpp)
+target_include_directories(lsx4_fex_fiber_hle_bridge_smoke PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+add_executable(lsx4_guest_context_snapshot_abi_layout
+    tests/guest_context_snapshot_abi_layout.cpp)
+target_include_directories(lsx4_guest_context_snapshot_abi_layout PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+add_executable(lsx4_fex_hle_guest_stub_roundtrip_smoke
+    tests/fex_hle_guest_stub_roundtrip_smoke.cpp)
+target_include_directories(lsx4_fex_hle_guest_stub_roundtrip_smoke PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${LSX4_ARM_DESKTOP_SOURCE_DIR}")
+target_link_libraries(lsx4_fex_hle_guest_stub_roundtrip_smoke PRIVATE
+    lsx4_executor_android
+    dl
+    log)
+set_target_properties(lsx4_fex_hle_guest_stub_roundtrip_smoke PROPERTIES
+    ENABLE_EXPORTS ON)
+
+add_executable(lsx4_fex_hle_frame_lease_model_smoke
+    tests/fex_hle_frame_lease_model_smoke.cpp)
+target_include_directories(lsx4_fex_hle_frame_lease_model_smoke PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+add_executable(lsx4_ps5_fex_contract
+    tests/ps5_fex_contract.cpp
+    src/executor/ps5_desktop/fex_contract.cpp)
+target_include_directories(lsx4_ps5_fex_contract PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+add_executable(lsx4_guest_capability_profile_contract
+    tests/guest_capability_profile_contract.cpp
+    src/executor/dynamic_translation/guest_capability_profile.cpp)
+target_include_directories(lsx4_guest_capability_profile_contract PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+add_executable(lsx4_cpu_tuning_profile_contract
+    tests/cpu_tuning_profile_contract.cpp)
+target_include_directories(lsx4_cpu_tuning_profile_contract PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+add_executable(lsx4_executable_range_registry_smoke
+    tests/executable_range_registry_smoke.cpp
+    src/executor/dynamic_translation/executable_range_registry.cpp)
+target_include_directories(lsx4_executable_range_registry_smoke PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+add_library(lsx4_fex_lifecycle_test_adapter SHARED
+    tests/fex_lifecycle_test_adapter.cpp)
+target_include_directories(lsx4_fex_lifecycle_test_adapter PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+add_executable(lsx4_fex_backend_loader_lifecycle_smoke
+    tests/fex_backend_loader_lifecycle_smoke.cpp
+    src/executor/fex_backend_loader.cpp
+    src/executor/dynamic_translation/guest_capability_profile.cpp
+    src/executor/dynamic_translation/host_isa_profile.cpp)
+target_include_directories(lsx4_fex_backend_loader_lifecycle_smoke PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(lsx4_fex_backend_loader_lifecycle_smoke PRIVATE
+    dl
+    log)
+add_dependencies(lsx4_fex_backend_loader_lifecycle_smoke
+    lsx4_fex_lifecycle_test_adapter)
+
+if(ANDROID)
+    add_library(lsx4_hle_abi_inventory_compile_smoke OBJECT
+        tests/hle_abi_inventory_compile_smoke.cpp)
+    target_include_directories(lsx4_hle_abi_inventory_compile_smoke PRIVATE
+        "${LSX4_ARM_DESKTOP_SOURCE_DIR}")
+    target_link_libraries(lsx4_hle_abi_inventory_compile_smoke PRIVATE
+        fmt::fmt)
+
+    add_custom_target(lsx4_hle_abi_inventory_elf_gate
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/verify_hle_abi_inventory.py"
+            "$<TARGET_FILE:lsx4_executor_android>"
+            --expected-count 815
+            --require-no-memory
+        DEPENDS
+            lsx4_executor_android
+            lsx4_hle_abi_inventory_compile_smoke
+        COMMENT "Validating all compiled Android x86-64 HLE ABI descriptors"
+        VERBATIM)
 endif()
 
 target_compile_definitions(lsx4_executor_android PRIVATE IMGUI_USER_CONFIG="imgui/imgui_config.h")
@@ -674,6 +874,8 @@ add_compile_definitions(BOOST_ASIO_STANDALONE)
 
 target_include_directories(lsx4_executor_android PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(lsx4_executor_android PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/externals/tracy/public)
+target_include_directories(lsx4_executor_android PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/externals/NVIDIAImageScaling/NIS)
 
 set(HOST_SHADERS_INCLUDE ${LSX4_ARM_DESKTOP_SOURCE_DIR}/video_core/host_shaders)
 

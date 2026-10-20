@@ -1,8 +1,10 @@
 package app.lsx4.android;
 
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.app.KeyguardManager;
 import android.content.Context;
+import android.content.ComponentCallbacks2;
 import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.content.Intent;
@@ -23,6 +25,7 @@ import android.net.Uri;
 import android.media.AudioManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Debug;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -30,7 +33,11 @@ import android.provider.OpenableColumns;
 import android.text.Editable;
 import android.text.InputFilter;
 import android.text.InputType;
+import android.text.SpannableString;
+import android.text.Spanned;
 import android.text.TextWatcher;
+import android.text.style.ForegroundColorSpan;
+import android.text.style.RelativeSizeSpan;
 import android.util.Log;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
@@ -60,20 +67,35 @@ import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONObject;
+
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.TreeSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class MainActivity extends Activity {
+    private static final int CROSS_PROCESS_TASK_BASE_FLAGS =
+            Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION;
     private static final String TAG = "LSX4";
     private static final String BUILD_MARKER =
-            "lsx4-2026-07-20-r27-game-side-menu";
+            "lsx4-2026-08-28-a840-pre8gen3-hud";
     private static final String DISABLE_DYNAMIC_SHADOWS_MARKER =
             "run-disable-dynamic-shadows";
     private static final String DISABLE_SSAO_MARKER = "run-disable-ssao";
@@ -82,6 +104,16 @@ public class MainActivity extends Activity {
     private static final String DISABLE_ANTI_ALIASING_MARKER = "run-disable-anti-aliasing";
     private static final String DISABLE_CHROMATIC_ABERRATION_MARKER =
             "run-disable-chromatic-aberration";
+    private static final String BUNDLED_PATCH_ASSET_DIRECTORY =
+            "patches/lsx4-bundled";
+    private static final String BUNDLED_PATCH_DIRECTORY =
+            "native/patches/lsx4-bundled";
+    private static final String[] BUNDLED_PATCH_FILES = {
+            "files.json", "Bloodborne.xml"
+    };
+    private static final String EXTRA_PROFILE_GRAPHICS_OVERRIDE =
+            "profile_graphics_override";
+    static final String EXTRA_PROFILE_FSR_ENABLED = "profile_fsr_enabled";
     private static final String RENDER_RESOLUTION_CONFIG =
             "runtime-config/android-render-resolution.ini";
     private static final int PICK_RUNTIME = 1001;
@@ -89,8 +121,15 @@ public class MainActivity extends Activity {
     private static final String EXTRA_AUTOINIT_RUNTIME = "autoinit_runtime";
     private static final String EXTRA_SCAN_GAME_PATH = "scan_game_path";
     private static final String EXTRA_LAUNCH_GAME_PATH = "launch_game_path";
+    private static final Pattern TITLE_ID_PATTERN =
+            Pattern.compile("(?i)(CUSA|PPSA)[0-9]{5}");
     private static final String EXTRA_GAME_PLATFORM = "game_platform";
     static final String EXTRA_RENDER_RESOLUTION_MODE = "render_resolution_mode";
+    static final String EXTRA_UPSCALED_OUTPUT_RESOLUTION_MODE =
+            "upscaled_output_resolution_mode";
+    static final String EXTRA_FSR_OUTPUT_RESOLUTION_MODE =
+            "fsr_output_resolution_mode";
+    static final String EXTRA_UPSCALER_MODE = "upscaler_mode";
     private static final String PLATFORM_PS5 = "ps5";
     private static final String EXTRA_TRANSLATOR_GUEST_ELF_PATH = "translator_guest_elf_path";
     private static final String EXTRA_TRANSLATOR_BRIDGE_LAUNCH = "translator_bridge_launch";
@@ -114,6 +153,63 @@ public class MainActivity extends Activity {
             "embedded_aarch64_jit_backend";
     private static final String EXTRA_RUNTIME_JIT_SELFTEST =
             "runtime_jit_selftest";
+    private static final String EXTRA_SETTINGS_SNAPSHOT =
+            "lsx4_cross_process_settings_snapshot";
+    private static final String EXTRA_SETTINGS_SNAPSHOT_GENERATION =
+            "lsx4_cross_process_settings_generation";
+    private static final String[] CROSS_PROCESS_SETTING_KEYS = {
+            SettingsActivity.K_RES_MODE,
+            SettingsActivity.K_UPSCALED_OUTPUT_RES_MODE,
+            SettingsActivity.K_DISPLAY_SCALING_MODE,
+            SettingsActivity.K_FSR_ENABLED,
+            SettingsActivity.K_RCAS_ENABLED,
+            SettingsActivity.K_UPSCALER_MODE,
+            SettingsActivity.K_SHARP_BILINEAR_STRENGTH,
+            SettingsActivity.K_BICUBIC_KERNEL,
+            SettingsActivity.K_FSR1_RCAS_SHARPNESS,
+            SettingsActivity.K_SGSR1_EDGE_SHARPNESS,
+            SettingsActivity.K_NIS_SHARPNESS,
+            SettingsActivity.K_SGSR2_TEMPORAL_STABILITY,
+            SettingsActivity.K_ARM_ASR_SHARPENING,
+            SettingsActivity.K_ARM_ASR_SHARPNESS,
+            SettingsActivity.K_GPU_BACKEND,
+            SettingsActivity.K_AUDIO,
+            SettingsActivity.K_OVERLAY,
+            SettingsActivity.K_OVERLAY_OPACITY,
+            SettingsActivity.K_PERF_HUD,
+            SettingsActivity.K_PERF_HUD_UPSCALER_INFO,
+            SettingsActivity.K_TEST_MODE,
+            SettingsActivity.K_KEEP_AWAKE,
+            SettingsActivity.K_PERSISTENT_JIT_CACHE,
+            SettingsActivity.K_ARM_GPU_FAST_PATH,
+            SettingsActivity.K_COARSE_FRAGMENT_2X2,
+            SettingsActivity.K_DISABLE_VK_ROBUSTNESS,
+            SettingsActivity.K_TIERED_JIT,
+            SettingsActivity.K_JIT_TRACE_COMPILATION,
+            SettingsActivity.K_GUEST_CPU_BACKEND,
+            SettingsActivity.K_VULKAN_DRIVER,
+            SettingsActivity.K_VULKAN_DRIVER_SELECTION,
+            SettingsActivity.K_LIMIT_ANISOTROPY_2X,
+            SettingsActivity.K_ANISOTROPY_MODE,
+            SettingsActivity.K_READBACK_BATCHING,
+            SettingsActivity.K_VULKAN_DRIVER_CALLS,
+            SettingsActivity.K_ASYNC_PIPELINE,
+            SettingsActivity.K_ADAPTIVE_MOBILE_GPU,
+            SettingsActivity.K_AUDIO_SIMD,
+            SettingsActivity.K_FAST_GUEST_MEMORY,
+            SettingsActivity.K_RELAXED_FP_FUSION,
+            SettingsActivity.K_ANDROID_PERFORMANCE_HINT,
+            SettingsActivity.K_OEM_ROOT_PERFORMANCE,
+            SettingsActivity.K_HOST_FLAGM,
+            SettingsActivity.K_HOST_SVE2,
+            SettingsActivity.K_HOST_RCPC,
+            SettingsActivity.K_DISABLE_DYNAMIC_SHADOWS,
+            SettingsActivity.K_DISABLE_SSAO,
+            SettingsActivity.K_DISABLE_MOTION_BLUR,
+            SettingsActivity.K_DISABLE_DEPTH_OF_FIELD,
+            SettingsActivity.K_DISABLE_ANTI_ALIASING,
+            SettingsActivity.K_DISABLE_CHROMATIC_ABERRATION
+    };
     private static final String ACTION_SMOKE_PAD_SUFFIX = ".SMOKE_PAD";
     private static final String ACTION_SMOKE_TEXT_SUFFIX = ".SMOKE_TEXT";
     private static final String ACTION_SMOKE_PIXEL_COPY_SUFFIX = ".SMOKE_PIXEL_COPY";
@@ -135,6 +231,7 @@ public class MainActivity extends Activity {
             "default.box64rc",
             "env_vars.json"
     };
+    private static final int PAD_SHARE = 0x1;
     private static final int PAD_OPTIONS = 0x8;
     private static final int PAD_L3 = 0x2;
     private static final int PAD_R3 = 0x4;
@@ -150,11 +247,12 @@ public class MainActivity extends Activity {
     private static final int PAD_CIRCLE = 0x2000;
     private static final int PAD_CROSS = 0x4000;
     private static final int PAD_SQUARE = 0x8000;
+    private static final int PAD_PS = 0x10000;
     private static final int PAD_TOUCHPAD = 0x100000;
     private static final int[] PAD_DIGITAL_BITS = {
-            PAD_OPTIONS, PAD_L3, PAD_R3, PAD_UP, PAD_RIGHT, PAD_DOWN, PAD_LEFT,
+            PAD_SHARE, PAD_OPTIONS, PAD_L3, PAD_R3, PAD_UP, PAD_RIGHT, PAD_DOWN, PAD_LEFT,
             PAD_L2, PAD_R2, PAD_L1, PAD_R1, PAD_TRIANGLE, PAD_CIRCLE, PAD_CROSS,
-            PAD_SQUARE, PAD_TOUCHPAD
+            PAD_SQUARE, PAD_PS, PAD_TOUCHPAD
     };
 
     private TextView output;
@@ -163,11 +261,18 @@ public class MainActivity extends Activity {
     private File runtimeFile;
     private boolean runtimeLoaded;
     private boolean ps5Runtime;
+    private int requestedGuestCpuBackend = GuestCpuBackend.CURRENT;
+    private int effectiveGuestCpuBackend = GuestCpuBackend.CURRENT;
+    private String guestCpuBackendStatus = "";
+    private String runtimeHardwareProfile = "unknown";
+    private String runtimeDriverFamily = "system-unknown";
+    private String runtimeDriverVersion = "";
     private Surface currentSurface;
     private SurfaceView renderSurfaceView;
     private int pixelCopyFrameIndex;
     private boolean fullscreenRender;
     private boolean inputDebugHud;
+    private boolean showDebugHudUpscalerInfo;
     private int automationSurfaceWaitAttempts;
     private volatile boolean mappedEntryRunRequested;
     private volatile String activeGamePath = "";
@@ -175,25 +280,62 @@ public class MainActivity extends Activity {
     private FrameLayout gameRenderFrame;
     private FrameLayout inputOverlay;
     private FrameLayout gameMenuLayer;
-    private LinearLayout gameMenuPanel;
-    private View gameMenuEdge;
+    private GameMenuPanelView gameMenuPanel;
+    private GameMenuHandleView gameMenuEdge;
     private View gameMenuScrim;
     private MenuToggleView gameMenuOverlayToggle;
     private TextView gameMenuOpacityValue;
     private SeekBar gameMenuOpacitySlider;
-    private boolean gameMenuOpen;
+    private GameDrawerController gameDrawerController;
     private boolean gameExitRequested;
+    private RuntimePauseController runtimePauseController;
+    private GameSessionConnection gameSession;
+    private GameAudioFocus gameAudioFocus;
+    private GameCaptureController gameCaptureController;
+    private GameCapturePanel gameCapturePanel;
+    private TextView gameMenuSubtitle;
+    private boolean liveSettingsDeferred;
+    private boolean launchSettingsInitialized;
+    private boolean renderSettingsEdited;
     private OnBackInvokedCallback gameBackCallback;
     private LinearLayout debugHudPanel;
     private TextView debugHudFps;
+    private TextView debugHudPs5Badge;
+    private TextView debugHudGamepadBadge;
+    private TextView debugHudFsr;
+    private TextView debugHudPmu;
     private TextView debugHud;
+    private TextView debugHudDriver;
     private TextView debugHudBrand;
     private TextView debugHudCollapsedButton;
+    private static final int HUD_FSR_FRAMES = 56;
+    private static final int HUD_FSR_ACTIVE = 99;
+    private static final int HUD_RCAS_ACTIVE = 100;
+    private static final int HUD_FSR_SOURCE_WIDTH = 101;
+    private static final int HUD_FSR_SOURCE_HEIGHT = 102;
+    private static final int HUD_FSR_OUTPUT_WIDTH = 103;
+    private static final int HUD_FSR_OUTPUT_HEIGHT = 104;
+    private static final int HUD_FSR_ENABLED = 105;
+    private static final int HUD_RCAS_FRAMES = 107;
+    private static final int HUD_UPSCALER_SCHEMA = 108;
+    private static final int HUD_UPSCALER_REQUESTED = 109;
+    private static final int HUD_UPSCALER_EFFECTIVE = 110;
+    private static final int HUD_UPSCALER_FRAMES = 111;
+    private static final int HUD_UPSCALER_FALLBACK = 112;
+    private static final int HUD_TEMPORAL_NATIVE_INPUTS = 113;
+    private static final int HUD_UPSCALER_PROOF_VALUE_COUNT = 114;
     private LinearLayout loadingProgressPanel;
+    private TextView loadingStatusText;
+    private ThinSpinnerView loadingSpinner;
+    private final LoadingProgressState loadingState = new LoadingProgressState();
     private TextView loadingBlocksText;
     private boolean launcherMode;
     private LauncherUi launcherUi;
     private int renderResolutionMode = SettingsActivity.DEFAULT_RES_MODE;
+    private int upscaledOutputResolutionMode =
+            SettingsActivity.DEFAULT_UPSCALED_OUTPUT_RES_MODE;
+    private int upscalerMode = SettingsActivity.DEFAULT_UPSCALER_MODE;
+    private int displayScalingMode = SettingsActivity.DEFAULT_DISPLAY_SCALING_MODE;
     private boolean overlayEnabledByPreference;
     private SharedPreferences liveSettings;
     private final SharedPreferences.OnSharedPreferenceChangeListener liveSettingsListener =
@@ -254,7 +396,82 @@ public class MainActivity extends Activity {
     private long runtimeHudLastSampleAtMs;
     private long[] runtimeHudLastStats;
     private long[] runtimeHudCurrentStats;
+    private long[] runtimeHudLastPmuStats;
+    private long[] runtimeHudCurrentPmuStats;
+    private long runtimeHudLastPmuReadAtMs;
+    private String runtimeHudPmuLabel = "PMU warming...";
+    private String runtimeHudVulkanStatus = "";
     private String runtimeHudEvent = "PAD ready";
+    private String pendingVulkanDriverHealthSha = "";
+    private long vulkanDriverHealthStartedAtMs;
+    private long vulkanDriverHealthInitialPresentCount;
+    private static final long ANDROID_MEMORY_MONITOR_INTERVAL_MS = 2_000L;
+
+
+
+
+
+    private static final long ANDROID_PROCESS_MEMORY_MONITOR_INTERVAL_MS = 10_000L;
+    private static final long ANDROID_MEMORY_PRESSURE_REPUBLISH_INTERVAL_MS = 10_000L;
+    private static final long ANDROID_MEMORY_WARNING_HEADROOM_MIN_BYTES =
+            1L * 1024L * 1024L * 1024L;
+
+
+
+
+
+
+
+
+
+
+
+    private static final long ANDROID_PROCESS_MEMORY_WARNING_BYTES =
+            4L * 1024L * 1024L * 1024L;
+    private static final long ANDROID_PROCESS_MEMORY_CRITICAL_BYTES =
+            19L * 256L * 1024L * 1024L;
+    private static final long ANDROID_GRAPHICS_MEMORY_WARNING_BYTES =
+            3L * 512L * 1024L * 1024L;
+    private static final long ANDROID_GRAPHICS_MEMORY_CRITICAL_BYTES =
+            5L * 512L * 1024L * 1024L;
+    private final Object androidMemoryMonitorLock = new Object();
+    private ScheduledExecutorService androidMemoryMonitorExecutor;
+    private boolean androidMemoryPressureLatched;
+    private int androidMemoryPressureLastLevel;
+    private long androidMemoryPressureLastPublishAtMs;
+    private long androidProcessMemoryLastSampleAtMs;
+    private long androidProcessMemoryTotalPssBytes;
+    private long androidProcessMemoryGraphicsBytes;
+    private long androidProcessMemoryTotalSwapBytes;
+    private boolean androidMemoryMonitorFailureLogged;
+    private final Runnable vulkanDriverHealthCheck = new Runnable() {
+        @Override
+        public void run() {
+            if (pendingVulkanDriverHealthSha.isEmpty()
+                    || isFinishing() || isDestroyed()) {
+                return;
+            }
+            if (runtimePauseController != null && runtimePauseController.shouldBePaused()) {
+                runtimeHudHandler.postDelayed(this, 1_000L);
+                return;
+            }
+            long presents = readPresentCounter();
+            long elapsed = SystemClock.elapsedRealtime() - vulkanDriverHealthStartedAtMs;
+            if (presents >= vulkanDriverHealthInitialPresentCount + 1L
+                    && importedTurnipIsActuallyEffective(pendingVulkanDriverHealthSha)) {
+                VulkanDriverManager.confirmGameLaunch(
+                        MainActivity.this, pendingVulkanDriverHealthSha);
+                Log.i(TAG, "EXECUTOR_VULKAN_DRIVER_HEALTH confirmed sha="
+                        + pendingVulkanDriverHealthSha + " presents=" + presents
+                        + " elapsedMs=" + elapsed);
+                refreshGuestCpuDriverAxisAfterVulkanLock(
+                        "turnip-health-confirm");
+                pendingVulkanDriverHealthSha = "";
+                return;
+            }
+            runtimeHudHandler.postDelayed(this, 1_000L);
+        }
+    };
     private boolean frameDetectionInFlight;
     private boolean frameCaught;
     private int frameProbeAcceptedStreak;
@@ -264,10 +481,14 @@ public class MainActivity extends Activity {
             if (!runtimeHudRunning || isFinishing() || isDestroyed()) {
                 return;
             }
+            if (runtimePauseController != null && runtimePauseController.shouldBePaused()) {
+                runtimeHudHandler.postDelayed(this, 500);
+                return;
+            }
             sampleRuntimeHudStats();
             renderLoadingProgress();
             renderRuntimeDebugHud();
-            if (!frameCaught) {
+            if (!frameCaught && loadingState.status() != LoadingProgressState.Status.ERROR) {
                 requestTinyGuestFrameProbe();
             }
             if (frameCaught && !inputDebugHud) {
@@ -277,6 +498,466 @@ public class MainActivity extends Activity {
             runtimeHudHandler.postDelayed(this, frameCaught ? 1000 : 500);
         }
     };
+
+    private void startAndroidMemoryPressureMonitor() {
+        boolean supportedA750Driver = "mesa-turnip".equals(runtimeDriverFamily)
+                || "qualcomm-proprietary".equals(runtimeDriverFamily);
+        if (launcherMode
+                || !"adreno-750".equals(runtimeHardwareProfile)
+                || !supportedA750Driver) {
+            return;
+        }
+        synchronized (androidMemoryMonitorLock) {
+            if (androidMemoryMonitorExecutor != null) {
+                return;
+            }
+            androidMemoryPressureLatched = false;
+            androidMemoryPressureLastLevel = 0;
+            androidMemoryPressureLastPublishAtMs = 0L;
+            androidProcessMemoryLastSampleAtMs = 0L;
+            androidProcessMemoryTotalPssBytes = 0L;
+            androidProcessMemoryGraphicsBytes = 0L;
+            androidProcessMemoryTotalSwapBytes = 0L;
+            androidMemoryMonitorFailureLogged = false;
+            androidMemoryMonitorExecutor = Executors.newSingleThreadScheduledExecutor(
+                    runnable -> {
+                        Thread thread = new Thread(runnable, "LSX4MemoryWatch");
+                        thread.setDaemon(true);
+                        thread.setPriority(Thread.MIN_PRIORITY);
+                        return thread;
+                    });
+            androidMemoryMonitorExecutor.scheduleWithFixedDelay(
+                    this::sampleAndroidMemoryPressure,
+                    0L, ANDROID_MEMORY_MONITOR_INTERVAL_MS,
+                    TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void stopAndroidMemoryPressureMonitor() {
+        ScheduledExecutorService executor;
+        synchronized (androidMemoryMonitorLock) {
+            executor = androidMemoryMonitorExecutor;
+            androidMemoryMonitorExecutor = null;
+            androidMemoryPressureLatched = false;
+            androidMemoryPressureLastLevel = 0;
+            androidMemoryPressureLastPublishAtMs = 0L;
+            androidProcessMemoryLastSampleAtMs = 0L;
+            androidProcessMemoryTotalPssBytes = 0L;
+            androidProcessMemoryGraphicsBytes = 0L;
+            androidProcessMemoryTotalSwapBytes = 0L;
+        }
+        if (executor != null) {
+            executor.shutdownNow();
+        }
+    }
+
+    private void sampleAndroidMemoryPressure() {
+        try {
+
+
+            if (RuntimeBridge.androidMemoryPressureMonitorRequested() != 1) {
+                return;
+            }
+            ActivityManager manager =
+                    (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+            if (manager == null) {
+                return;
+            }
+            ActivityManager.MemoryInfo info = new ActivityManager.MemoryInfo();
+            manager.getMemoryInfo(info);
+            long now = SystemClock.elapsedRealtime();
+            boolean processSampleFresh = androidProcessMemoryLastSampleAtMs == 0L
+                    || now - androidProcessMemoryLastSampleAtMs
+                            >= ANDROID_PROCESS_MEMORY_MONITOR_INTERVAL_MS;
+            long processSampleElapsedNs = 0L;
+            if (processSampleFresh) {
+                long processSampleStartedNs = SystemClock.elapsedRealtimeNanos();
+                Debug.MemoryInfo processInfo = new Debug.MemoryInfo();
+                Debug.getMemoryInfo(processInfo);
+                processSampleElapsedNs = Math.max(
+                        0L, SystemClock.elapsedRealtimeNanos() - processSampleStartedNs);
+                androidProcessMemoryTotalPssBytes = kibToBytes(processInfo.getTotalPss());
+                androidProcessMemoryTotalSwapBytes = kibToBytes(
+                        memoryStatKb(processInfo, "summary.total-swap"));
+                androidProcessMemoryGraphicsBytes = kibToBytes(
+                        memoryStatKb(processInfo, "summary.graphics"));
+                androidProcessMemoryLastSampleAtMs = now;
+            }
+            long totalPssBytes = androidProcessMemoryTotalPssBytes;
+            long totalSwapBytes = androidProcessMemoryTotalSwapBytes;
+            long graphicsBytes = androidProcessMemoryGraphicsBytes;
+
+
+
+
+            long processFootprintBytes = totalPssBytes;
+            long threshold = Math.max(0L, info.threshold);
+            long available = Math.max(0L, info.availMem);
+            long warningHeadroom = Math.max(
+                    ANDROID_MEMORY_WARNING_HEADROOM_MIN_BYTES,
+                    threshold / 2L);
+            long warningThreshold = threshold > Long.MAX_VALUE - warningHeadroom
+                    ? Long.MAX_VALUE : threshold + warningHeadroom;
+            int level = info.lowMemory || (threshold > 0L && available <= threshold)
+                    ? ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL
+                    : (threshold > 0L && available <= warningThreshold)
+                            ? ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW : 0;
+            int processLevel = processFootprintBytes
+                            >= ANDROID_PROCESS_MEMORY_CRITICAL_BYTES
+                    || graphicsBytes >= ANDROID_GRAPHICS_MEMORY_CRITICAL_BYTES
+                    ? ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL
+                    : processFootprintBytes >= ANDROID_PROCESS_MEMORY_WARNING_BYTES
+                            || graphicsBytes >= ANDROID_GRAPHICS_MEMORY_WARNING_BYTES
+                            ? ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW : 0;
+            level = Math.max(level, processLevel);
+
+            boolean publishPressure = false;
+            synchronized (androidMemoryMonitorLock) {
+                if (androidMemoryMonitorExecutor == null) {
+                    return;
+                }
+                if (level != 0
+                        && (!androidMemoryPressureLatched
+                            || level > androidMemoryPressureLastLevel
+                            || now - androidMemoryPressureLastPublishAtMs
+                                    >= ANDROID_MEMORY_PRESSURE_REPUBLISH_INTERVAL_MS)) {
+                    androidMemoryPressureLatched = true;
+                    androidMemoryPressureLastLevel = level;
+                    androidMemoryPressureLastPublishAtMs = now;
+                    publishPressure = true;
+                } else if (level == 0 && threshold > 0L
+                        && available > threshold + warningHeadroom * 2L) {
+                    androidMemoryPressureLatched = false;
+                    androidMemoryPressureLastLevel = 0;
+                    androidMemoryPressureLastPublishAtMs = 0L;
+                }
+            }
+            RuntimeBridge.reportAndroidMemoryInfo(
+                    publishPressure ? level : 0,
+                    available, threshold, info.lowMemory);
+            if (processSampleFresh) {
+                RuntimeBridge.reportAndroidProcessMemoryInfo(
+                        totalPssBytes, graphicsBytes, totalSwapBytes);
+            }
+            if (publishPressure) {
+                Log.w(TAG, "EXECUTOR_ANDROID_MEMORY_INFO_PRESSURE level=" + level
+                        + " availableMiB=" + (available / (1024L * 1024L))
+                        + " thresholdMiB=" + (threshold / (1024L * 1024L))
+                        + " processPssMiB=" + (totalPssBytes / (1024L * 1024L))
+                        + " graphicsMiB=" + (graphicsBytes / (1024L * 1024L))
+                        + " rawSwapMiB=" + (totalSwapBytes / (1024L * 1024L))
+                        + " sampleMs=" + (processSampleElapsedNs / 1_000_000L)
+                        + " processSampleFresh=" + processSampleFresh
+                        + " lowMemory=" + info.lowMemory);
+            }
+        } catch (Throwable error) {
+            synchronized (androidMemoryMonitorLock) {
+                if (androidMemoryMonitorFailureLogged) {
+                    return;
+                }
+                androidMemoryMonitorFailureLogged = true;
+            }
+            Log.w(TAG, "Android memory monitor unavailable", error);
+        }
+    }
+
+    private static long memoryStatKb(Debug.MemoryInfo memory, String key) {
+        String value = memory.getMemoryStat(key);
+        if (value == null || value.isEmpty()) {
+            return 0L;
+        }
+        try {
+            return Math.max(0L, Long.parseLong(value));
+        } catch (NumberFormatException ignored) {
+            return 0L;
+        }
+    }
+
+    private static long kibToBytes(long kibibytes) {
+        if (kibibytes <= 0L) {
+            return 0L;
+        }
+        return kibibytes > Long.MAX_VALUE / 1024L
+                ? Long.MAX_VALUE : kibibytes * 1024L;
+    }
+
+    private static final String PERF_HINT_SETTING =
+            SettingsActivity.K_ANDROID_PERFORMANCE_HINT;
+
+
+
+
+    private static final long PERF_HINT_TARGET_NANOS = 16_666_667L;
+    private static final long PERF_HINT_MAX_REPORT_NANOS = 200_000_000L;
+    private static final int PERF_HINT_TICK_MS = 500;
+    private static final int PERF_HINT_THREAD_REFRESH_TICKS = 8;
+    private static final int PERF_HINT_MAX_THREADS = 10;
+    private final Handler perfHintHandler = new Handler(Looper.getMainLooper());
+    private Object perfHintSession;
+    private boolean perfHintRunning;
+    private long perfHintLastSampleAtNanos;
+    private long perfHintLastPresentCount = -1L;
+    private int perfHintTickCount;
+    private int[] perfHintThreadIds;
+    private boolean perfHintNativeHandoff;
+
+    private final Runnable perfHintTick = new Runnable() {
+        @Override
+        public void run() {
+            if (!perfHintRunning || isFinishing() || isDestroyed()) {
+                return;
+            }
+            if (runtimePauseController != null && runtimePauseController.shouldBePaused()) {
+                perfHintHandler.postDelayed(this, PERF_HINT_TICK_MS);
+                return;
+            }
+            updatePerformanceHintSession();
+
+
+
+            if (!perfHintRunning) {
+                return;
+            }
+            dumpJitStatusPeriodically();
+            perfHintHandler.postDelayed(this, PERF_HINT_TICK_MS);
+        }
+    };
+
+    private boolean performanceHintRequested() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return false;
+        }
+        boolean enabled = ProcessSafePreferences.get(this)
+                .getBoolean(PERF_HINT_SETTING, true);
+        Intent intent = getIntent();
+        if (intent != null && intent.hasExtra(PERF_HINT_SETTING)) {
+            enabled = intent.getBooleanExtra(PERF_HINT_SETTING, enabled);
+        }
+        return enabled;
+    }
+
+    private void startPerformanceHintSession() {
+        if (perfHintRunning || perfHintSession != null || !performanceHintRequested()) {
+            return;
+        }
+        try {
+            int[] threads = collectHotThreadIds();
+            Object session = AndroidApiCompat.createPerformanceHintSession(
+                    this, threads, PERF_HINT_TARGET_NANOS);
+            if (session == null) {
+                append("ADPF hint session unavailable");
+                return;
+            }
+            perfHintSession = session;
+            perfHintThreadIds = threads;
+            perfHintRunning = true;
+            perfHintTickCount = 0;
+            perfHintLastPresentCount = -1L;
+            perfHintLastSampleAtNanos = System.nanoTime();
+            perfHintNativeHandoff = false;
+            Log.i(TAG, "ADPF hint session started threads=" + threads.length
+                    + " target=" + PERF_HINT_TARGET_NANOS + "ns");
+            append("ADPF boost on (" + threads.length + " threads)");
+            perfHintHandler.postDelayed(perfHintTick, PERF_HINT_TICK_MS);
+        } catch (Throwable t) {
+            perfHintSession = null;
+            perfHintRunning = false;
+            Log.w(TAG, "ADPF hint session failed: " + t);
+        }
+    }
+
+    private void stopPerformanceHintSession() {
+        perfHintRunning = false;
+        perfHintHandler.removeCallbacks(perfHintTick);
+        Object session = perfHintSession;
+        perfHintSession = null;
+        perfHintThreadIds = null;
+        perfHintLastPresentCount = -1L;
+        perfHintNativeHandoff = false;
+        if (session == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return;
+        }
+        try {
+            AndroidApiCompat.closePerformanceHintSession(session);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void updatePerformanceHintSession() {
+        Object rawSession = perfHintSession;
+        if (rawSession == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return;
+        }
+        perfHintTickCount++;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+                && perfHintTickCount % PERF_HINT_THREAD_REFRESH_TICKS == 0) {
+            try {
+                int[] refreshed = collectHotThreadIds();
+                if (refreshed.length > 0 && !java.util.Arrays.equals(refreshed, perfHintThreadIds)) {
+                    AndroidApiCompat.setPerformanceHintThreads(rawSession, refreshed);
+                    perfHintThreadIds = refreshed;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        long now = System.nanoTime();
+        long presentCount = readPresentCounter();
+        if (presentCount > 0L) {
+            PlatformPerformanceController.markGameplay(this);
+            if (!perfHintNativeHandoff) {
+                perfHintNativeHandoff = true;
+                perfHintRunning = false;
+                try {
+                    AndroidApiCompat.closePerformanceHintSession(rawSession);
+                } catch (Throwable ignored) {
+                }
+                perfHintSession = null;
+                perfHintThreadIds = null;
+                Log.i(TAG, "ADPF loading session handed off to native frame session");
+                return;
+            }
+        }
+        long elapsed = now - perfHintLastSampleAtNanos;
+        long actual;
+        if (presentCount < 0 || elapsed <= 0L) {
+            return;
+        }
+        if (perfHintLastPresentCount >= 0L && presentCount > perfHintLastPresentCount) {
+            long frames = presentCount - perfHintLastPresentCount;
+            actual = elapsed / frames;
+        } else if (perfHintLastPresentCount >= 0L) {
+            actual = PERF_HINT_MAX_REPORT_NANOS;
+        } else {
+            perfHintLastPresentCount = presentCount;
+            perfHintLastSampleAtNanos = now;
+            return;
+        }
+        perfHintLastPresentCount = presentCount;
+        perfHintLastSampleAtNanos = now;
+        if (actual <= 0L) {
+            return;
+        }
+        if (actual > PERF_HINT_MAX_REPORT_NANOS) {
+            actual = PERF_HINT_MAX_REPORT_NANOS;
+        }
+        try {
+            AndroidApiCompat.reportActualWorkDuration(rawSession, actual);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private int jitStatusDumpTicks;
+
+    private void dumpJitStatusPeriodically() {
+
+
+
+        if (!runtimeLoaded || (++jitStatusDumpTicks % 40) != 0) {
+            return;
+        }
+        try {
+            String status = RuntimeBridge.jitStatus();
+            if (status == null || status.isEmpty()) {
+                return;
+            }
+            java.io.File out = new java.io.File(getFilesDir(), "jit-status.json");
+            try (java.io.FileOutputStream stream = new java.io.FileOutputStream(out, false)) {
+                stream.write(status.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private long readPresentCounter() {
+        if (!runtimeLoaded) {
+            return -1L;
+        }
+        if (runtimePauseController != null && runtimePauseController.shouldBePaused()) {
+            return runtimeHudCurrentStats != null && runtimeHudCurrentStats.length > 10
+                    ? runtimeHudCurrentStats[10] : -1L;
+        }
+        try {
+            long[] stats = RuntimeBridge.runtimeHudStats();
+            if (stats == null || stats.length <= 10) {
+                return -1L;
+            }
+            return stats[10];
+        } catch (Throwable t) {
+            return -1L;
+        }
+    }
+
+    private int[] collectHotThreadIds() {
+        int self = android.os.Process.myTid();
+        File taskDir = new File("/proc/self/task");
+        String[] entries = taskDir.list();
+        if (entries == null || entries.length == 0) {
+            return new int[] {self};
+        }
+        long[][] scored = new long[entries.length][2];
+        int count = 0;
+        for (String entry : entries) {
+            int tid;
+            try {
+                tid = Integer.parseInt(entry);
+            } catch (NumberFormatException ignored) {
+                continue;
+            }
+            long cpu = readThreadCpuTicks(entry);
+            if (cpu < 0L) {
+                continue;
+            }
+            scored[count][0] = cpu;
+            scored[count][1] = tid;
+            count++;
+        }
+        if (count == 0) {
+            return new int[] {self};
+        }
+        java.util.Arrays.sort(scored, 0, count, (left, right) -> Long.compare(right[0], left[0]));
+        int limit = Math.min(PERF_HINT_MAX_THREADS, count);
+        java.util.LinkedHashSet<Integer> selected = new java.util.LinkedHashSet<>();
+        selected.add(self);
+        for (int i = 0; i < limit && selected.size() < PERF_HINT_MAX_THREADS; i++) {
+            selected.add((int) scored[i][1]);
+        }
+        int[] result = new int[selected.size()];
+        int index = 0;
+        for (Integer tid : selected) {
+            result[index++] = tid;
+        }
+        return result;
+    }
+
+    private long readThreadCpuTicks(String tid) {
+        java.io.BufferedReader reader = null;
+        try {
+            reader = new java.io.BufferedReader(
+                    new java.io.FileReader("/proc/self/task/" + tid + "/stat"));
+            String line = reader.readLine();
+            if (line == null) {
+                return -1L;
+            }
+            int tail = line.lastIndexOf(')');
+            if (tail < 0 || tail + 2 >= line.length()) {
+                return -1L;
+            }
+            String[] fields = line.substring(tail + 2).split(" ");
+            if (fields.length < 13) {
+                return -1L;
+            }
+            return Long.parseLong(fields[11]) + Long.parseLong(fields[12]);
+        } catch (Throwable t) {
+            return -1L;
+        } finally {
+            if (reader != null) {
+                try {
+                    reader.close();
+                } catch (java.io.IOException ignored) {
+                }
+            }
+        }
+    }
 
     private void migrateLegacyPrivateHome() {
         File legacyHome = new File(getFilesDir(), "shad" + "ps4-home");
@@ -304,7 +985,7 @@ public class MainActivity extends Activity {
             return;
         }
         SharedPreferences current =
-                getSharedPreferences(SettingsActivity.PREFS, MODE_PRIVATE);
+                ProcessSafePreferences.get(this);
         SharedPreferences.Editor editor = current.edit();
         boolean changed = false;
         for (java.util.Map.Entry<String, ?> entry : legacy.getAll().entrySet()) {
@@ -373,16 +1054,152 @@ public class MainActivity extends Activity {
         super.attachBaseContext(AppLocale.wrap(base));
     }
 
+    private void preparePs1ClassicLaunch(Intent intent) {
+        if (intent == null) {
+            return;
+        }
+        String launchPath = intent.getStringExtra(EXTRA_LAUNCH_GAME_PATH);
+        if (launchPath == null || launchPath.isEmpty()) {
+            return;
+        }
+        File eboot = new File(launchPath);
+        File app0 = eboot.getParentFile();
+        if (app0 == null
+                || !new File(app0, "conf/PS1HD/package-ps4.conf").isFile()
+                || !new File(app0, "assets/common/PS1FullScreen.png").isFile()) {
+            return;
+        }
+        try {
+            File titleConfig = new File(app0, "config-title.txt");
+            String titleOptions = readUtf8File(titleConfig);
+            String region = optionValue(titleOptions, "--region-dir=");
+            if (region == null || !region.matches("[A-Za-z0-9_-]{1,32}")) {
+                Log.w(TAG, "PS1 Classics compatibility skipped: invalid region-dir");
+                return;
+            }
+            File regionConfig = new File(new File(app0, region), "config-region.txt");
+            if (!regionConfig.isFile()) {
+                Log.w(TAG, "PS1 Classics compatibility skipped: missing " + regionConfig);
+                return;
+            }
+            String original = readUtf8File(regionConfig);
+            String updated = setBooleanOption(original, "--userui-region-selector", false);
+            updated = setBooleanOption(updated, "--has-shown-start-select-help", true);
+            if (updated.equals(original)) {
+                Log.i(TAG, "PS1 Classics compatibility already active region=" + region);
+                return;
+            }
+            File backup = new File(regionConfig.getPath() + ".lsx4-original");
+            if (!backup.exists()) {
+                writeUtf8FileAtomically(backup, original);
+            }
+            writeUtf8FileAtomically(regionConfig, updated);
+            Log.i(TAG, "PS1 Classics compatibility enabled region=" + region
+                    + " config=" + regionConfig);
+        } catch (Exception error) {
+            Log.e(TAG, "PS1 Classics compatibility preparation failed", error);
+        }
+    }
+
+    private static String readUtf8File(File file) throws java.io.IOException {
+        long length = file.length();
+        if (length < 0 || length > 1024 * 1024) {
+            throw new java.io.IOException("Invalid config size: " + length);
+        }
+        byte[] bytes = new byte[(int) length];
+        int offset = 0;
+        try (FileInputStream input = new FileInputStream(file)) {
+            while (offset < bytes.length) {
+                int count = input.read(bytes, offset, bytes.length - offset);
+                if (count < 0) {
+                    break;
+                }
+                offset += count;
+            }
+        }
+        return new String(bytes, 0, offset, StandardCharsets.UTF_8);
+    }
+
+    private static String optionValue(String text, String prefix) {
+        for (String line : text.split("\\r?\\n")) {
+            String value = line.trim();
+            if (value.startsWith(prefix)) {
+                return value.substring(prefix.length()).trim();
+            }
+        }
+        return null;
+    }
+
+    private static String setBooleanOption(String text, String name, boolean enabled) {
+        String wanted = name + "=" + (enabled ? "1" : "false");
+        StringBuilder result = new StringBuilder(text.length() + wanted.length() + 2);
+        boolean replaced = false;
+        for (String line : text.split("\\r?\\n", -1)) {
+            String trimmed = line.trim();
+            if (trimmed.startsWith(name + "=")) {
+                if (!replaced) {
+                    result.append(wanted);
+                    replaced = true;
+                }
+            } else {
+                result.append(line);
+            }
+            result.append('\n');
+        }
+        if (!replaced) {
+            result.append(wanted).append('\n');
+        }
+        return result.toString();
+    }
+
+    private static void writeUtf8FileAtomically(File destination, String text)
+            throws java.io.IOException {
+        File parent = destination.getParentFile();
+        if (parent == null || (!parent.isDirectory() && !parent.mkdirs())) {
+            throw new java.io.IOException("Cannot create config directory: " + parent);
+        }
+        File temporary = new File(parent, destination.getName() + ".lsx4-tmp");
+        try (FileOutputStream output = new FileOutputStream(temporary, false)) {
+            output.write(text.getBytes(StandardCharsets.UTF_8));
+            output.getFD().sync();
+        }
+        if (destination.exists() && !destination.delete()) {
+            throw new java.io.IOException("Cannot replace " + destination);
+        }
+        if (!temporary.renameTo(destination)) {
+            throw new java.io.IOException("Cannot publish " + destination);
+        }
+    }
+
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        if (getClass() == MainActivity.class) {
+            try {
+                SharedGameStorage.requestAccessIfNeeded(this);
+            } catch (RuntimeException accessError) {
+                Log.w(TAG, "Could not open shared game storage settings", accessError);
+            }
+        }
         Log.i(TAG, "EXECUTOR_UI_BUILD_MARKER=" + BUILD_MARKER);
+        ProcessSafePreferences.refresh(this);
+        if (getClass() != MainActivity.class) {
+            runtimePauseController = new RuntimePauseController(this::applyNativeRuntimePaused);
+            runtimePauseController.setReason(RuntimePauseController.REASON_SURFACE_UNAVAILABLE, true);
+            gameSession = new GameSessionConnection(this, this::finishGameProcess);
+        }
         migrateLegacyPrivateHome();
         migrateLegacyPreferences();
         TestModeManager.reconcileBuildScope(this);
 
         if (getClass() == MainActivity.class) {
-            if (isLauncherHomeIntent(getIntent()) || !hasIntentAutomationExtras(getIntent())) {
+            launcherMode = true;
+            boolean foregroundExit = GameSessionProvider.consumeForegroundExit(this, getIntent());
+            if (foregroundExit || isLauncherHomeIntent(getIntent()) || !hasIntentAutomationExtras(getIntent())) {
+                if (!foregroundExit && GameSessionProvider.resumeExisting(this)) {
+                    retireProcessAfterTaskHandoff(this, "launcher-return-to-game");
+                    return;
+                }
                 launcherMode = true;
                 synchronizeGameMenuPreferences(getIntent());
                 configurePortraitLauncherWindow();
@@ -391,24 +1208,45 @@ public class MainActivity extends Activity {
                 return;
             }
             routeIntentToGameActivity(getIntent());
-            finish();
+            retireProcessAfterTaskHandoff(this, "launcher-automation");
             return;
         }
 
         Log.i(TAG, "Lifecycle onCreate fullscreen=" + wantsFullscreenRender());
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
+        gameAudioFocus = new GameAudioFocus(this, available -> {
+            setRuntimePauseReason(RuntimePauseController.REASON_AUDIO_FOCUS_LOST,
+                    !available, "audio-focus");
+            if (!available && !gameExitRequested) {
+                requestGameDrawerOpen("audio-interruption");
+                if (gameMenuSubtitle != null) gameMenuSubtitle.setText(R.string.game_menu_audio_focus);
+            }
+        });
         fullscreenRender = wantsFullscreenRender();
         ps5Runtime = PLATFORM_PS5.equalsIgnoreCase(
                 getIntent().getStringExtra(EXTRA_GAME_PLATFORM));
+        if (!ps5Runtime) {
+            preparePs1ClassicLaunch(getIntent());
+        }
+        RemoteDiagnostics.setGameContext(
+                getIntent().getStringExtra(EXTRA_LAUNCH_GAME_PATH),
+                ps5Runtime ? PLATFORM_PS5 : "ps4");
         configureLandscapeWindow();
 
-        SharedPreferences appSettings = getSharedPreferences(SettingsActivity.PREFS, MODE_PRIVATE);
+        SharedPreferences appSettings = SettingsActivity.prefsForGame(
+                this, launchTitleId());
         renderResolutionMode = resolveRenderResolutionMode(getIntent(), appSettings);
-        applyExtremePerformanceProfile(appSettings, renderResolutionMode);
+        upscaledOutputResolutionMode = resolveUpscaledOutputResolutionMode(
+                getIntent(), appSettings, renderResolutionMode);
+        upscalerMode = resolveUpscalerMode(getIntent(), appSettings);
+        displayScalingMode = resolveDisplayScalingMode(appSettings);
+        seedGraphicsDefaults(appSettings);
+        applyDebugGraphicsProfileOverride(getIntent(), appSettings);
         liveSettings = appSettings;
         liveSettings.registerOnSharedPreferenceChangeListener(liveSettingsListener);
+        launchSettingsInitialized = true;
         try {
-            GraphicsBackend.selected(this).writeLaunchConfiguration(this);
+            GraphicsBackend.selected(this, appSettings).writeLaunchConfiguration(this);
         } catch (Exception error) {
             Log.e(TAG, "Graphics backend configuration could not be written", error);
         }
@@ -417,14 +1255,16 @@ public class MainActivity extends Activity {
         refreshExternalGamepadState();
         inputDebugHud = getIntent().getBooleanExtra("input_debug_hud", false)
                 || appSettings.getBoolean(SettingsActivity.K_PERF_HUD, false);
+        showDebugHudUpscalerInfo = appSettings.getBoolean(
+                SettingsActivity.K_PERF_HUD_UPSCALER_INFO, false);
         if (fullscreenRender) {
             enableFullscreenRenderMode();
         }
 
-        runtimeFile = new File(new File(getFilesDir(), "runtime"),
-                ps5Runtime
-                        ? "liblsx4_executor_ps5_android.so"
-                        : "liblsx4_executor_android.so");
+
+
+
+        runtimeFile = selectRuntimeFileForLaunch();
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -449,27 +1289,25 @@ public class MainActivity extends Activity {
         }
 
         FrameLayout renderFrame = new FrameLayout(this);
+
+
+        renderFrame.setClipChildren(true);
+        renderFrame.setClipToPadding(true);
         gameRenderFrame = renderFrame;
         SurfaceView renderSurface = new SurfaceView(this) {
             @Override
             protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
                 int w = MeasureSpec.getSize(widthMeasureSpec);
                 int h = MeasureSpec.getSize(heightMeasureSpec);
-                if (fullscreenRender
-                        && renderResolutionMode != SettingsActivity.RES_NATIVE
-                        && w > 0 && h > 0) {
-                    int guestWidth =
-                            SettingsActivity.resolutionWidth(renderResolutionMode);
-                    int guestHeight =
-                            SettingsActivity.resolutionHeight(renderResolutionMode);
-                    float guestAspect = guestWidth > 0 && guestHeight > 0
-                            ? (float) guestWidth / (float) guestHeight
-                            : 16f / 9f;
-                    if ((float) w / (float) h > guestAspect) {
-                        w = Math.round(h * guestAspect);
-                    } else {
-                        h = Math.round(w / guestAspect);
-                    }
+                if (fullscreenRender && w > 0 && h > 0) {
+                    int outputMode = effectiveOutputResolutionMode();
+                    int sourceWidth = SettingsActivity.resolutionWidth(outputMode);
+                    int sourceHeight = SettingsActivity.resolutionHeight(outputMode);
+                    DisplayScaling.Dimensions measured = DisplayScaling.measure(
+                            w, h, sourceWidth, sourceHeight, displayScalingMode,
+                            outputMode != SettingsActivity.RES_NATIVE);
+                    w = measured.width;
+                    h = measured.height;
                 }
                 setMeasuredDimension(w, h);
             }
@@ -478,13 +1316,16 @@ public class MainActivity extends Activity {
         renderSurface.setZOrderOnTop(false);
         renderSurface.getHolder().setFormat(PixelFormat.RGBA_8888);
         if (fullscreenRender) {
-            int outputWidth = SettingsActivity.resolutionWidth(renderResolutionMode);
-            int outputHeight = SettingsActivity.resolutionHeight(renderResolutionMode);
+            int outputMode = effectiveOutputResolutionMode();
+            int outputWidth = SettingsActivity.resolutionWidth(outputMode);
+            int outputHeight = SettingsActivity.resolutionHeight(outputMode);
             if (outputWidth > 0 && outputHeight > 0) {
                 renderSurface.getHolder().setFixedSize(outputWidth, outputHeight);
             }
-            Log.i(TAG, "Requested Vulkan output resolution mode=" + renderResolutionMode
-                    + " extent=" + outputWidth + "x" + outputHeight);
+            Log.i(TAG, "Requested Vulkan source resolution mode=" + renderResolutionMode
+                    + " outputMode=" + outputMode
+                    + " extent=" + outputWidth + "x" + outputHeight
+                    + " displayScalingMode=" + displayScalingMode);
         }
         renderSurface.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override
@@ -542,6 +1383,7 @@ public class MainActivity extends Activity {
                 installDebugHud(renderFrame);
             }
             installGameSideMenu(renderFrame);
+            installCapturePanel(renderFrame);
             registerGameBackCallback();
         }
         if (fullscreenRender) {
@@ -653,15 +1495,26 @@ public class MainActivity extends Activity {
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        ProcessSafePreferences.refresh(this);
         if (launcherMode) {
             setIntent(intent);
+            boolean foregroundExit = GameSessionProvider.consumeForegroundExit(this, intent);
             synchronizeGameMenuPreferences(intent);
-            if (isLauncherHomeIntent(intent) || !hasIntentAutomationExtras(intent)) {
-                if (launcherUi != null) {
+            if (foregroundExit || isLauncherHomeIntent(intent) || !hasIntentAutomationExtras(intent)) {
+                if (!foregroundExit && GameSessionProvider.resumeExisting(this)) {
+                    retireProcessAfterTaskHandoff(this, "launcher-return-to-game");
+                    return;
+                }
+                if (launcherUi == null) {
+                    configurePortraitLauncherWindow();
+                    launcherUi = new LauncherUi(this);
+                    setContentView(launcherUi.createView());
+                } else {
                     launcherUi.refresh();
                 }
             } else {
                 routeIntentToGameActivity(intent);
+                retireProcessAfterTaskHandoff(this, "launcher-automation-resume");
             }
             return;
         }
@@ -671,31 +1524,46 @@ public class MainActivity extends Activity {
                 !incomingLaunchPath.trim().isEmpty();
         if (incomingGameLaunch && !activeGamePath.isEmpty()) {
             if (!activeGamePath.equals(incomingLaunchPath)) {
-                Log.w(TAG, "Refusing second concurrent guest: active=" + activeGamePath +
-                        " requested=" + incomingLaunchPath);
-                Toast.makeText(this,
-                        getString(R.string.another_game_active),
-                        Toast.LENGTH_LONG).show();
+                routeIntentToGameActivity(intent);
+            } else {
+                requestGameDrawerOpen("return-to-existing-game");
             }
+            return;
+        }
+        if (!incomingGameLaunch && !activeGamePath.isEmpty()) {
+
+            handleExternalControlIntent(intent);
             return;
         }
         boolean wasFullscreen = fullscreenRender;
         setIntent(intent);
         int incomingResolutionMode = resolveRenderResolutionMode(intent, liveSettings);
-        if (renderResolutionMode != incomingResolutionMode) {
+        int incomingUpscaledOutputMode = resolveUpscaledOutputResolutionMode(
+                intent, liveSettings, incomingResolutionMode);
+        int incomingUpscalerMode = resolveUpscalerMode(intent, liveSettings);
+        if (renderResolutionMode != incomingResolutionMode
+                || upscaledOutputResolutionMode != incomingUpscaledOutputMode
+                || upscalerMode != incomingUpscalerMode) {
             renderResolutionMode = incomingResolutionMode;
+            upscaledOutputResolutionMode = incomingUpscaledOutputMode;
+            upscalerMode = incomingUpscalerMode;
             applyRenderResolutionToSurface();
             materializeRenderResolutionSetting(new File(getFilesDir(), "lsx4-home"));
+        }
+        int incomingDisplayScalingMode = resolveDisplayScalingMode(liveSettings);
+        if (displayScalingMode != incomingDisplayScalingMode) {
+            displayScalingMode = incomingDisplayScalingMode;
+            applyDisplayScalingToSurface();
         }
         boolean nextPs5Runtime = PLATFORM_PS5.equalsIgnoreCase(
                 intent.getStringExtra(EXTRA_GAME_PLATFORM));
         if (ps5Runtime != nextPs5Runtime) {
             ps5Runtime = nextPs5Runtime;
             runtimeLoaded = false;
-            runtimeFile = new File(new File(getFilesDir(), "runtime"),
-                    ps5Runtime
-                            ? "liblsx4_executor_ps5_android.so"
-                            : "liblsx4_executor_android.so");
+            if (runtimePauseController != null) {
+                runtimePauseController.setRuntimeReady(false);
+            }
+            runtimeFile = defaultRuntimeFile();
         }
         boolean nextFullscreen = wantsFullscreenRender();
         if (wasFullscreen && !nextFullscreen) {
@@ -725,17 +1593,53 @@ public class MainActivity extends Activity {
                 && !hasIntentAutomationExtras();
     }
 
-    private void routeIntentToGameActivity(Intent source) {
+    void routeIntentToGameActivity(Intent source) {
         Intent routed = source == null ? new Intent() : new Intent(source);
         routed.setClass(this, GameActivity.class);
+        String titleId = routed.getStringExtra(GameProfileSettings.EXTRA_GAME_TITLE_ID);
+        if (titleId == null || titleId.isEmpty()) {
+            titleId = CpuTuningSettings.titleIdFromPath(
+                    routed.getStringExtra(EXTRA_LAUNCH_GAME_PATH));
+        }
+        ProcessSafePreferences.refresh(this);
+        routed.removeExtra(EXTRA_SETTINGS_SNAPSHOT);
+        routed.removeExtra(EXTRA_SETTINGS_SNAPSHOT_GENERATION);
+        SharedPreferences gamePreferences = SettingsActivity.prefsForGame(this, titleId);
         if (!routed.hasExtra(EXTRA_RENDER_RESOLUTION_MODE)) {
             routed.putExtra(EXTRA_RENDER_RESOLUTION_MODE, resolveRenderResolutionMode(
-                    null, SettingsActivity.prefs(this)));
+                    null, gamePreferences));
         }
-        routed.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT |
-                Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        if (!routed.hasExtra(EXTRA_UPSCALED_OUTPUT_RESOLUTION_MODE)
+                && !routed.hasExtra(EXTRA_FSR_OUTPUT_RESOLUTION_MODE)) {
+            int sourceMode = resolveRenderResolutionMode(null, gamePreferences);
+            routed.putExtra(EXTRA_UPSCALED_OUTPUT_RESOLUTION_MODE,
+                    resolveUpscaledOutputResolutionMode(null, gamePreferences, sourceMode));
+        }
+        if (!routed.hasExtra(EXTRA_UPSCALER_MODE)) {
+            routed.putExtra(EXTRA_UPSCALER_MODE,
+                    resolveUpscalerMode(null, gamePreferences));
+        }
+        routed.addFlags(crossProcessTaskFlags());
         routed.removeCategory(Intent.CATEGORY_LAUNCHER);
-        startActivity(routed);
+        GameSessionProvider.launch(this, routed);
+    }
+
+    static int crossProcessTaskFlags() {
+        int flags = CROSS_PROCESS_TASK_BASE_FLAGS;
+
+
+
+        if (!"vivo".equalsIgnoreCase(Build.MANUFACTURER)) {
+            flags |= Intent.FLAG_ACTIVITY_CLEAR_TASK;
+        }
+        return flags;
+    }
+
+    static void retireProcessAfterTaskHandoff(Activity activity, String role) {
+
+
+        Log.i(TAG, "Task handoff accepted role=" + role);
+        activity.finish();
     }
 
     private static int resolveRenderResolutionMode(
@@ -751,50 +1655,93 @@ public class MainActivity extends Activity {
                 SettingsActivity.resolutionModeToPosition(mode));
     }
 
-    private void synchronizeGameMenuPreferences(Intent intent) {
-        if (intent == null || !intent.hasExtra(EXTRA_SYNC_OVERLAY_ENABLED) ||
-                !intent.hasExtra(EXTRA_SYNC_OVERLAY_OPACITY)) {
-            return;
+    private static int resolveUpscaledOutputResolutionMode(
+            Intent intent, SharedPreferences preferences, int sourceMode) {
+        int mode = preferences == null
+                ? SettingsActivity.defaultUpscaledOutputMode(sourceMode)
+                : preferences.getInt(SettingsActivity.K_UPSCALED_OUTPUT_RES_MODE,
+                        SettingsActivity.defaultUpscaledOutputMode(sourceMode));
+        if (intent != null && intent.hasExtra(EXTRA_UPSCALED_OUTPUT_RESOLUTION_MODE)) {
+            mode = intent.getIntExtra(EXTRA_UPSCALED_OUTPUT_RESOLUTION_MODE, mode);
+        } else if (intent != null && intent.hasExtra(EXTRA_FSR_OUTPUT_RESOLUTION_MODE)) {
+            mode = intent.getIntExtra(EXTRA_FSR_OUTPUT_RESOLUTION_MODE, mode);
         }
-        boolean enabled = intent.getBooleanExtra(EXTRA_SYNC_OVERLAY_ENABLED, true);
-        int opacity = Math.max(20, Math.min(100,
-                intent.getIntExtra(EXTRA_SYNC_OVERLAY_OPACITY, 74)));
-        getSharedPreferences(SettingsActivity.PREFS, MODE_PRIVATE)
-                .edit()
-                .putBoolean(SettingsActivity.K_OVERLAY, enabled)
-                .putInt(SettingsActivity.K_OVERLAY_OPACITY, opacity)
-                .apply();
+        return SettingsActivity.sanitizeUpscaledOutputMode(sourceMode, mode);
+    }
+
+    private static int resolveUpscalerMode(
+            Intent intent, SharedPreferences preferences) {
+        int mode = preferences == null
+                ? SettingsActivity.DEFAULT_UPSCALER_MODE
+                : preferences.getInt(SettingsActivity.K_UPSCALER_MODE,
+                        SettingsActivity.DEFAULT_UPSCALER_MODE);
+        if (intent != null && intent.hasExtra(EXTRA_UPSCALER_MODE)) {
+            mode = intent.getIntExtra(EXTRA_UPSCALER_MODE, mode);
+        }
+        return SettingsActivity.sanitizeUpscalerMode(mode);
+    }
+
+    private static int resolveDisplayScalingMode(SharedPreferences preferences) {
+        int mode = preferences == null
+                ? SettingsActivity.DEFAULT_DISPLAY_SCALING_MODE
+                : preferences.getInt(SettingsActivity.K_DISPLAY_SCALING_MODE,
+                        SettingsActivity.DEFAULT_DISPLAY_SCALING_MODE);
+        return DisplayScaling.sanitize(mode);
+    }
+
+    private void synchronizeGameMenuPreferences(Intent intent) {
+
+
+        ProcessSafePreferences.refresh(this);
     }
 
     private void configurePortraitLauncherWindow() {
-        setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+        setRequestedOrientation(launcherUi != null ? launcherUi.requestedOrientation()
+                : ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN |
                 WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
         UiChrome.preparePortraitWindow(this);
+        if (launcherUi != null) {
+            launcherUi.applyWindowMode();
+        }
     }
 
     private void updateBackendLabel() {
         if (backendLabel == null) {
             return;
         }
-        boolean jitActive = false;
-        String runtimeStatus = "";
-        if (runtimeLoaded) {
-            try {
-                runtimeStatus = RuntimeBridge.jitStatus();
-                jitActive = runtimeStatus != null &&
-                        (runtimeStatus.contains("\"selectedBackend\":\"jit") ||
-                                runtimeStatus.contains("\"name\":\"embedded-aarch64-jit-b\""));
-            } catch (Throwable e) {
-                Log.w(TAG, "Backend label runtime status unavailable", e);
-            }
+        boolean fallback = requestedGuestCpuBackend != effectiveGuestCpuBackend;
+        backendLabel.setBackgroundColor(fallback ? 0xeeef6c00 : 0xee1565c0);
+        if (fallback) {
+            String reason = guestCpuBackendStatusField("fallbackReason");
+            backendLabel.setText(GuestCpuBackend.label(this, requestedGuestCpuBackend)
+                    + " unavailable\n"
+                    + GuestCpuBackend.label(this, effectiveGuestCpuBackend)
+                    + " active: " + (reason.isEmpty() ? "unknown" : reason));
+        } else {
+            backendLabel.setText(GuestCpuBackend.label(this, effectiveGuestCpuBackend)
+                    + " active");
         }
-        backendLabel.setBackgroundColor(0xee1565c0);
-        backendLabel.setText(R.string.aarch64_jit);
-        Log.i(TAG, "EXECUTOR_UI_JIT_LABEL active=" + jitActive +
-                " shown=AArch64 JIT" +
-                " runtimeStatus=" + runtimeStatus);
+        Log.i(TAG, "EXECUTOR_UI_CPU_BACKEND requested=" + requestedGuestCpuBackend
+                + " effective=" + effectiveGuestCpuBackend
+                + " fallback=" + fallback
+                + " status=" + guestCpuBackendStatus);
+    }
+
+    private String guestCpuBackendStatusField(String field) {
+        if (guestCpuBackendStatus == null || guestCpuBackendStatus.isEmpty()
+                || field == null || field.isEmpty()) {
+            return "";
+        }
+        String prefix = "\"" + field + "\":\"";
+        int start = guestCpuBackendStatus.indexOf(prefix);
+        if (start < 0) {
+            return "";
+        }
+        start += prefix.length();
+        int end = guestCpuBackendStatus.indexOf('"', start);
+        return end > start ? guestCpuBackendStatus.substring(start, end) : "";
     }
 
     private void handleExternalControlIntent(Intent intent) {
@@ -979,6 +1926,8 @@ public class MainActivity extends Activity {
         if (launcherMode) {
             return;
         }
+        setRuntimePauseReason(RuntimePauseController.REASON_WINDOW_FOCUS_LOST, !hasFocus,
+                hasFocus ? "window-focus-gained" : "window-focus-lost");
         if (hasFocus && fullscreenRender) {
             enableFullscreenRenderMode();
         }
@@ -990,29 +1939,52 @@ public class MainActivity extends Activity {
         if (launcherMode) {
             configurePortraitLauncherWindow();
             if (launcherUi != null) {
+                launcherUi.setMenuActive(true);
                 launcherUi.refresh();
             }
             return;
         }
         append("Lifecycle onResume fullscreen=" + fullscreenRender);
+        ProcessSafePreferences.refresh(this);
+        if (gameAudioFocus != null) {
+            gameAudioFocus.resume(gamePreferences().getBoolean(SettingsActivity.K_AUDIO, true));
+        }
+        attachSurfaceIfReady();
+        if (gameCaptureController != null) gameCaptureController.onGameForegrounded();
+        setRuntimePauseReason(RuntimePauseController.REASON_ACTIVITY_STOPPED, false,
+                "activity-resume-stop-release");
+        setRuntimePauseReason(RuntimePauseController.REASON_ACTIVITY_BACKGROUND, false,
+                "activity-resume");
         configureLandscapeWindow();
-        SharedPreferences appSettings = getSharedPreferences(SettingsActivity.PREFS, MODE_PRIVATE);
-        applyLiveSetting(appSettings, null);
+        applyLiveSetting(gamePreferences(), null);
         registerInputDeviceListener();
         refreshExternalGamepadState();
         if (fullscreenRender) {
             enableFullscreenRenderMode();
             startSystemImeBridge();
         }
+        startPerformanceHintSession();
+        startAndroidMemoryPressureMonitor();
+        PlatformPerformanceController.start(this, fullscreenRender, gamePreferences());
     }
 
     @Override
     protected void onPause() {
         if (launcherMode) {
+            if (launcherUi != null) launcherUi.setMenuActive(false);
             super.onPause();
             return;
         }
         append("Lifecycle onPause fullscreen=" + fullscreenRender);
+        if (gameAudioFocus != null) gameAudioFocus.pause();
+        if (gameCaptureController != null) gameCaptureController.onGameBackgrounded();
+        if (gameCapturePanel != null) gameCapturePanel.collapse();
+        if (!gameExitRequested) requestGameDrawerOpen("activity-background");
+        setRuntimePauseReason(RuntimePauseController.REASON_ACTIVITY_BACKGROUND, true,
+                "activity-pause");
+        PlatformPerformanceController.stop(this);
+        stopPerformanceHintSession();
+        stopAndroidMemoryPressureMonitor();
         stopSystemImeBridge();
         resetExternalGamepadInputs();
         unregisterInputDeviceListener();
@@ -1026,11 +1998,31 @@ public class MainActivity extends Activity {
             return;
         }
         append("Lifecycle onStop fullscreen=" + fullscreenRender);
+        setRuntimePauseReason(RuntimePauseController.REASON_ACTIVITY_STOPPED, true,
+                "activity-stop");
         super.onStop();
     }
 
     @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (!launcherMode) {
+            RuntimeBridge.reportAndroidMemoryPressure(level);
+        }
+    }
+
+    @Override
+    public void onLowMemory() {
+        super.onLowMemory();
+        if (!launcherMode) {
+            RuntimeBridge.reportAndroidMemoryPressure(
+                    ComponentCallbacks2.TRIM_MEMORY_COMPLETE);
+        }
+    }
+
+    @Override
     protected void onDestroy() {
+        stopAndroidMemoryPressureMonitor();
         if (launcherMode) {
             if (launcherUi != null) {
                 launcherUi.destroy();
@@ -1039,12 +2031,21 @@ public class MainActivity extends Activity {
             return;
         }
         append("Lifecycle onDestroy fullscreen=" + fullscreenRender);
+        if (!gameExitRequested) finishGameProcess();
+        terminateRuntimePauseController("activity-destroy");
         stopSystemImeBridge();
         systemImeHandler.removeCallbacks(systemImePoll);
         systemUiTextCapturedKeyCodes.clear();
         resetExternalGamepadInputs();
         unregisterInputDeviceListener();
         runtimeHudRunning = false;
+        if (!runtimePauseController.shouldBePaused() && !pendingVulkanDriverHealthSha.isEmpty()
+                && readPresentCounter() >= vulkanDriverHealthInitialPresentCount + 1L
+                && importedTurnipIsActuallyEffective(pendingVulkanDriverHealthSha)) {
+            VulkanDriverManager.confirmGameLaunch(this, pendingVulkanDriverHealthSha);
+        }
+        pendingVulkanDriverHealthSha = "";
+        runtimeHudHandler.removeCallbacks(vulkanDriverHealthCheck);
         runtimeHudHandler.removeCallbacks(runtimeHudTick);
         if (liveSettings != null) {
             liveSettings.unregisterOnSharedPreferenceChangeListener(liveSettingsListener);
@@ -1057,11 +2058,10 @@ public class MainActivity extends Activity {
         super.onDestroy();
     }
 
-    private void handleGameBack() {
-        if (gameMenuOpen) {
-            closeGameSideMenu();
-        } else {
-            openGameSideMenu();
+    private void requestGameDrawerToggle(String source) {
+        if (gameDrawerController != null) {
+            if (gameDrawerController.requiresPause()) requestGameDrawerClose(source);
+            else requestGameDrawerOpen(source);
         }
     }
 
@@ -1069,7 +2069,7 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || gameBackCallback != null) {
             return;
         }
-        gameBackCallback = this::handleGameBack;
+        gameBackCallback = () -> requestGameDrawerToggle("on-back-invoked");
         getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
                 OnBackInvokedDispatcher.PRIORITY_OVERLAY, gameBackCallback);
     }
@@ -1077,7 +2077,12 @@ public class MainActivity extends Activity {
     @Override
     public void onBackPressed() {
         if (!launcherMode) {
-            handleGameBack();
+
+
+
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                requestGameDrawerToggle("legacy-on-back-pressed");
+            }
             return;
         }
         super.onBackPressed();
@@ -1086,6 +2091,16 @@ public class MainActivity extends Activity {
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
         if (!launcherMode && event != null) {
+            int triggerMask = liveSettings == null
+                    ? 0 : HardwareTriggerMapper.map(liveSettings, event);
+            if (triggerMask != 0
+                    && (event.getAction() == KeyEvent.ACTION_DOWN
+                    || event.getAction() == KeyEvent.ACTION_UP)) {
+                if (event.getAction() == KeyEvent.ACTION_UP || event.getRepeatCount() == 0) {
+                    sendPadButton(triggerMask, event.getAction() == KeyEvent.ACTION_DOWN);
+                }
+                return true;
+            }
             if (handleSystemUiTextKey(event)) {
                 return true;
             }
@@ -1095,11 +2110,16 @@ public class MainActivity extends Activity {
             }
             boolean pressed = event.getAction() == KeyEvent.ACTION_DOWN;
             InputDevice device = event.getDevice();
+            boolean controllerEvent = isControllerSource(event.getSource())
+                    || (device != null && isControllerSource(device.getSources()));
             boolean systemBackEvent = event.getKeyCode() == KeyEvent.KEYCODE_BACK
-                    && (device == null || event.getDeviceId() < 0);
+                    && !controllerEvent;
             if (systemBackEvent) {
-                if (!pressed) {
-                    handleGameBack();
+
+
+
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU && !pressed) {
+                    requestGameDrawerToggle("legacy-back-key");
                 }
                 return true;
             }
@@ -1167,6 +2187,7 @@ public class MainActivity extends Activity {
     }
 
     private int queueSystemUiText(String text, String source) {
+        if (runtimePauseController != null && runtimePauseController.shouldBePaused()) return 0;
         int byteCount = text == null ? 0 : text.getBytes(StandardCharsets.UTF_8).length;
         try {
             int result = RuntimeBridge.sendSystemUiText(text);
@@ -1228,6 +2249,7 @@ public class MainActivity extends Activity {
             }
         });
         editText.setOnEditorActionListener((view, actionId, event) -> {
+            if (runtimePauseController != null && runtimePauseController.shouldBePaused()) return true;
             boolean done = actionId == EditorInfo.IME_ACTION_DONE ||
                     (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER &&
                             event.getAction() == KeyEvent.ACTION_DOWN);
@@ -1273,6 +2295,7 @@ public class MainActivity extends Activity {
     }
 
     private void updateSystemImeVisibility() {
+        if (runtimePauseController != null && runtimePauseController.shouldBePaused()) return;
         boolean active = false;
         if (runtimeLoaded && fullscreenRender && systemImeEditText != null) {
             try {
@@ -1304,7 +2327,8 @@ public class MainActivity extends Activity {
         editText.setVisibility(View.VISIBLE);
         editText.requestFocus();
         editText.post(() -> {
-            if (!systemImeVisible || systemImeEditText != editText) {
+            if (!systemImeVisible || systemImeEditText != editText
+                    || (runtimePauseController != null && runtimePauseController.shouldBePaused())) {
                 return;
             }
             InputMethodManager inputMethodManager =
@@ -1362,6 +2386,7 @@ public class MainActivity extends Activity {
     }
 
     private void forwardCommittedSystemImeText(Editable editable) {
+        if (runtimePauseController != null && runtimePauseController.shouldBePaused()) return;
         if (editable == null) {
             return;
         }
@@ -1668,6 +2693,7 @@ public class MainActivity extends Activity {
         externalGamepadName = name == null ? "" : name;
         externalGamepadDeviceId = deviceId;
         externalGamepadDescriptor = descriptor == null ? "" : descriptor;
+        updateDebugHudGamepadBadge();
         updateTouchOverlayVisibility();
         if (connected && changed) {
             runtimeHudEvent = getString(R.string.hud_external_controller,
@@ -1686,7 +2712,22 @@ public class MainActivity extends Activity {
             externalGamepadName = device == null ? "Controller" : device.getName();
             externalGamepadDeviceId = device == null ? -1 : device.getId();
             externalGamepadDescriptor = device == null ? "" : device.getDescriptor();
+            updateDebugHudGamepadBadge();
             updateTouchOverlayVisibility();
+        }
+    }
+
+    private void updateDebugHudGamepadBadge() {
+        if (debugHudGamepadBadge == null) {
+            return;
+        }
+        debugHudGamepadBadge.setVisibility(
+                externalGamepadConnected ? View.VISIBLE : View.GONE);
+        if (externalGamepadConnected) {
+            debugHudGamepadBadge.setContentDescription(getString(
+                    R.string.hud_external_controller, externalGamepadName));
+        } else {
+            debugHudGamepadBadge.setContentDescription(null);
         }
     }
 
@@ -1933,6 +2974,24 @@ public class MainActivity extends Activity {
             return;
         }
 
+        gameDrawerController = new GameDrawerController(new GameDrawerController.Host() {
+            @Override
+            public void setDrawerPauseReason(boolean active, String source) {
+                setRuntimePauseReason(RuntimePauseController.REASON_GAME_MENU, active,
+                        "game-drawer:" + source);
+            }
+
+            @Override
+            public void beginOpen(int generation, String source) {
+                beginGameDrawerOpen(generation, source);
+            }
+
+            @Override
+            public void beginClose(int generation, String source) {
+                beginGameDrawerClose(generation, source);
+            }
+        });
+
         gameMenuLayer = new FrameLayout(this);
         gameMenuLayer.setVisibility(View.GONE);
         gameMenuLayer.setElevation(dp(80));
@@ -1941,13 +3000,14 @@ public class MainActivity extends Activity {
         gameMenuScrim.setBackgroundColor(0xaa03060b);
         gameMenuScrim.setAlpha(0f);
         gameMenuScrim.setContentDescription(getString(R.string.game_menu_close));
-        gameMenuScrim.setOnClickListener(view -> closeGameSideMenu());
+        gameMenuScrim.setOnClickListener(
+                view -> requestGameDrawerClose("scrim-click"));
         gameMenuLayer.addView(gameMenuScrim, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 Gravity.CENTER));
 
-        gameMenuPanel = new LinearLayout(this);
+        gameMenuPanel = new GameMenuPanelView(this);
         gameMenuPanel.setOrientation(LinearLayout.VERTICAL);
         gameMenuPanel.setGravity(Gravity.TOP);
         gameMenuPanel.setPadding(dp(24), dp(24), dp(24), dp(22));
@@ -1973,7 +3033,8 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
         TextView subtitle = new TextView(this);
-        subtitle.setText(R.string.game_menu_hint);
+        subtitle.setText(R.string.game_menu_paused_hint);
+        gameMenuSubtitle = subtitle;
         subtitle.setTextColor(0xff9dadc1);
         subtitle.setTextSize(12);
         LinearLayout.LayoutParams subtitleParams = new LinearLayout.LayoutParams(
@@ -1982,6 +3043,20 @@ public class MainActivity extends Activity {
         subtitleParams.topMargin = dp(6);
         subtitleParams.bottomMargin = dp(20);
         gameMenuPanel.addView(subtitle, subtitleParams);
+
+        TextView continueGame = new TextView(this);
+        continueGame.setText(R.string.game_menu_continue);
+        continueGame.setTextColor(0xffffffff);
+        continueGame.setTextSize(16);
+        continueGame.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        continueGame.setGravity(Gravity.CENTER);
+        continueGame.setPadding(dp(16), dp(13), dp(16), dp(13));
+        continueGame.setBackground(gameMenuCardBackground());
+        continueGame.setOnClickListener(view -> requestGameDrawerClose("continue-button"));
+        LinearLayout.LayoutParams continueParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        continueParams.bottomMargin = dp(12);
+        gameMenuPanel.addView(continueGame, continueParams);
 
         LinearLayout overlayRow = new LinearLayout(this);
         overlayRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -2017,6 +3092,38 @@ public class MainActivity extends Activity {
         gameMenuPanel.addView(overlayRow, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        TextView customizeOverlay = new TextView(this);
+        customizeOverlay.setText(R.string.controls_customize_overlay);
+        customizeOverlay.setTextColor(0xfff2f6fb);
+        customizeOverlay.setTextSize(15);
+        customizeOverlay.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        customizeOverlay.setGravity(Gravity.CENTER_VERTICAL);
+        customizeOverlay.setPadding(dp(16), dp(13), dp(12), dp(13));
+        customizeOverlay.setClickable(true);
+        customizeOverlay.setFocusable(true);
+        customizeOverlay.setBackground(gameMenuCardBackground());
+        LinearLayout.LayoutParams customizeParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        customizeParams.topMargin = dp(10);
+        customizeOverlay.setOnClickListener(view -> {
+            view.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+
+            view.postDelayed(() -> {
+                Intent editorIntent = new Intent(
+                        MainActivity.this, OverlayEditorActivity.class);
+                String titleId = launchTitleId();
+                if (!titleId.isEmpty()) {
+                    editorIntent.putExtra(
+                            GameProfileSettings.EXTRA_GAME_TITLE_ID, titleId);
+                    editorIntent.putExtra(GameProfileSettings.EXTRA_GAME_TITLE,
+                            getIntent().getStringExtra(
+                                    GameProfileSettings.EXTRA_GAME_TITLE));
+                }
+                startActivity(editorIntent);
+            }, 240);
+        });
+        gameMenuPanel.addView(customizeOverlay, customizeParams);
 
         LinearLayout opacityHeader = new LinearLayout(this);
         opacityHeader.setOrientation(LinearLayout.HORIZONTAL);
@@ -2123,6 +3230,24 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
+
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(24), dp(24), dp(24), dp(22));
+        while (gameMenuPanel.getChildCount() != 0) {
+            View child = gameMenuPanel.getChildAt(0);
+            ViewGroup.LayoutParams childParams = child.getLayoutParams();
+            gameMenuPanel.removeViewAt(0);
+            content.addView(child, childParams);
+        }
+        gameMenuPanel.setPadding(0, 0, 0, 0);
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.addView(content, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        gameMenuPanel.addView(scroll, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
         FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(
                 dp(320), ViewGroup.LayoutParams.MATCH_PARENT,
                 Gravity.END | Gravity.CENTER_VERTICAL);
@@ -2130,21 +3255,8 @@ public class MainActivity extends Activity {
         panelParams.bottomMargin = dp(8);
         panelParams.rightMargin = dp(8);
         gameMenuLayer.addView(gameMenuPanel, panelParams);
-        gameMenuPanel.setOnTouchListener(new View.OnTouchListener() {
-            private float downX;
-
-            @Override
-            public boolean onTouch(View view, MotionEvent event) {
-                if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                    downX = event.getRawX();
-                } else if (event.getActionMasked() == MotionEvent.ACTION_UP &&
-                        event.getRawX() - downX > dp(56)) {
-                    closeGameSideMenu();
-                    return true;
-                }
-                return false;
-            }
-        });
+        gameMenuPanel.setCloseRequest(
+                () -> requestGameDrawerClose("panel-swipe"));
 
         renderFrame.addView(gameMenuLayer, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -2154,41 +3266,8 @@ public class MainActivity extends Activity {
         gameMenuEdge = new GameMenuHandleView(this);
         gameMenuEdge.setContentDescription(getString(R.string.game_menu_open));
         gameMenuEdge.setElevation(dp(78));
-        gameMenuEdge.setOnClickListener(view -> openGameSideMenu());
-        gameMenuEdge.setOnTouchListener(new View.OnTouchListener() {
-            private float downX;
-            private float downY;
-            private boolean opened;
-
-            @Override
-            public boolean onTouch(View view, MotionEvent event) {
-                switch (event.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
-                    downX = event.getRawX();
-                    downY = event.getRawY();
-                    opened = false;
-                    return true;
-                case MotionEvent.ACTION_MOVE:
-                    float horizontal = downX - event.getRawX();
-                    float vertical = Math.abs(downY - event.getRawY());
-                    if (!opened && horizontal > dp(28) && horizontal > vertical) {
-                        opened = true;
-                        openGameSideMenu();
-                    }
-                    return true;
-                case MotionEvent.ACTION_UP:
-                    if (!opened && Math.abs(downX - event.getRawX()) < dp(12) &&
-                            Math.abs(downY - event.getRawY()) < dp(12)) {
-                        view.performClick();
-                    }
-                    return true;
-                case MotionEvent.ACTION_CANCEL:
-                    return true;
-                default:
-                    return false;
-                }
-            }
-        });
+        gameMenuEdge.setOpenRequest(
+                () -> requestGameDrawerOpen("edge-touch"));
         FrameLayout.LayoutParams edgeParams = new FrameLayout.LayoutParams(
                 dp(28), dp(132), Gravity.END | Gravity.CENTER_VERTICAL);
         renderFrame.addView(gameMenuEdge, edgeParams);
@@ -2231,15 +3310,35 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void openGameSideMenu() {
-        if (gameMenuLayer == null || gameMenuPanel == null || gameMenuOpen) {
+    private void requestGameDrawerOpen(String source) {
+        if (gameDrawerController != null) {
+            gameDrawerController.requestOpen(source);
+        }
+    }
+
+    private void requestGameDrawerClose(String source) {
+        if (!gameExitRequested && gameDrawerController != null) {
+            if (gameAudioFocus != null && !gameAudioFocus.resume(
+                    gamePreferences().getBoolean(SettingsActivity.K_AUDIO, true))) return;
+            if (gameMenuSubtitle != null) gameMenuSubtitle.setText(R.string.game_menu_paused_hint);
+            gameDrawerController.requestClose(source);
+        }
+    }
+
+    private void beginGameDrawerOpen(int generation, String source) {
+        if (gameMenuLayer == null || gameMenuPanel == null || gameMenuScrim == null) {
             return;
         }
         syncGameMenuState();
+        if (gameCapturePanel != null) gameCapturePanel.collapse();
+        resetExternalGamepadInputs();
         if (dualShockOverlay != null) {
             dualShockOverlay.resetAllInputs();
         }
-        gameMenuOpen = true;
+        Log.i(TAG, "EXECUTOR_GAME_DRAWER phase=open generation=" + generation
+                + " source=" + source);
+        gameMenuPanel.animate().cancel();
+        gameMenuScrim.animate().cancel();
         gameMenuLayer.setVisibility(View.VISIBLE);
         gameMenuLayer.bringToFront();
         if (gameMenuEdge != null) {
@@ -2247,7 +3346,9 @@ public class MainActivity extends Activity {
         }
         gameMenuScrim.setAlpha(0f);
         gameMenuPanel.post(() -> {
-            if (!gameMenuOpen || gameMenuPanel == null) {
+            if (gameDrawerController == null || gameMenuPanel == null
+                    || gameDrawerController.state() != GameDrawerController.State.OPENING
+                    || gameDrawerController.generation() != generation) {
                 return;
             }
             gameMenuPanel.setTranslationX(gameMenuPanel.getWidth() + dp(16));
@@ -2256,6 +3357,11 @@ public class MainActivity extends Activity {
             gameMenuPanel.animate()
                     .translationX(0f)
                     .setDuration(220)
+                    .withEndAction(() -> {
+                        if (gameDrawerController != null) {
+                            gameDrawerController.completeOpen(generation);
+                        }
+                    })
                     .start();
             gameMenuScrim.animate()
                     .alpha(1f)
@@ -2264,11 +3370,12 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void closeGameSideMenu() {
-        if (gameMenuLayer == null || gameMenuPanel == null || !gameMenuOpen) {
+    private void beginGameDrawerClose(int generation, String source) {
+        if (gameMenuLayer == null || gameMenuPanel == null || gameMenuScrim == null) {
             return;
         }
-        gameMenuOpen = false;
+        Log.i(TAG, "EXECUTOR_GAME_DRAWER phase=close generation=" + generation
+                + " source=" + source);
         gameMenuPanel.animate().cancel();
         gameMenuScrim.animate().cancel();
         gameMenuScrim.animate().alpha(0f).setDuration(150).start();
@@ -2276,7 +3383,8 @@ public class MainActivity extends Activity {
                 .translationX(gameMenuPanel.getWidth() + dp(16))
                 .setDuration(190)
                 .withEndAction(() -> {
-                    if (gameMenuOpen || gameMenuLayer == null) {
+                    if (gameDrawerController == null || gameMenuLayer == null
+                            || !gameDrawerController.ownsClosingLease(generation)) {
                         return;
                     }
                     gameMenuLayer.setVisibility(View.GONE);
@@ -2284,46 +3392,63 @@ public class MainActivity extends Activity {
                         gameMenuEdge.setVisibility(View.VISIBLE);
                         gameMenuEdge.bringToFront();
                     }
+                    gameDrawerController.completeClose(
+                            generation, "close-animation:" + source);
                 })
                 .start();
     }
 
     private void exitGameToLibrary() {
-        if (gameExitRequested) {
-            return;
-        }
+        if (gameExitRequested) return;
+        if (gameSession != null) gameSession.exitToLibrary();
+        else finishGameProcess();
+    }
+
+    private void finishGameProcess() {
+        if (gameExitRequested) return;
         gameExitRequested = true;
-        if (dualShockOverlay != null) {
-            dualShockOverlay.resetAllInputs();
-        }
+        if (gameMenuSubtitle != null) gameMenuSubtitle.setText(R.string.game_menu_exiting);
+        if (gameCapturePanel != null) gameCapturePanel.setVisibility(View.GONE);
+        if (dualShockOverlay != null) dualShockOverlay.resetAllInputs();
         resetExternalGamepadInputs();
+        terminateRuntimePauseController("game-exit");
         runtimeHudRunning = false;
         runtimeHudHandler.removeCallbacks(runtimeHudTick);
-        detachSurface();
-        try {
-            if (runtimeLoaded) {
-                RuntimeBridge.stopServicePresentPump();
+        Runnable retire = () -> {
+
+
+            finishAndRemoveTask();
+            new Handler(Looper.getMainLooper()).post(
+                    () -> android.os.Process.killProcess(android.os.Process.myPid()));
+        };
+        if (gameCaptureController != null) gameCaptureController.closeWhenFinished(retire);
+        else retire.run();
+    }
+
+    private void installCapturePanel(FrameLayout renderFrame) {
+        gameCaptureController = new GameCaptureController(this, renderSurfaceView, () -> {
+            String title = getIntent().getStringExtra(GameProfileSettings.EXTRA_GAME_TITLE);
+            return title == null || title.trim().isEmpty() ? launchTitleId() : title;
+        }, new GameCaptureController.Listener() {
+            @Override public void onRecordingStateChanged(boolean recording) {
+                if (gameCapturePanel != null) gameCapturePanel.setRecording(recording);
             }
-        } catch (Throwable error) {
-            Log.w(TAG, "Present pump did not stop cleanly while exiting the game", error);
-        }
-
-        Intent library = new Intent(this, MainActivity.class);
-        library.setAction(Intent.ACTION_MAIN);
-        library.addCategory(Intent.CATEGORY_LAUNCHER);
-        int overlayOpacity = gameMenuOpacitySlider == null ? 74
-                : gameMenuOpacitySlider.getProgress();
-        library.putExtra(EXTRA_SYNC_OVERLAY_ENABLED, overlayEnabledByPreference);
-        library.putExtra(EXTRA_SYNC_OVERLAY_OPACITY, overlayOpacity);
-        library.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP |
-                Intent.FLAG_ACTIVITY_SINGLE_TOP |
-                Intent.FLAG_ACTIVITY_REORDER_TO_FRONT);
-        startActivity(library);
-        finish();
-        overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out);
-
-        new Handler(Looper.getMainLooper()).postDelayed(
-                () -> android.os.Process.killProcess(android.os.Process.myPid()), 180);
+            @Override public void onRecordingStatusChanged(String status) {
+                if (gameCapturePanel != null) gameCapturePanel.setRecordingStatus(status);
+            }
+            @Override public void onGalleryVisibilityChanged(boolean visible) {
+                setRuntimePauseReason(RuntimePauseController.REASON_CAPTURE_GALLERY,
+                        visible, "capture-gallery");
+            }
+        });
+        gameCapturePanel = new GameCapturePanel(this, new GameCapturePanel.Actions() {
+            @Override public void screenshot() { gameCaptureController.takeScreenshot(); }
+            @Override public void toggleRecording() { gameCaptureController.toggleRecording(); }
+            @Override public void gallery() { gameCaptureController.showGallery(); }
+        });
+        gameCapturePanel.setElevation(dp(79));
+        renderFrame.addView(gameCapturePanel);
+        gameCaptureController.onRuntimePaused(runtimePauseController.shouldBePaused());
     }
 
     private static final class MenuToggleView extends View {
@@ -2360,10 +3485,90 @@ public class MainActivity extends Activity {
         }
     }
 
+    private static final class GameMenuPanelView extends LinearLayout {
+        private Runnable closeRequest;
+        private float downX;
+        private float downY;
+        private boolean interceptingSwipe;
+
+        GameMenuPanelView(Context context) {
+            super(context);
+        }
+
+        void setCloseRequest(Runnable closeRequest) {
+            this.closeRequest = closeRequest;
+        }
+
+        @Override
+        public boolean onInterceptTouchEvent(MotionEvent event) {
+            switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                downX = event.getX();
+                downY = event.getY();
+                interceptingSwipe = false;
+                return false;
+            case MotionEvent.ACTION_MOVE:
+                float horizontal = event.getX() - downX;
+                float vertical = Math.abs(event.getY() - downY);
+                if (horizontal > dpStatic(getContext(), 28) && horizontal > vertical) {
+                    interceptingSwipe = true;
+                    return true;
+                }
+                return false;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                interceptingSwipe = false;
+                return false;
+            default:
+                return false;
+            }
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent event) {
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                downX = event.getX();
+                downY = event.getY();
+                interceptingSwipe = false;
+                return super.onTouchEvent(event);
+            }
+            if (event.getActionMasked() == MotionEvent.ACTION_MOVE && !interceptingSwipe) {
+                float horizontal = event.getX() - downX;
+                float vertical = Math.abs(event.getY() - downY);
+                interceptingSwipe = horizontal > dpStatic(getContext(), 28)
+                        && horizontal > vertical;
+                if (!interceptingSwipe) {
+                    return super.onTouchEvent(event);
+                }
+            }
+            if (event.getActionMasked() == MotionEvent.ACTION_UP) {
+                float horizontal = event.getX() - downX;
+                float vertical = Math.abs(event.getY() - downY);
+                interceptingSwipe = false;
+                if (horizontal > dpStatic(getContext(), 56) && horizontal > vertical
+                        && closeRequest != null) {
+                    closeRequest.run();
+                }
+                return true;
+            }
+            if (!interceptingSwipe) {
+                return super.onTouchEvent(event);
+            }
+            if (event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
+                interceptingSwipe = false;
+            }
+            return true;
+        }
+    }
+
     private static final class GameMenuHandleView extends View {
         private final Paint pillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint arrowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Path arrow = new Path();
+        private Runnable openRequest;
+        private float downX;
+        private float downY;
+        private boolean swipeRequested;
 
         GameMenuHandleView(Context context) {
             super(context);
@@ -2375,6 +3580,51 @@ public class MainActivity extends Activity {
             arrowPaint.setStrokeCap(Paint.Cap.ROUND);
             arrowPaint.setStrokeJoin(Paint.Join.ROUND);
             arrowPaint.setStrokeWidth(dpStatic(context, 2));
+        }
+
+        void setOpenRequest(Runnable openRequest) {
+            this.openRequest = openRequest;
+        }
+
+        @Override
+        public boolean onTouchEvent(MotionEvent event) {
+            switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                downX = event.getX();
+                downY = event.getY();
+                swipeRequested = false;
+                return true;
+            case MotionEvent.ACTION_MOVE:
+                float horizontal = downX - event.getX();
+                float vertical = Math.abs(downY - event.getY());
+                if (!swipeRequested && horizontal > dpStatic(getContext(), 28)
+                        && horizontal > vertical) {
+                    swipeRequested = true;
+                    if (openRequest != null) {
+                        openRequest.run();
+                    }
+                }
+                return true;
+            case MotionEvent.ACTION_UP:
+                if (!swipeRequested && Math.abs(downX - event.getX()) < dpStatic(getContext(), 12)
+                        && Math.abs(downY - event.getY()) < dpStatic(getContext(), 12)) {
+                    performClick();
+                }
+                return true;
+            case MotionEvent.ACTION_CANCEL:
+                return true;
+            default:
+                return super.onTouchEvent(event);
+            }
+        }
+
+        @Override
+        public boolean performClick() {
+            super.performClick();
+            if (openRequest != null) {
+                openRequest.run();
+            }
+            return true;
         }
 
         @Override
@@ -2411,7 +3661,20 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 Gravity.CENTER));
 
-        dualShockOverlay = new DualShockOverlayView(this);
+        dualShockOverlay = new DualShockOverlayView(this, gamePreferences(),
+                new DualShockOverlayView.InputSink() {
+                    @Override public void button(int mask, boolean pressed) {
+                        sendPadButton(mask, pressed);
+                    }
+
+                    @Override public void axis(int axis, int value, boolean verbose) {
+                        sendPadAxis(axis, value, verbose);
+                    }
+
+                    @Override public void touchpad(boolean pressed, float x, float y) {
+                        sendTouchPad(pressed, x, y);
+                    }
+                });
         dualShockOverlay.setSoundEffectsEnabled(false);
         inputOverlay.addView(dualShockOverlay, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -2435,26 +3698,35 @@ public class MainActivity extends Activity {
         loadingProgressPanel.setElevation(dp(44));
 
         loadingBlocksText = new TextView(this);
-        loadingBlocksText.setText("blocks 0");
+        loadingBlocksText.setText(getString(R.string.loading_blocks, 0L));
         loadingBlocksText.setTextColor(0xff55e37a);
-        loadingBlocksText.setTextSize(9);
+        loadingBlocksText.setTextSize(7);
         loadingBlocksText.setTypeface(Typeface.create("sans-serif", Typeface.NORMAL));
         loadingBlocksText.setGravity(Gravity.CENTER);
         loadingBlocksText.setIncludeFontPadding(false);
         loadingProgressPanel.addView(loadingBlocksText, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        ThinSpinnerView progress = new ThinSpinnerView(this);
+        loadingStatusText = new TextView(this);
+        loadingStatusText.setTextSize(7);
+        loadingStatusText.setGravity(Gravity.CENTER);
+        loadingStatusText.setIncludeFontPadding(false);
+        loadingStatusText.setMaxLines(3);
+        loadingProgressPanel.addView(loadingStatusText, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        loadingSpinner = new ThinSpinnerView(this);
         LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(
-                dp(24), dp(24));
+                dp(16), dp(16));
         progressParams.gravity = Gravity.CENTER_HORIZONTAL;
         progressParams.topMargin = dp(4);
-        loadingProgressPanel.addView(progress, progressParams);
+        loadingProgressPanel.addView(loadingSpinner, progressParams);
 
         FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(
-                dp(150), ViewGroup.LayoutParams.WRAP_CONTENT,
+                dp(120), ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.END | Gravity.CENTER_VERTICAL);
         panelParams.rightMargin = dp(20);
+        loadingProgressPanel.setTranslationY(-dp(36));
         renderFrame.addView(loadingProgressPanel, panelParams);
         loadingProgressPanel.bringToFront();
         resetRuntimeDebugHudForGuestLaunch();
@@ -2512,9 +3784,77 @@ public class MainActivity extends Activity {
         debugHudFps.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         debugHudFps.setGravity(Gravity.CENTER);
         debugHudFps.setIncludeFontPadding(false);
-        debugHudFps.setText("FPS --");
+        debugHudFps.setText(formatFpsWithScreencastNote("FPS --"));
         debugHudFps.setClickable(false);
         debugHudFps.setFocusable(false);
+
+        debugHudPs5Badge = new TextView(this);
+        debugHudPs5Badge.setText("PS5");
+        debugHudPs5Badge.setTextColor(0xffffffff);
+        debugHudPs5Badge.setTextSize(10);
+        debugHudPs5Badge.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        debugHudPs5Badge.setGravity(Gravity.CENTER);
+        debugHudPs5Badge.setIncludeFontPadding(false);
+        debugHudPs5Badge.setPadding(dp(5), dp(2), dp(5), dp(2));
+        GradientDrawable ps5BadgeBackground = new GradientDrawable();
+        ps5BadgeBackground.setColor(0xff1769aa);
+        ps5BadgeBackground.setCornerRadius(dp(7));
+        ps5BadgeBackground.setStroke(dp(1), 0xff89c8ff);
+        debugHudPs5Badge.setBackground(ps5BadgeBackground);
+        debugHudPs5Badge.setVisibility(ps5Runtime ? View.VISIBLE : View.GONE);
+        debugHudPs5Badge.setClickable(false);
+        debugHudPs5Badge.setFocusable(false);
+
+        debugHudPmu = new TextView(this);
+        debugHudPmu.setTextColor(0xffa9c7e8);
+        debugHudPmu.setTextSize(6.2f);
+        debugHudPmu.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        debugHudPmu.setGravity(Gravity.CENTER);
+        debugHudPmu.setIncludeFontPadding(false);
+        debugHudPmu.setSingleLine(true);
+        debugHudPmu.setPadding(dp(6), dp(3), dp(6), dp(3));
+        debugHudPmu.setBackgroundColor(0x99000000);
+        debugHudPmu.setElevation(dp(48));
+        debugHudPmu.setText("PMU n/a");
+        debugHudPmu.setClickable(false);
+        debugHudPmu.setFocusable(false);
+
+        LinearLayout fpsRow = new LinearLayout(this);
+        fpsRow.setOrientation(LinearLayout.HORIZONTAL);
+        fpsRow.setGravity(Gravity.CENTER);
+        fpsRow.addView(debugHudFps, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout.LayoutParams ps5BadgeParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        ps5BadgeParams.setMargins(dp(4), 0, 0, 0);
+        fpsRow.addView(debugHudPs5Badge, ps5BadgeParams);
+
+        debugHudGamepadBadge = new TextView(this);
+        debugHudGamepadBadge.setText(formatConnectedGamepadBadge());
+        debugHudGamepadBadge.setTextSize(8);
+        debugHudGamepadBadge.setGravity(Gravity.CENTER_VERTICAL);
+        debugHudGamepadBadge.setIncludeFontPadding(false);
+        debugHudGamepadBadge.setSingleLine(true);
+        debugHudGamepadBadge.setClickable(false);
+        debugHudGamepadBadge.setFocusable(false);
+        LinearLayout.LayoutParams gamepadBadgeParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        gamepadBadgeParams.setMargins(dp(4), 0, 0, 0);
+        gamepadBadgeParams.gravity = Gravity.CENTER_VERTICAL;
+        fpsRow.addView(debugHudGamepadBadge, gamepadBadgeParams);
+        updateDebugHudGamepadBadge();
+        debugHudFsr = new TextView(this);
+        debugHudFsr.setText("UPSCALER --");
+        debugHudFsr.setTextColor(0xffa9b2bb);
+        debugHudFsr.setTextSize(7.2f);
+        debugHudFsr.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        debugHudFsr.setGravity(Gravity.CENTER);
+        debugHudFsr.setSingleLine(true);
+        debugHudFsr.setIncludeFontPadding(false);
+        debugHudFsr.setClickable(false);
+        debugHudFsr.setFocusable(false);
+        debugHudFsr.setVisibility(!ps5Runtime && showDebugHudUpscalerInfo
+                ? View.VISIBLE : View.GONE);
 
         debugHud = new TextView(this);
         debugHud.setTextColor(0xccffffff);
@@ -2530,8 +3870,22 @@ public class MainActivity extends Activity {
         debugHudPanel.addView(debugHud, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
+        debugHudDriver = new TextView(this);
+        debugHudDriver.setText("GPU detecting...");
+        debugHudDriver.setTextColor(0xfff1c56b);
+        debugHudDriver.setTextSize(7);
+        debugHudDriver.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        debugHudDriver.setGravity(Gravity.CENTER);
+        debugHudDriver.setSingleLine(true);
+        debugHudDriver.setIncludeFontPadding(false);
+        debugHudDriver.setClickable(false);
+        debugHudDriver.setFocusable(false);
+        debugHudDriver.setVisibility(View.GONE);
+        debugHudPanel.addView(debugHudDriver, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
         debugHudBrand = new TextView(this);
-        debugHudBrand.setText("LSX4-APP");
+        debugHudBrand.setText("LSX4 emulator");
         debugHudBrand.setTextColor(0xff78b5ff);
         debugHudBrand.setTextSize(8);
         debugHudBrand.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
@@ -2539,9 +3893,12 @@ public class MainActivity extends Activity {
         debugHudBrand.setIncludeFontPadding(false);
         debugHudBrand.setClickable(false);
         debugHudBrand.setFocusable(false);
+        debugHudBrand.setVisibility(View.VISIBLE);
         debugHudPanel.addView(debugHudBrand, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        debugHudPanel.addView(debugHudFps, new LinearLayout.LayoutParams(
+        debugHudPanel.addView(fpsRow, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        debugHudPanel.addView(debugHudFsr, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
@@ -2550,6 +3907,14 @@ public class MainActivity extends Activity {
                 Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         params.topMargin = dp(10);
         renderFrame.addView(debugHudPanel, params);
+
+        FrameLayout.LayoutParams pmuParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM | Gravity.END);
+        pmuParams.rightMargin = dp(10);
+        pmuParams.bottomMargin = dp(10);
+        renderFrame.addView(debugHudPmu, pmuParams);
 
         debugHudCollapsedButton = new TextView(this);
         debugHudCollapsedButton.setText(R.string.hud_metrics);
@@ -2580,6 +3945,7 @@ public class MainActivity extends Activity {
         debugHudCollapsedButton.setVisibility(View.GONE);
 
         debugHudPanel.bringToFront();
+        debugHudPmu.bringToFront();
         startRuntimeDebugHud();
     }
 
@@ -2588,12 +3954,18 @@ public class MainActivity extends Activity {
             return;
         }
         debugHudPanel.setVisibility(collapsed ? View.GONE : View.VISIBLE);
+        if (debugHudPmu != null) {
+            debugHudPmu.setVisibility(collapsed ? View.GONE : View.VISIBLE);
+        }
         debugHudCollapsedButton.setVisibility(collapsed ? View.VISIBLE : View.GONE);
         Log.i(TAG, "EXECUTOR_DEBUG_HUD collapsed=" + collapsed);
         if (collapsed) {
             debugHudCollapsedButton.bringToFront();
         } else {
             debugHudPanel.bringToFront();
+            if (debugHudPmu != null) {
+                debugHudPmu.bringToFront();
+            }
             renderRuntimeDebugHud();
         }
     }
@@ -2616,8 +3988,19 @@ public class MainActivity extends Activity {
             }
             debugHudPanel = null;
             debugHudFps = null;
+            debugHudPs5Badge = null;
+            debugHudGamepadBadge = null;
+            debugHudFsr = null;
             debugHud = null;
+            debugHudDriver = null;
             debugHudBrand = null;
+        }
+        if (debugHudPmu != null) {
+            ViewGroup parent = (ViewGroup) debugHudPmu.getParent();
+            if (parent != null) {
+                parent.removeView(debugHudPmu);
+            }
+            debugHudPmu = null;
         }
         if (debugHudCollapsedButton != null) {
             ViewGroup parent = (ViewGroup) debugHudCollapsedButton.getParent();
@@ -2629,8 +4012,34 @@ public class MainActivity extends Activity {
         Log.i(TAG, "EXECUTOR_DEBUG_HUD visible=false reason=preference");
     }
 
+    private void applyDebugHudUpscalerInfoPreference(SharedPreferences preferences) {
+        showDebugHudUpscalerInfo = preferences.getBoolean(
+                SettingsActivity.K_PERF_HUD_UPSCALER_INFO, false);
+        if (debugHudFsr == null) {
+            return;
+        }
+        debugHudFsr.setVisibility(!ps5Runtime && showDebugHudUpscalerInfo
+                ? View.VISIBLE : View.GONE);
+        if (showDebugHudUpscalerInfo) {
+            renderRuntimeDebugHud();
+        }
+    }
+
     private void applyLiveSetting(SharedPreferences preferences, String key) {
         if (launcherMode || preferences == null) {
+            return;
+        }
+        if (launchSettingsInitialized && key != null
+                && (SettingsActivity.K_RES_MODE.equals(key)
+                    || SettingsActivity.K_UPSCALED_OUTPUT_RES_MODE.equals(key)
+                    || SettingsActivity.K_FSR_ENABLED.equals(key)
+                    || SettingsActivity.K_UPSCALER_MODE.equals(key))) {
+            renderSettingsEdited = true;
+        }
+        if (runtimePauseController != null && runtimePauseController.shouldBePaused()) {
+
+
+            liveSettingsDeferred = true;
             return;
         }
         if (key == null || SettingsActivity.K_OVERLAY.equals(key)) {
@@ -2654,8 +4063,14 @@ public class MainActivity extends Activity {
                         getString(R.string.game_menu_opacity_value, opacity));
             }
         }
+        if (OverlayLayoutStore.isPreferenceKey(key) && dualShockOverlay != null) {
+            dualShockOverlay.reloadLayout();
+        }
         if (key == null || SettingsActivity.K_PERF_HUD.equals(key)) {
             applyDebugHudPreference(preferences);
+        }
+        if (key == null || SettingsActivity.K_PERF_HUD_UPSCALER_INFO.equals(key)) {
+            applyDebugHudUpscalerInfoPreference(preferences);
         }
         if (key == null || SettingsActivity.K_KEEP_AWAKE.equals(key)) {
             if (preferences.getBoolean(SettingsActivity.K_KEEP_AWAKE, true)) {
@@ -2669,16 +4084,27 @@ public class MainActivity extends Activity {
                     preferences.getBoolean(SettingsActivity.K_AUDIO, true));
             Log.i(TAG, "EXECUTOR_LIVE_SETTING audio result=" + result);
         }
-        if (key == null || SettingsActivity.K_RES_MODE.equals(key)) {
+        if (key == null || SettingsActivity.K_RES_MODE.equals(key)
+                || SettingsActivity.K_UPSCALED_OUTPUT_RES_MODE.equals(key)
+                || SettingsActivity.K_FSR_ENABLED.equals(key)
+                || SettingsActivity.K_UPSCALER_MODE.equals(key)) {
             renderResolutionMode = resolveRenderResolutionMode(
-                    key == null ? getIntent() : null, preferences);
+                    !renderSettingsEdited ? getIntent() : null, preferences);
+            upscaledOutputResolutionMode = resolveUpscaledOutputResolutionMode(
+                    !renderSettingsEdited ? getIntent() : null, preferences, renderResolutionMode);
+            upscalerMode = resolveUpscalerMode(
+                    !renderSettingsEdited ? getIntent() : null, preferences);
             File root = new File(getFilesDir(), "lsx4-home");
             materializeRenderResolutionSetting(root);
             applyRenderResolutionToSurface();
         }
+        if (key == null || SettingsActivity.K_DISPLAY_SCALING_MODE.equals(key)) {
+            displayScalingMode = resolveDisplayScalingMode(preferences);
+            applyDisplayScalingToSurface();
+        }
         if (key == null || SettingsActivity.K_GPU_BACKEND.equals(key)) {
             try {
-                GraphicsBackend.selected(this).writeLaunchConfiguration(this);
+                GraphicsBackend.selected(this, preferences).writeLaunchConfiguration(this);
             } catch (Exception error) {
                 Log.e(TAG, "Live graphics backend configuration could not be written", error);
             }
@@ -2691,8 +4117,18 @@ public class MainActivity extends Activity {
                 Log.e(TAG, "Live cache setting could not be published", error);
             }
         }
+        if (SettingsActivity.K_GUEST_CPU_BACKEND.equals(key)) {
+            Log.i(TAG, "EXECUTOR_LIVE_SETTING guestCpuBackend deferred=true "
+                    + "reason=requires-game-process-restart requested="
+                    + GuestCpuBackend.sanitize(preferences.getInt(
+                            SettingsActivity.K_GUEST_CPU_BACKEND,
+                            GuestCpuBackend.CURRENT)));
+        }
         if (key == null || isGraphicsPatchPreference(key)) {
             materializeGraphicsEffectSettings(new File(getFilesDir(), "lsx4-home"));
+        }
+        if (key == null || GamePatchCatalog.isPreferenceKey(this, key)) {
+            materializeBundledGamePatches(this);
         }
     }
 
@@ -2700,36 +4136,109 @@ public class MainActivity extends Activity {
         if (!fullscreenRender || renderSurfaceView == null) {
             return;
         }
-        int width = SettingsActivity.resolutionWidth(renderResolutionMode);
-        int height = SettingsActivity.resolutionHeight(renderResolutionMode);
+        int outputMode = effectiveOutputResolutionMode();
+        int width = SettingsActivity.resolutionWidth(outputMode);
+        int height = SettingsActivity.resolutionHeight(outputMode);
         if (width > 0 && height > 0) {
             renderSurfaceView.getHolder().setFixedSize(width, height);
         } else {
             renderSurfaceView.getHolder().setSizeFromLayout();
         }
         renderSurfaceView.requestLayout();
-        Log.i(TAG, "Applied Vulkan output resolution mode=" + renderResolutionMode
-                + " extent=" + width + "x" + height);
+        Log.i(TAG, "Applied Vulkan source resolution mode=" + renderResolutionMode
+                + " outputMode=" + outputMode
+                + " extent=" + width + "x" + height
+                + " displayScalingMode=" + displayScalingMode);
     }
 
-    private void applyExtremePerformanceProfile(
-            SharedPreferences appSettings, int defaultResolutionMode) {
+    private void applyDisplayScalingToSurface() {
+        displayScalingMode = DisplayScaling.sanitize(displayScalingMode);
+        if (!fullscreenRender || renderSurfaceView == null) {
+            return;
+        }
+        renderSurfaceView.requestLayout();
+        Log.i(TAG, "Applied presentation scaling mode=" + displayScalingMode
+                + " sourceResolutionMode=" + renderResolutionMode
+                + " outputResolutionMode=" + effectiveOutputResolutionMode());
+    }
+
+    private int effectiveOutputResolutionMode() {
+        SharedPreferences preferences = gamePreferences();
+        if (!requestedFsrEnabled(preferences)) {
+            return renderResolutionMode;
+        }
+        return SettingsActivity.sanitizeUpscaledOutputMode(
+                renderResolutionMode, upscaledOutputResolutionMode);
+    }
+
+    private void seedGraphicsDefaults(SharedPreferences appSettings) {
         if (appSettings == null) {
             return;
         }
         SharedPreferences.Editor editor = appSettings.edit();
-        if (!appSettings.contains(SettingsActivity.K_RES_MODE)) {
-            editor.putInt(SettingsActivity.K_RES_MODE, defaultResolutionMode);
+
+
+        String[] keys = {
+                SettingsActivity.K_DISABLE_DYNAMIC_SHADOWS, SettingsActivity.K_DISABLE_SSAO,
+                SettingsActivity.K_DISABLE_MOTION_BLUR, SettingsActivity.K_DISABLE_DEPTH_OF_FIELD,
+                SettingsActivity.K_DISABLE_ANTI_ALIASING, SettingsActivity.K_DISABLE_CHROMATIC_ABERRATION
+        };
+        boolean changed = false;
+        for (String key : keys) {
+            if (!appSettings.contains(key)) {
+                editor.putBoolean(key, true);
+                changed = true;
+            }
         }
-        editor.putBoolean(SettingsActivity.K_DISABLE_DYNAMIC_SHADOWS, true);
-        editor.putBoolean(SettingsActivity.K_DISABLE_SSAO, true);
-        editor.putBoolean(SettingsActivity.K_DISABLE_MOTION_BLUR, true);
-        editor.putBoolean(SettingsActivity.K_DISABLE_DEPTH_OF_FIELD, true);
-        editor.putBoolean(SettingsActivity.K_DISABLE_ANTI_ALIASING, true);
-        editor.putBoolean(SettingsActivity.K_DISABLE_CHROMATIC_ABERRATION, true);
-        editor.apply();
-        Log.i(TAG, "Extreme performance profile enabled: render resolution="
-                + defaultResolutionMode + " (default-only) + heavy graphics effects disabled");
+        if (!changed) return;
+        if (!editor.commit()) {
+            Log.e(TAG, "Initial graphics defaults could not be persisted");
+        } else {
+            Log.i(TAG, "Missing graphics preferences initialized");
+        }
+    }
+
+    private void applyDebugGraphicsProfileOverride(
+            Intent intent, SharedPreferences appSettings) {
+        if (!BuildConfig.DEBUG || intent == null || appSettings == null
+                || !intent.getBooleanExtra(EXTRA_PROFILE_GRAPHICS_OVERRIDE, false)) {
+            return;
+        }
+        final String[][] settings = {
+                {SettingsActivity.K_DISABLE_DYNAMIC_SHADOWS,
+                        "profile_disable_dynamic_shadows"},
+                {SettingsActivity.K_DISABLE_SSAO, "profile_disable_ssao"},
+                {SettingsActivity.K_DISABLE_MOTION_BLUR,
+                        "profile_disable_motion_blur"},
+                {SettingsActivity.K_DISABLE_DEPTH_OF_FIELD,
+                        "profile_disable_depth_of_field"},
+                {SettingsActivity.K_DISABLE_ANTI_ALIASING,
+                        "profile_disable_anti_aliasing"},
+                {SettingsActivity.K_DISABLE_CHROMATIC_ABERRATION,
+                        "profile_disable_chromatic_aberration"}
+        };
+        SharedPreferences.Editor editor = appSettings.edit();
+        StringBuilder applied = new StringBuilder();
+        for (String[] setting : settings) {
+            if (!intent.hasExtra(setting[1])) {
+                continue;
+            }
+            final boolean disabled = intent.getBooleanExtra(setting[1], false);
+            editor.putBoolean(setting[0], disabled);
+            if (applied.length() != 0) {
+                applied.append(',');
+            }
+            applied.append(setting[0]).append('=').append(disabled);
+        }
+        if (applied.length() == 0) {
+            Log.w(TAG, "Debug graphics profile override requested without effect values");
+            return;
+        }
+        if (!editor.commit()) {
+            Log.e(TAG, "Debug graphics profile override could not be persisted");
+            return;
+        }
+        Log.i(TAG, "Debug graphics profile override applied: " + applied);
     }
 
     private static boolean isGraphicsPatchPreference(String key) {
@@ -2765,15 +4274,22 @@ public class MainActivity extends Activity {
             runtimeHudLastSampleAtMs = 0;
             runtimeHudLastStats = null;
             runtimeHudCurrentStats = null;
+            runtimeHudLastPmuStats = null;
+            runtimeHudCurrentPmuStats = null;
+            runtimeHudLastPmuReadAtMs = 0;
+            runtimeHudPmuLabel = "PMU warming...";
+            runtimeHudVulkanStatus = "";
             frameDetectionInFlight = false;
             frameCaught = false;
             frameProbeAcceptedStreak = 0;
+            loadingState.reset();
             if (loadingProgressPanel != null) {
                 loadingProgressPanel.setVisibility(View.VISIBLE);
             }
             if (loadingBlocksText != null) {
-                loadingBlocksText.setText("blocks 0");
+                loadingBlocksText.setText(getString(R.string.loading_blocks, 0L));
             }
+            renderLoadingProgress();
             renderRuntimeDebugHud();
         };
         if (Looper.myLooper() == Looper.getMainLooper()) {
@@ -2784,6 +4300,7 @@ public class MainActivity extends Activity {
     }
 
     private void sampleRuntimeHudStats() {
+        sampleHostPmuStats();
         if (!runtimeLoaded) {
             return;
         }
@@ -2794,9 +4311,323 @@ public class MainActivity extends Activity {
                 runtimeHudCurrentStats = stats;
                 runtimeHudPreviousSampleAtMs = runtimeHudLastSampleAtMs;
                 runtimeHudLastSampleAtMs = SystemClock.elapsedRealtime();
+                if (!frameCaught) loadingState.sample(stats);
+            } else if (!frameCaught) {
+                loadingState.sample(null);
             }
         } catch (Throwable t) {
+            if (!frameCaught) loadingState.sample(null);
             runtimeHudEvent = "HUD stats unavailable: " + t.getClass().getSimpleName();
+        }
+        try {
+            String status = RuntimeBridge.vulkanDriverStatus();
+            if (status != null && !status.isEmpty()) {
+                runtimeHudVulkanStatus = status;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Vulkan driver HUD status unavailable", t);
+        }
+    }
+
+    private void sampleHostPmuStats() {
+        if (!inputDebugHud || debugHudPanel == null ||
+                debugHudPanel.getVisibility() != View.VISIBLE) {
+            return;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (runtimeHudLastPmuReadAtMs != 0 && now - runtimeHudLastPmuReadAtMs < 900L) {
+            return;
+        }
+        runtimeHudLastPmuReadAtMs = now;
+        try {
+            long[] stats = RuntimeBridge.hostPmuStats();
+            if (stats == null || stats.length < 8 || stats[0] != 1 || stats[1] == 0) {
+                runtimeHudPmuLabel = stats != null && stats.length >= 3 && stats[2] != 0
+                        ? "PMU n/a E" + stats[2]
+                        : "PMU n/a";
+                return;
+            }
+            runtimeHudLastPmuStats = runtimeHudCurrentPmuStats;
+            runtimeHudCurrentPmuStats = stats;
+            if (runtimeHudLastPmuStats == null || runtimeHudLastPmuStats.length < 8) {
+                runtimeHudPmuLabel = "PMU warming...";
+                return;
+            }
+            long elapsedNs = stats[3] - runtimeHudLastPmuStats[3];
+            long instructions = stats[4] - runtimeHudLastPmuStats[4];
+            long cycles = stats[5] - runtimeHudLastPmuStats[5];
+            long branches = stats[6] - runtimeHudLastPmuStats[6];
+            long branchMisses = stats[7] - runtimeHudLastPmuStats[7];
+            if (elapsedNs <= 0 || instructions < 0 || cycles <= 0 ||
+                    branches <= 0 || branchMisses < 0) {
+                runtimeHudPmuLabel = "PMU warming...";
+                return;
+            }
+            double ginstPerSecond = (double) instructions / (double) elapsedNs;
+            double ipc = (double) instructions / (double) cycles;
+            double branchMissPercent = 100.0 * (double) branchMisses / (double) branches;
+            runtimeHudPmuLabel = String.format(Locale.US,
+                    "%.2f Gi/s  IPC %.2f  BM %.2f%%",
+                    ginstPerSecond, ipc, branchMissPercent);
+        } catch (Throwable error) {
+            runtimeHudPmuLabel = "PMU n/a";
+            Log.w(TAG, "Host PMU HUD unavailable", error);
+        }
+    }
+
+    private String formatFexJitLabel(long[] current, long[] previous) {
+        if (current == null || current.length < 99 || current[92] == 0) {
+            return null;
+        }
+        if (previous == null || previous.length < 99 || runtimeHudPreviousSampleAtMs == 0 ||
+                runtimeHudLastSampleAtMs <= runtimeHudPreviousSampleAtMs) {
+            return "JIT warming...";
+        }
+        long sampleMs = runtimeHudLastSampleAtMs - runtimeHudPreviousSampleAtMs;
+        long compilations = current[97] >= previous[97]
+                ? current[97] - previous[97] : 0;
+        long compileNs = current[98] >= previous[98]
+                ? current[98] - previous[98] : 0;
+        long compilationsPerSecond = Math.round(
+                (double) compilations * 1000.0 / (double) sampleMs);
+        double compileCores = (double) compileNs / ((double) sampleMs * 1_000_000.0);
+        double cacheMiB = (double) current[95] / (1024.0 * 1024.0);
+        return String.format(Locale.US, "JIT %,d/s  %.2fc  CC %.1fMiB",
+                compilationsPerSecond, compileCores, cacheMiB);
+    }
+
+    private static CharSequence formatFpsWithScreencastNote(String fps) {
+        String note = " (+7-9 FPS without screencast overhead)";
+        SpannableString label = new SpannableString(fps + note);
+        int noteStart = fps.length() + 1;
+        label.setSpan(new RelativeSizeSpan(0.62f), noteStart, label.length(),
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        label.setSpan(new ForegroundColorSpan(0xff8fc7a3), noteStart, label.length(),
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        return label;
+    }
+
+    private static CharSequence formatConnectedGamepadBadge() {
+        SpannableString badge = new SpannableString("\uD83C\uDFAE connected");
+        int connectedStart = "\uD83C\uDFAE ".length();
+        badge.setSpan(new RelativeSizeSpan(0.68f), connectedStart, badge.length(),
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        badge.setSpan(new ForegroundColorSpan(0xffa9c7e8), connectedStart, badge.length(),
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        return badge;
+    }
+
+    private void updateFpsWithPmu(long presentRate, long[] current, long[] previous) {
+        if (debugHudFps == null) {
+            return;
+        }
+
+        String fps = presentRate < 0
+                ? "FPS --"
+                : String.format(Locale.US, "FPS %,d", presentRate);
+        String metrics = runtimeHudPmuLabel;
+        String fexJit = formatFexJitLabel(current, previous);
+        if (fexJit != null && (metrics == null || metrics.startsWith("PMU n/a") ||
+                metrics.startsWith("PMU warming"))) {
+            metrics = fexJit;
+        }
+        debugHudFps.setText(formatFpsWithScreencastNote(fps));
+        if (debugHudPs5Badge != null) {
+            debugHudPs5Badge.setVisibility(ps5Runtime ? View.VISIBLE : View.GONE);
+        }
+        if (debugHudPmu != null) {
+            debugHudPmu.setText(metrics == null ? "PMU n/a" : metrics);
+        }
+    }
+
+    private void updateFsrProofHud(long[] current, long[] previous) {
+        if (debugHudFsr == null) {
+            return;
+        }
+        final boolean visible = !ps5Runtime && showDebugHudUpscalerInfo;
+        debugHudFsr.setVisibility(visible ? View.VISIBLE : View.GONE);
+        if (!visible) {
+            return;
+        }
+        if (current == null || current.length < HUD_UPSCALER_PROOF_VALUE_COUNT ||
+                current[HUD_UPSCALER_SCHEMA] != 1) {
+            debugHudFsr.setText("UPSCALER --");
+            debugHudFsr.setTextColor(0xffa9b2bb);
+            return;
+        }
+        final long sourceWidth = current[HUD_FSR_SOURCE_WIDTH];
+        final long sourceHeight = current[HUD_FSR_SOURCE_HEIGHT];
+        final long outputWidth = current[HUD_FSR_OUTPUT_WIDTH];
+        final long outputHeight = current[HUD_FSR_OUTPUT_HEIGHT];
+        final String extent = String.format(Locale.US, "%d×%d → %d×%d",
+                sourceWidth, sourceHeight, outputWidth, outputHeight);
+        if (current[HUD_FSR_ENABLED] == 0) {
+            debugHudFsr.setText("UPSCALER OFF · " + extent);
+            debugHudFsr.setTextColor(0xffc18b8b);
+            return;
+        }
+        final int requested = (int) current[HUD_UPSCALER_REQUESTED];
+        final int effective = (int) current[HUD_UPSCALER_EFFECTIVE];
+        if (effective != SettingsActivity.UPSCALER_OFF) {
+            final long frameRate = counterRate(current, previous, HUD_UPSCALER_FRAMES);
+            final long rcasRate = counterRate(current, previous, HUD_RCAS_FRAMES);
+            final String rcas = effective == SettingsActivity.UPSCALER_FSR1 &&
+                    current[HUD_RCAS_ACTIVE] != 0
+                    ? String.format(Locale.US, "RCAS %,d/s", rcasRate)
+                    : "";
+            final String temporal = effective == SettingsActivity.UPSCALER_SGSR2 ||
+                    effective == SettingsActivity.UPSCALER_ARM_ASR
+                    ? (current[HUD_TEMPORAL_NATIVE_INPUTS] != 0
+                        ? " · native motion/depth" : " · reconstructed motion/depth")
+                    : "";
+            final long fallback = current[HUD_UPSCALER_FALLBACK];
+            final String fallbackText = fallback != 0 || requested != effective
+                    ? " · fallback " + upscalerModeName(requested) + "→" +
+                        upscalerModeName(effective) + " (" + upscalerFallbackName(fallback) + ")"
+                    : "";
+            debugHudFsr.setText(String.format(Locale.US,
+                    "%s ACTIVE · %s · %,d/s%s%s%s",
+                    upscalerModeName(effective), extent, frameRate,
+                    rcas.isEmpty() ? "" : " · " + rcas, temporal, fallbackText));
+            debugHudFsr.setTextColor(0xff82c99a);
+            return;
+        }
+        if (sourceWidth == 0 || sourceHeight == 0 || outputWidth == 0 || outputHeight == 0) {
+            debugHudFsr.setText("UPSCALER READY · waiting for present");
+            debugHudFsr.setTextColor(0xffd2b46f);
+            return;
+        }
+        if (sourceWidth < outputWidth && sourceHeight < outputHeight) {
+            debugHudFsr.setText(upscalerModeName(requested) + " BYPASSED · " + extent);
+            debugHudFsr.setTextColor(0xffe39a73);
+            return;
+        }
+        debugHudFsr.setText("UPSCALER READY · " + extent + " · upscale not required");
+        debugHudFsr.setTextColor(0xffd2b46f);
+    }
+
+    private static String upscalerModeName(int mode) {
+        switch (mode) {
+            case SettingsActivity.UPSCALER_AUTO: return "AUTO";
+            case SettingsActivity.UPSCALER_BILINEAR: return "BILINEAR";
+            case SettingsActivity.UPSCALER_SHARP_BILINEAR: return "SHARP BILINEAR";
+            case SettingsActivity.UPSCALER_BICUBIC: return "BICUBIC";
+            case SettingsActivity.UPSCALER_FSR1: return "FSR1";
+            case SettingsActivity.UPSCALER_SGSR1: return "SGSR1";
+            case SettingsActivity.UPSCALER_NIS: return "NIS";
+            case SettingsActivity.UPSCALER_SGSR2: return "SGSR2";
+            case SettingsActivity.UPSCALER_ARM_ASR: return "ARM ASR";
+            default: return "OFF";
+        }
+    }
+
+    private static String upscalerFallbackName(long reason) {
+        if (reason == 1) return "unsupported capability";
+        if (reason == 2) return "unsupported scale/HDR domain";
+        if (reason == 3) return "dispatch failed";
+        if (reason == 4) return "HDR route";
+        return "auto route";
+    }
+
+    private static String describeVulkanDriverForHud(String status) {
+        if (status == null || status.isEmpty()) {
+            return "GPU detecting...";
+        }
+        try {
+            JSONObject json = new JSONObject(status);
+            String effective = json.optString("effective", "");
+            String requested = json.optString("requested", "");
+            String driverName = json.optString("driverName", "");
+            String driverInfo = json.optString("driverInfo", "");
+            String deviceName = json.optString("deviceName", "");
+            String driverVersion = json.optString("driverVersion", "");
+            String apiVersion = json.optString("apiVersion", "");
+            boolean selectionLocked = json.optBoolean("selectionLocked", false);
+            if ("turnip".equalsIgnoreCase(requested) && !selectionLocked) {
+                return "GPU Turnip pending...";
+            }
+            String driverNameLower = driverName.toLowerCase(Locale.ROOT);
+            String driverInfoLower = driverInfo.toLowerCase(Locale.ROOT);
+            boolean hasActualDriverProperties = !driverName.trim().isEmpty()
+                    || !driverInfo.trim().isEmpty();
+            boolean actualPropertiesAuthoritative = selectionLocked
+                    && hasActualDriverProperties;
+            boolean actualTurnip = driverNameLower.contains("turnip")
+                    || driverNameLower.contains("mesa")
+                    || driverInfoLower.contains("turnip")
+                    || driverInfoLower.contains("mesa");
+
+
+
+            boolean actualQualcomm = !actualTurnip
+                    && (driverNameLower.contains("qualcomm")
+                    || driverNameLower.contains("adreno")
+                    || driverInfoLower.contains("qualcomm")
+                    || driverInfoLower.contains("adreno"));
+            boolean effectiveTurnip = "turnip".equalsIgnoreCase(effective);
+            boolean turnip = actualPropertiesAuthoritative
+                    ? actualTurnip
+                    : effectiveTurnip;
+            boolean qualcomm = actualPropertiesAuthoritative
+                    ? actualQualcomm
+                    : driverNameLower.contains("qualcomm")
+                            || driverInfoLower.contains("qualcomm")
+                            || deviceName.toLowerCase(Locale.ROOT).contains("adreno");
+            StringBuilder label = new StringBuilder("GPU ");
+            if (turnip) {
+                label.append("Turnip");
+                int mesa = driverInfo.indexOf("Mesa ");
+                if (mesa >= 0) {
+                    int end = driverInfo.indexOf(' ', mesa + 5);
+                    if (end < 0) {
+                        end = driverInfo.length();
+                    }
+                    label.append(' ').append(driverInfo, mesa, end);
+                } else if (!driverVersion.isEmpty()) {
+                    label.append(" drv ").append(driverVersion);
+                }
+            } else if (qualcomm) {
+                label.append("Qualcomm");
+                String build = "";
+                int marker = driverInfo.indexOf("Driver Build:");
+                if (marker >= 0) {
+                    int start = marker + "Driver Build:".length();
+                    int comma = driverInfo.indexOf(',', start);
+                    int newline = driverInfo.indexOf('\n', start);
+                    int end = comma >= 0 ? comma : newline;
+                    if (end < 0) {
+                        end = driverInfo.length();
+                    }
+                    build = driverInfo.substring(start, end).trim();
+                }
+                if (!build.isEmpty()) {
+                    label.append(' ').append(build);
+                } else if (!driverVersion.isEmpty()) {
+                    label.append(" drv ").append(driverVersion);
+                }
+            } else {
+                String systemLabel = !driverName.isEmpty() ? driverName : deviceName;
+                label.append(systemLabel.isEmpty() ? "unknown" : systemLabel);
+                if (!driverVersion.isEmpty()) {
+                    label.append(" drv ").append(driverVersion);
+                }
+            }
+            if (!apiVersion.isEmpty() && !"0.0.0".equals(apiVersion)) {
+                label.append("  VK ").append(apiVersion);
+            }
+            boolean actualDriverRouteMismatch = actualPropertiesAuthoritative
+                    && ((actualTurnip && !effectiveTurnip)
+                    || (actualQualcomm && effectiveTurnip));
+            if (actualDriverRouteMismatch) {
+                label.append("  DRIVER MISMATCH");
+            }
+            if (selectionLocked && "turnip".equalsIgnoreCase(requested)
+                    && !"turnip".equalsIgnoreCase(effective)) {
+                label.append("  TURNIP FALLBACK");
+            }
+            return label.toString();
+        } catch (Exception error) {
+            return "GPU status invalid";
         }
     }
 
@@ -2804,14 +4635,33 @@ public class MainActivity extends Activity {
         if (loadingProgressPanel == null || loadingBlocksText == null) {
             return;
         }
-        if (frameCaught) {
+        if (frameCaught && loadingState.status() != LoadingProgressState.Status.ERROR) {
             loadingProgressPanel.setVisibility(View.GONE);
             return;
         }
         loadingProgressPanel.setVisibility(View.VISIBLE);
         long blocks = runtimeHudCurrentStats != null && runtimeHudCurrentStats.length > 0
                 ? runtimeHudCurrentStats[0] : 0;
-        loadingBlocksText.setText(String.format(Locale.US, "blocks %,d", blocks));
+        String blocksLabel = getString(R.string.loading_blocks, blocks);
+        if (!blocksLabel.contentEquals(loadingBlocksText.getText())) {
+            loadingBlocksText.setText(blocksLabel);
+        }
+        LoadingProgressState.Status status = loadingState.status();
+        int message = status == LoadingProgressState.Status.ERROR ? R.string.loading_failed
+                : status == LoadingProgressState.Status.ACTIVE ? R.string.loading_active
+                : R.string.loading_waiting;
+        int color = status == LoadingProgressState.Status.ERROR ? 0xffff7777
+                : status == LoadingProgressState.Status.ACTIVE ? 0xff55e37a : 0xffe5cd87;
+        String label = getString(message);
+        if (loadingStatusText != null && !label.contentEquals(loadingStatusText.getText())) {
+            loadingStatusText.setText(label);
+            loadingStatusText.setTextColor(color);
+            loadingBlocksText.setTextColor(color);
+        }
+        if (loadingSpinner != null) {
+            loadingSpinner.setVisibility(status == LoadingProgressState.Status.ERROR
+                    ? View.GONE : View.VISIBLE);
+        }
     }
 
     private void renderRuntimeDebugHud() {
@@ -2825,10 +4675,15 @@ public class MainActivity extends Activity {
         long minutes = totalSeconds / 60;
         long seconds = totalSeconds % 60;
 
+        if (debugHudDriver != null) {
+            debugHudDriver.setText(describeVulkanDriverForHud(runtimeHudVulkanStatus));
+        }
+
         long[] current = runtimeHudCurrentStats;
         long[] previous = runtimeHudLastStats;
         if (current == null || current.length < 11) {
-            debugHudFps.setText("FPS --");
+            updateFpsWithPmu(-1, current, previous);
+            updateFsrProofHud(current, previous);
             debugHud.setText(String.format(Locale.US,
                     "time %02d:%02d  blocks --  draw --  submit --  present --",
                     minutes, seconds));
@@ -2900,7 +4755,8 @@ public class MainActivity extends Activity {
             managedOptimization.append("  VK-REPLAY")
                     .append(current[77]);
         }
-        debugHudFps.setText(String.format(Locale.US, "FPS %,d", presentRate));
+        updateFpsWithPmu(presentRate, current, previous);
+        updateFsrProofHud(current, previous);
         debugHud.setText(String.format(Locale.US,
                 "time %02d:%02d  blocks %,d (+%,d/s)  draw %,d/s  submit %,d/s  present %,d/s%s",
                 minutes, seconds, current[0], generatedRate, drawRate, submitRate, presentRate,
@@ -3088,7 +4944,13 @@ public class MainActivity extends Activity {
         return drawable;
     }
 
-    private final class DualShockOverlayView extends View {
+    static final class DualShockOverlayView extends View {
+        interface InputSink {
+            void button(int mask, boolean pressed);
+            void axis(int axis, int value, boolean verbose);
+            void touchpad(boolean pressed, float x, float y);
+        }
+
         private static final long STICK_CLICK_HOLD_MS = 500;
         private static final int AXIS_LEFT_X = 0;
         private static final int AXIS_LEFT_Y = 1;
@@ -3102,6 +4964,8 @@ public class MainActivity extends Activity {
         private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint iconPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint shadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final SharedPreferences preferences;
+        private final InputSink inputSink;
         private final Path path = new Path();
         private final RectF body = new RectF();
         private final RectF touchpad = new RectF();
@@ -3127,17 +4991,20 @@ public class MainActivity extends Activity {
         private final RectF rightStick = new RectF();
         private final RectF scratch = new RectF();
         private final int[] buttonBits = {
-                PAD_L3, PAD_R3, PAD_OPTIONS, PAD_UP, PAD_RIGHT, PAD_DOWN, PAD_LEFT,
+                PAD_SHARE, PAD_L3, PAD_R3, PAD_OPTIONS, PAD_UP, PAD_RIGHT, PAD_DOWN, PAD_LEFT,
                 PAD_L2, PAD_R2, PAD_L1, PAD_R1, PAD_TRIANGLE, PAD_CIRCLE, PAD_CROSS,
-                PAD_SQUARE, PAD_TOUCHPAD
+                PAD_SQUARE, PAD_PS, PAD_TOUCHPAD
         };
+        private OverlayLayoutStore.State[] layoutStates;
 
         private float leftStickCenterX;
         private float leftStickCenterY;
         private float rightStickCenterX;
         private float rightStickCenterY;
-        private float stickRadius;
-        private float stickThrowRadius;
+        private float leftStickRadius;
+        private float rightStickRadius;
+        private float leftStickThrowRadius;
+        private float rightStickThrowRadius;
         private int activeMask;
         private int leftX = 128;
         private int leftY = 128;
@@ -3187,8 +5054,11 @@ public class MainActivity extends Activity {
             requestVisualRefresh(true);
         };
 
-        DualShockOverlayView(Context context) {
+        DualShockOverlayView(Context context, SharedPreferences preferences,
+                             InputSink inputSink) {
             super(context);
+            this.preferences = preferences;
+            this.inputSink = inputSink;
             setClickable(true);
             setFocusable(false);
             setSoundEffectsEnabled(false);
@@ -3205,6 +5075,55 @@ public class MainActivity extends Activity {
             iconPaint.setStrokeJoin(Paint.Join.ROUND);
             shadowPaint.setStyle(Paint.Style.FILL);
             shadowPaint.setColor(0x66000000);
+            layoutStates = OverlayLayoutStore.readAll(preferences);
+        }
+
+        void reloadLayout() {
+            resetAllInputs();
+            layoutStates = OverlayLayoutStore.readAll(preferences);
+            geometryDirty = true;
+            invalidate();
+        }
+
+        void previewLayout(OverlayLayoutStore.State[] states) {
+            layoutStates = states == null
+                    ? OverlayLayoutStore.readAll(preferences) : states;
+            geometryDirty = true;
+            invalidate();
+        }
+
+        RectF controlBounds(OverlayLayoutStore.Element element) {
+            updateGeometryIfNeeded();
+            if (element == OverlayLayoutStore.DPAD) return union(
+                    dpadBase, dpadUp, dpadRight, dpadDown, dpadLeft);
+            if (element == OverlayLayoutStore.FACE) return union(
+                    faceBase, triangle, circle, cross, square);
+            if (element == OverlayLayoutStore.LEFT_STICK) return new RectF(leftStick);
+            if (element == OverlayLayoutStore.RIGHT_STICK) return new RectF(rightStick);
+            if (element == OverlayLayoutStore.L1) return new RectF(l1);
+            if (element == OverlayLayoutStore.L2) return new RectF(l2);
+            if (element == OverlayLayoutStore.R1) return new RectF(r1);
+            if (element == OverlayLayoutStore.R2) return new RectF(r2);
+            if (element == OverlayLayoutStore.OPTIONS) return new RectF(options);
+            if (element == OverlayLayoutStore.SHARE) return new RectF(share);
+            if (element == OverlayLayoutStore.PS) return new RectF(ps);
+            if (element == OverlayLayoutStore.TOUCHPAD) return new RectF(touchpad);
+            return new RectF();
+        }
+
+        private RectF union(RectF... values) {
+            RectF result = new RectF();
+            if (values.length > 0) {
+                result.set(values[0]);
+                for (int index = 1; index < values.length; index++) {
+                    result.union(values[index]);
+                }
+            }
+            return result;
+        }
+
+        private boolean isVisible(OverlayLayoutStore.Element element) {
+            return OverlayLayoutStore.find(layoutStates, element).visible;
         }
 
         @Override
@@ -3214,14 +5133,24 @@ public class MainActivity extends Activity {
 
             drawBody(canvas);
             drawShoulders(canvas);
-            drawTouchpad(canvas);
-            drawCenterButton(canvas, share, "SHARE", false);
-            drawCenterButton(canvas, options, "OPTIONS", (activeMask & PAD_OPTIONS) != 0);
-            drawPs(canvas);
-            drawDpad(canvas);
-            drawFaceButtons(canvas);
-            drawStick(canvas, leftStick, leftX, leftY, (activeMask & PAD_L3) != 0, "L3");
-            drawStick(canvas, rightStick, rightX, rightY, (activeMask & PAD_R3) != 0, "R3");
+            if (isVisible(OverlayLayoutStore.TOUCHPAD)) drawTouchpad(canvas);
+            if (isVisible(OverlayLayoutStore.SHARE)) {
+                drawCenterButton(canvas, share, "SHARE", (activeMask & PAD_SHARE) != 0);
+            }
+            if (isVisible(OverlayLayoutStore.OPTIONS)) {
+                drawCenterButton(canvas, options, "OPTIONS", (activeMask & PAD_OPTIONS) != 0);
+            }
+            if (isVisible(OverlayLayoutStore.PS)) drawPs(canvas);
+            if (isVisible(OverlayLayoutStore.DPAD)) drawDpad(canvas);
+            if (isVisible(OverlayLayoutStore.FACE)) drawFaceButtons(canvas);
+            if (isVisible(OverlayLayoutStore.LEFT_STICK)) {
+                drawStick(canvas, leftStick, leftX, leftY,
+                        (activeMask & PAD_L3) != 0, "L3");
+            }
+            if (isVisible(OverlayLayoutStore.RIGHT_STICK)) {
+                drawStick(canvas, rightStick, rightX, rightY,
+                        (activeMask & PAD_R3) != 0, "R3");
+            }
         }
 
         @Override
@@ -3276,12 +5205,18 @@ public class MainActivity extends Activity {
                 if (action == MotionEvent.ACTION_POINTER_DOWN && !isControlHit(x, y)) {
                     return true;
                 }
-                if (leftStickPointerId == -1 && isInsideStick(x, y, leftStickCenterX, leftStickCenterY)) {
+                if (leftStickPointerId == -1 && isVisible(OverlayLayoutStore.LEFT_STICK)
+                        && isInsideStick(x, y, leftStickCenterX, leftStickCenterY,
+                        leftStickRadius)) {
                     beginLeftStickTouch(pointerId, x, y);
                 } else if (rightStickPointerId == -1 &&
-                        isInsideStick(x, y, rightStickCenterX, rightStickCenterY)) {
+                        isVisible(OverlayLayoutStore.RIGHT_STICK)
+                        && isInsideStick(x, y, rightStickCenterX, rightStickCenterY,
+                        rightStickRadius)) {
                     beginRightStickTouch(pointerId, x, y);
-                } else if (touchpadPointerId == -1 && touchpad.contains(x, y)) {
+                } else if (touchpadPointerId == -1
+                        && isVisible(OverlayLayoutStore.TOUCHPAD)
+                        && touchpad.contains(x, y)) {
                     touchpadPointerId = pointerId;
                     updateTouchpad(x, y, true);
                 }
@@ -3303,10 +5238,11 @@ public class MainActivity extends Activity {
                 float x = event.getX(i);
                 float y = event.getY(i);
                 if (pointerId == leftStickPointerId) {
-                    newLeftX = axisValue(x, leftStickCenterX);
-                    newLeftY = axisValue(y, leftStickCenterY);
+                    newLeftX = axisValue(x, leftStickCenterX, leftStickThrowRadius);
+                    newLeftY = axisValue(y, leftStickCenterY, leftStickThrowRadius);
                     if (leftStickLongPressEligible &&
-                            distance(x, y, leftStickDownX, leftStickDownY) > stickRadius * 0.35f) {
+                            distance(x, y, leftStickDownX, leftStickDownY)
+                                    > leftStickRadius * 0.35f) {
                         leftStickLongPressEligible = false;
                         removeCallbacks(leftStickLongPress);
                     }
@@ -3314,10 +5250,11 @@ public class MainActivity extends Activity {
                     continue;
                 }
                 if (pointerId == rightStickPointerId) {
-                    newRightX = axisValue(x, rightStickCenterX);
-                    newRightY = axisValue(y, rightStickCenterY);
+                    newRightX = axisValue(x, rightStickCenterX, rightStickThrowRadius);
+                    newRightY = axisValue(y, rightStickCenterY, rightStickThrowRadius);
                     if (rightStickLongPressEligible &&
-                            distance(x, y, rightStickDownX, rightStickDownY) > stickRadius * 0.35f) {
+                            distance(x, y, rightStickDownX, rightStickDownY)
+                                    > rightStickRadius * 0.35f) {
                         rightStickLongPressEligible = false;
                         removeCallbacks(rightStickLongPress);
                     }
@@ -3478,22 +5415,54 @@ public class MainActivity extends Activity {
             r1.set(r2.left - shoulderGap - shoulderW, shoulderTop, r2.left - shoulderGap,
                     shoulderTop + shoulderH);
 
-            stickRadius = Math.max(dp(24), Math.min(min * 0.060f, dp(42)));
-            stickThrowRadius = stickRadius * 0.46f;
-            leftStickCenterX = Math.max(width * 0.30f, dpadBase.right + stickRadius * 1.15f);
+            float baseStickRadius = Math.max(dp(24), Math.min(min * 0.060f, dp(42)));
+            leftStickCenterX = Math.max(width * 0.30f,
+                    dpadBase.right + baseStickRadius * 1.15f);
             leftStickCenterY = Math.min(dpadY + cluster * 0.44f,
-                    height - bottomInset - stickRadius * 0.14f);
-            rightStickCenterX = Math.min(width * 0.70f, faceBase.left - stickRadius * 1.15f);
+                    height - bottomInset - baseStickRadius * 0.14f);
+            rightStickCenterX = Math.min(width * 0.70f,
+                    faceBase.left - baseStickRadius * 1.15f);
             rightStickCenterY = leftStickCenterY;
-            setCentered(leftStick, leftStickCenterX, leftStickCenterY, stickRadius * 2f,
-                    stickRadius * 2f);
-            setCentered(rightStick, rightStickCenterX, rightStickCenterY, stickRadius * 2f,
-                    stickRadius * 2f);
+            setCentered(leftStick, leftStickCenterX, leftStickCenterY, baseStickRadius * 2f,
+                    baseStickRadius * 2f);
+            setCentered(rightStick, rightStickCenterX, rightStickCenterY, baseStickRadius * 2f,
+                    baseStickRadius * 2f);
+
+            applyLayoutTransform(OverlayLayoutStore.DPAD, width, height,
+                    dpadBase, dpadUp, dpadRight, dpadDown, dpadLeft);
+            applyLayoutTransform(OverlayLayoutStore.FACE, width, height,
+                    faceBase, triangle, circle, cross, square);
+            applyLayoutTransform(OverlayLayoutStore.LEFT_STICK, width, height, leftStick);
+            applyLayoutTransform(OverlayLayoutStore.RIGHT_STICK, width, height, rightStick);
+            applyLayoutTransform(OverlayLayoutStore.L1, width, height, l1);
+            applyLayoutTransform(OverlayLayoutStore.L2, width, height, l2);
+            applyLayoutTransform(OverlayLayoutStore.R1, width, height, r1);
+            applyLayoutTransform(OverlayLayoutStore.R2, width, height, r2);
+            applyLayoutTransform(OverlayLayoutStore.OPTIONS, width, height, options);
+            applyLayoutTransform(OverlayLayoutStore.SHARE, width, height, share);
+            applyLayoutTransform(OverlayLayoutStore.PS, width, height, ps);
+            applyLayoutTransform(OverlayLayoutStore.TOUCHPAD, width, height,
+                    touchpad, touchpadToggle);
+
+            leftStickCenterX = leftStick.centerX();
+            leftStickCenterY = leftStick.centerY();
+            rightStickCenterX = rightStick.centerX();
+            rightStickCenterY = rightStick.centerY();
+            leftStickRadius = leftStick.width() * 0.5f;
+            rightStickRadius = rightStick.width() * 0.5f;
+            leftStickThrowRadius = Math.max(1f, leftStickRadius * 0.46f);
+            rightStickThrowRadius = Math.max(1f, rightStickRadius * 0.46f);
 
             float stroke = Math.max(dp(1), min * 0.0035f);
             strokePaint.setStrokeWidth(stroke);
             iconPaint.setStrokeWidth(stroke * 1.25f);
             textPaint.setTextSize(Math.max(dp(8), Math.min(min * 0.013f, dp(12))));
+        }
+
+        private void applyLayoutTransform(OverlayLayoutStore.Element element,
+                                          float width, float height, RectF... rectangles) {
+            OverlayLayoutStore.transform(OverlayLayoutStore.find(layoutStates, element),
+                    width, height, rectangles);
         }
 
         private void drawBody(Canvas canvas) {
@@ -3509,10 +5478,18 @@ public class MainActivity extends Activity {
         }
 
         private void drawShoulders(Canvas canvas) {
-            drawShoulder(canvas, l1, "L1", (activeMask & PAD_L1) != 0);
-            drawShoulder(canvas, l2, "L2", (activeMask & PAD_L2) != 0);
-            drawShoulder(canvas, r1, "R1", (activeMask & PAD_R1) != 0);
-            drawShoulder(canvas, r2, "R2", (activeMask & PAD_R2) != 0);
+            if (isVisible(OverlayLayoutStore.L1)) {
+                drawShoulder(canvas, l1, "L1", (activeMask & PAD_L1) != 0);
+            }
+            if (isVisible(OverlayLayoutStore.L2)) {
+                drawShoulder(canvas, l2, "L2", (activeMask & PAD_L2) != 0);
+            }
+            if (isVisible(OverlayLayoutStore.R1)) {
+                drawShoulder(canvas, r1, "R1", (activeMask & PAD_R1) != 0);
+            }
+            if (isVisible(OverlayLayoutStore.R2)) {
+                drawShoulder(canvas, r2, "R2", (activeMask & PAD_R2) != 0);
+            }
         }
 
         private void drawShoulder(Canvas canvas, RectF rect, String label, boolean pressed) {
@@ -3552,7 +5529,7 @@ public class MainActivity extends Activity {
         }
 
         private void drawPs(Canvas canvas) {
-            boolean pressed = false;
+            boolean pressed = (activeMask & PAD_PS) != 0;
             float radius = ps.width() * 0.5f;
             fillPaint.setColor(pressed ? 0xdd2d3744 : 0xbb05070a);
             canvas.drawCircle(ps.centerX(), ps.centerY(), radius, fillPaint);
@@ -3640,13 +5617,14 @@ public class MainActivity extends Activity {
 
         private void drawStick(Canvas canvas, RectF rect, int axisX, int axisY, boolean pressed, String label) {
             float radius = rect.width() * 0.5f;
+            float throwRadius = radius * 0.46f;
             fillPaint.setColor(pressed ? 0xcc293748 : 0xba05070a);
             canvas.drawCircle(rect.centerX(), rect.centerY(), radius, fillPaint);
             strokePaint.setColor(pressed ? 0xffe8f1ff : 0xaaaab2bf);
             canvas.drawCircle(rect.centerX(), rect.centerY(), radius, strokePaint);
 
-            float knobX = rect.centerX() + ((axisX - 128) / 127f) * stickThrowRadius;
-            float knobY = rect.centerY() + ((axisY - 128) / 127f) * stickThrowRadius;
+            float knobX = rect.centerX() + ((axisX - 128) / 127f) * throwRadius;
+            float knobY = rect.centerY() + ((axisY - 128) / 127f) * throwRadius;
             fillPaint.setColor(0xee111821);
             canvas.drawCircle(knobX, knobY, radius * 0.46f, fillPaint);
             strokePaint.setColor(0xff5f6977);
@@ -3662,20 +5640,29 @@ public class MainActivity extends Activity {
 
         private int controlMaskAt(float x, float y, boolean includeTouchpad) {
             int mask = 0;
-            if (dpadUp.contains(x, y)) mask |= PAD_UP;
-            if (dpadRight.contains(x, y)) mask |= PAD_RIGHT;
-            if (dpadDown.contains(x, y)) mask |= PAD_DOWN;
-            if (dpadLeft.contains(x, y)) mask |= PAD_LEFT;
-            if (triangle.contains(x, y)) mask |= PAD_TRIANGLE;
-            if (circle.contains(x, y)) mask |= PAD_CIRCLE;
-            if (cross.contains(x, y)) mask |= PAD_CROSS;
-            if (square.contains(x, y)) mask |= PAD_SQUARE;
-            if (l1.contains(x, y)) mask |= PAD_L1;
-            if (l2.contains(x, y)) mask |= PAD_L2;
-            if (r1.contains(x, y)) mask |= PAD_R1;
-            if (r2.contains(x, y)) mask |= PAD_R2;
-            if (options.contains(x, y)) mask |= PAD_OPTIONS;
-            if (includeTouchpad && touchpadExpanded && touchpad.contains(x, y) &&
+            if (isVisible(OverlayLayoutStore.DPAD)) {
+                if (dpadUp.contains(x, y)) mask |= PAD_UP;
+                if (dpadRight.contains(x, y)) mask |= PAD_RIGHT;
+                if (dpadDown.contains(x, y)) mask |= PAD_DOWN;
+                if (dpadLeft.contains(x, y)) mask |= PAD_LEFT;
+            }
+            if (isVisible(OverlayLayoutStore.FACE)) {
+                if (triangle.contains(x, y)) mask |= PAD_TRIANGLE;
+                if (circle.contains(x, y)) mask |= PAD_CIRCLE;
+                if (cross.contains(x, y)) mask |= PAD_CROSS;
+                if (square.contains(x, y)) mask |= PAD_SQUARE;
+            }
+            if (isVisible(OverlayLayoutStore.L1) && l1.contains(x, y)) mask |= PAD_L1;
+            if (isVisible(OverlayLayoutStore.L2) && l2.contains(x, y)) mask |= PAD_L2;
+            if (isVisible(OverlayLayoutStore.R1) && r1.contains(x, y)) mask |= PAD_R1;
+            if (isVisible(OverlayLayoutStore.R2) && r2.contains(x, y)) mask |= PAD_R2;
+            if (isVisible(OverlayLayoutStore.OPTIONS) && options.contains(x, y)) {
+                mask |= PAD_OPTIONS;
+            }
+            if (isVisible(OverlayLayoutStore.SHARE) && share.contains(x, y)) mask |= PAD_SHARE;
+            if (isVisible(OverlayLayoutStore.PS) && ps.contains(x, y)) mask |= PAD_PS;
+            if (includeTouchpad && isVisible(OverlayLayoutStore.TOUCHPAD)
+                    && touchpadExpanded && touchpad.contains(x, y) &&
                     !touchpadToggle.contains(x, y)) {
                 mask |= PAD_TOUCHPAD;
             }
@@ -3684,15 +5671,20 @@ public class MainActivity extends Activity {
 
         private boolean isControlHit(float x, float y) {
             return controlMaskAt(x, y, true) != 0 ||
-                    isInsideStick(x, y, leftStickCenterX, leftStickCenterY) ||
-                    isInsideStick(x, y, rightStickCenterX, rightStickCenterY) ||
-                    containsWithSlop(touchpad, x, y, dp(12)) ||
-                    ps.contains(x, y);
+                    (isVisible(OverlayLayoutStore.LEFT_STICK)
+                            && isInsideStick(x, y, leftStickCenterX, leftStickCenterY,
+                            leftStickRadius)) ||
+                    (isVisible(OverlayLayoutStore.RIGHT_STICK)
+                            && isInsideStick(x, y, rightStickCenterX, rightStickCenterY,
+                            rightStickRadius)) ||
+                    (isVisible(OverlayLayoutStore.TOUCHPAD)
+                            && containsWithSlop(touchpad, x, y, dp(12)));
         }
 
         private boolean shouldToggleTouchpad(float x, float y) {
             float slop = dp(14);
-            return containsWithSlop(touchpad, x, y, slop) &&
+            return isVisible(OverlayLayoutStore.TOUCHPAD)
+                    && containsWithSlop(touchpad, x, y, slop) &&
                     (!touchpadExpanded || containsWithSlop(touchpadToggle, x, y, slop));
         }
 
@@ -3819,13 +5811,14 @@ public class MainActivity extends Activity {
             }
         }
 
-        private int axisValue(float value, float center) {
-            float normalized = Math.max(-1f, Math.min(1f, (value - center) / stickThrowRadius));
+        private int axisValue(float value, float center, float throwRadius) {
+            float normalized = Math.max(-1f, Math.min(1f, (value - center) / throwRadius));
             return Math.max(0, Math.min(255, Math.round(128 + normalized * 127f)));
         }
 
-        private boolean isInsideStick(float x, float y, float centerX, float centerY) {
-            return distance(x, y, centerX, centerY) <= stickRadius * 1.15f;
+        private boolean isInsideStick(float x, float y, float centerX, float centerY,
+                                      float radius) {
+            return distance(x, y, centerX, centerY) <= radius * 1.15f;
         }
 
         private float distance(float x, float y, float centerX, float centerY) {
@@ -3848,6 +5841,32 @@ public class MainActivity extends Activity {
         private void setCentered(RectF rect, float centerX, float centerY, float width, float height) {
             rect.set(centerX - width * 0.5f, centerY - height * 0.5f,
                     centerX + width * 0.5f, centerY + height * 0.5f);
+        }
+
+        private int dp(int value) {
+            return dpStatic(getContext(), value);
+        }
+
+        private void sendPadButton(int mask, boolean pressed) {
+            if (inputSink != null) {
+                inputSink.button(mask, pressed);
+            }
+        }
+
+        private void sendPadAxis(int axis, int value) {
+            sendPadAxis(axis, value, true);
+        }
+
+        private void sendPadAxis(int axis, int value, boolean verbose) {
+            if (inputSink != null) {
+                inputSink.axis(axis, value, verbose);
+            }
+        }
+
+        private void sendTouchPad(boolean pressed, float x, float y) {
+            if (inputSink != null) {
+                inputSink.touchpad(pressed, x, y);
+            }
         }
     }
 
@@ -4026,6 +6045,7 @@ public class MainActivity extends Activity {
     }
 
     private void sendPadButton(int mask, boolean pressed, boolean hostFeedback) {
+        if (runtimePauseController != null && runtimePauseController.shouldBePaused()) return;
         try {
             int result = ps5Runtime
                     ? RuntimeBridge.setPs5PadButton(mask, pressed)
@@ -4052,6 +6072,7 @@ public class MainActivity extends Activity {
     }
 
     private void sendPadAxis(int axis, int value, boolean verbose) {
+        if (runtimePauseController != null && runtimePauseController.shouldBePaused()) return;
         try {
             int clamped = Math.max(0, Math.min(255, value));
             int result = ps5Runtime
@@ -4093,6 +6114,7 @@ public class MainActivity extends Activity {
     }
 
     private void sendTouchPad(boolean pressed, float x, float y) {
+        if (runtimePauseController != null && runtimePauseController.shouldBePaused()) return;
         try {
             int result = RuntimeBridge.setTouchPad(pressed,
                     Math.max(0.0f, Math.min(1.0f, x)),
@@ -4124,6 +6146,8 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (gameCaptureController != null
+                && gameCaptureController.onActivityResult(requestCode, resultCode, data)) return;
         if (launcherMode) {
             if (launcherUi != null) {
                 launcherUi.handleActivityResult(requestCode, resultCode, data);
@@ -4135,11 +6159,20 @@ public class MainActivity extends Activity {
         }
 
         try {
+            runtimeFile = sandboxRuntimeFile();
             copyUriToFile(data.getData(), runtimeFile);
             append("Runtime selected: " + describe(data.getData()));
             loadRuntimeFromFile("Selected runtime");
         } catch (Exception e) {
             append("Selected runtime failed: " + e.getMessage());
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (gameCaptureController != null) {
+            gameCaptureController.onRequestPermissionsResult(requestCode, permissions, results);
         }
     }
 
@@ -4150,6 +6183,17 @@ public class MainActivity extends Activity {
             return;
         }
         if (!runtimeFile.isFile()) {
+            String libraryName = ps5Runtime
+                    ? "liblsx4_executor_ps5_android.so"
+                    : "liblsx4_executor_android.so";
+            File packagedRuntime = new File(getApplicationInfo().nativeLibraryDir, libraryName);
+            if (packagedRuntime.isFile()) {
+                append("Sandbox runtime missing; using packaged runtime: "
+                        + packagedRuntime.getAbsolutePath());
+                runtimeFile = packagedRuntime;
+            }
+        }
+        if (!runtimeFile.isFile()) {
             append("Runtime file missing: " + runtimeFile.getAbsolutePath());
             if (ps5Runtime) {
                 append("PS5 runtime is not present in sandbox. Install PS5 runtime or run on a build that includes it.");
@@ -4158,14 +6202,39 @@ public class MainActivity extends Activity {
             return;
         }
         try {
+            File cpuProfile = CpuTuningSettings.materialize(
+                    this, getIntent().getStringExtra(EXTRA_LAUNCH_GAME_PATH));
+            append("CPU tuning profile: " + cpuProfile.getAbsolutePath());
             append(label + ": " + runtimeFile.getAbsolutePath());
             append(ps5Runtime
                     ? RuntimeBridge.loadPs5(runtimeFile.getAbsolutePath())
                     : RuntimeBridge.load(runtimeFile.getAbsolutePath()));
             runtimeLoaded = true;
+            applyVulkanDriverAxisSelection();
             applyManagedOptimizations();
+            applyGuestCpuBackendSelection();
+            if (requestedGuestCpuBackend != effectiveGuestCpuBackend) {
+                String reason = guestCpuBackendStatusField("fallbackReason");
+                String message = "Guest CPU backend launch blocked: requested="
+                        + GuestCpuBackend.label(this, requestedGuestCpuBackend)
+                        + " effective="
+                        + GuestCpuBackend.label(this, effectiveGuestCpuBackend)
+                        + " reason=" + (reason.isEmpty() ? "unknown" : reason);
+                append(message);
+                Log.e(TAG, "EXECUTOR_GUEST_CPU_BACKEND_BLOCKED " + message
+                        + " status=" + guestCpuBackendStatus);
+                runtimeLoaded = false;
+                if (runtimePauseController != null) {
+                    runtimePauseController.setRuntimeReady(false);
+                }
+                runOnUiThread(() -> {
+                    updateBackendLabel();
+                    Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+                });
+                return;
+            }
             if (!ps5Runtime) {
-                RuntimeBridge.setAudioEnabled(SettingsActivity.prefs(this).getBoolean(
+                RuntimeBridge.setAudioEnabled(gamePreferences().getBoolean(
                         SettingsActivity.K_AUDIO, true));
                 replayExternalGamepadState();
             }
@@ -4185,13 +6254,371 @@ public class MainActivity extends Activity {
                 append("PS5 runtime is missing required native library. Install PS5 runtime or use build with embedded PS5 binary.");
             }
             runtimeLoaded = false;
+            if (runtimePauseController != null) {
+                runtimePauseController.setRuntimeReady(false);
+            }
         }
     }
 
+    private int applyNativeRuntimePaused(boolean paused) {
+        try {
+            int result = RuntimeBridge.setRuntimePaused(paused);
+            if (result == 0 && !paused) {
+                runOnUiThread(() -> {
+                    if (gameExitRequested || runtimePauseController.shouldBePaused()) return;
+                    if (liveSettingsDeferred) {
+                        liveSettingsDeferred = false;
+                        applyLiveSetting(gamePreferences(), null);
+                    }
+                });
+            }
+            String nativeStatus = RuntimeBridge.runtimeLifecycleStatus();
+            Log.i(TAG, "EXECUTOR_RUNTIME_LIFECYCLE requested="
+                    + (paused ? "paused" : "running") + " result=" + result
+                    + " native=" + nativeStatus);
+            return result;
+        } catch (Throwable error) {
+            Log.e(TAG, "Runtime lifecycle transition failed paused=" + paused, error);
+            return -1;
+        }
+    }
+
+    private void setRuntimePauseReason(int reason, boolean active, String source) {
+        if (runtimePauseController == null) {
+            return;
+        }
+        if (active && !runtimePauseController.shouldBePaused()) {
+
+            if (dualShockOverlay != null) dualShockOverlay.resetAllInputs();
+            resetExternalGamepadInputs();
+        }
+        runtimePauseController.setReason(reason, active);
+        if (gameCaptureController != null) {
+            runOnUiThread(() -> {
+                if (!gameExitRequested) {
+                    gameCaptureController.onRuntimePaused(runtimePauseController.shouldBePaused());
+                }
+            });
+        }
+        Log.i(TAG, "EXECUTOR_RUNTIME_LIFECYCLE source=" + source + " "
+                + runtimePauseController.status());
+    }
+
+    private void terminateRuntimePauseController(String source) {
+        if (runtimePauseController == null) {
+            return;
+        }
+        runtimePauseController.terminate();
+        Log.i(TAG, "EXECUTOR_RUNTIME_LIFECYCLE source=" + source + " "
+                + runtimePauseController.status());
+    }
+
+    private void applyGuestCpuBackendSelection() {
+        SharedPreferences preferences = gamePreferences();
+        java.util.Map<String, Integer> cpuProfile = CpuTuningSettings.resolvedValues(
+                preferences, CpuTuningSettings.titleIdFromPath(
+                        getIntent().getStringExtra(EXTRA_LAUNCH_GAME_PATH)));
+        int executionMode = cpuProfile.get("execution_mode");
+        int memoryManager = cpuProfile.get("memory_manager");
+        requestedGuestCpuBackend = !ps5Runtime && executionMode == 0 && memoryManager != 0
+                ? GuestCpuBackend.FEX_EXPERIMENTAL
+                : GuestCpuBackend.CURRENT;
+        File nativeDir = new File(getApplicationInfo().nativeLibraryDir);
+
+
+
+
+        File adapter = new File(nativeDir, "liblsx4_fex_backend_v3.so");
+        StringBuilder missing = new StringBuilder();
+        for (String name : new String[]{"liblsx4_fex_backend_v3.so",
+                "liblsx4_fex2608_context_bridge.so", "libFEXCore.so"}) {
+            File library = new File(nativeDir, name);
+            if (!library.isFile() || library.length() <= 0L) {
+                if (missing.length() > 0) {
+                    missing.append(", ");
+                }
+                missing.append(name);
+            }
+        }
+        File runtimeRoot = new File(getFilesDir(), "lsx4-home");
+        String launchTitleId = launchTitleId();
+        if (missing.length() > 0) {
+            Log.w(TAG, "EXECUTOR_GUEST_CPU_BACKEND missing libraries: " + missing);
+        }
+        boolean requestedFex = requestedGuestCpuBackend
+                == GuestCpuBackend.FEX_EXPERIMENTAL;
+        boolean fexBundleComplete = missing.length() == 0;
+        if (requestedFex && !fexBundleComplete) {
+            effectiveGuestCpuBackend = GuestCpuBackend.CURRENT;
+            guestCpuBackendStatus = "{\"schema\":\"lsx4.guest-cpu-backend.v1\""
+                    + ",\"platform\":\"" + (ps5Runtime ? "ps5" : "ps4") + "\""
+                    + ",\"requested\":\"fex-experimental\""
+                    + ",\"effective\":\"current-aarch64-jit\""
+                    + ",\"supported\":false"
+                    + ",\"fallbackReason\":\"fex-runtime-bundle-incomplete\""
+                    + ",\"selectionLocked\":false"
+                    + ",\"source\":\"android-package-gate\""
+                    + ",\"missing\":\"" + missing + "\"}";
+        } else {
+            effectiveGuestCpuBackend = GuestCpuBackend.sanitize(
+                    RuntimeBridge.setGuestCpuBackend(requestedGuestCpuBackend,
+                            adapter.getAbsolutePath(), runtimeRoot.getAbsolutePath(),
+                            launchTitleId, runtimeHardwareProfile, runtimeDriverFamily,
+                            runtimeDriverVersion));
+            guestCpuBackendStatus = RuntimeBridge.guestCpuBackendStatus();
+        }
+        if (guestCpuBackendStatus == null) {
+            guestCpuBackendStatus = "";
+        }
+        persistGuestCpuBackendStatus("selected");
+        Log.i(TAG, "EXECUTOR_GUEST_CPU_BACKEND requested="
+                + requestedGuestCpuBackend + " effective="
+                + effectiveGuestCpuBackend + " adapter="
+                + adapter.getAbsolutePath() + " titleId=" + launchTitleId
+                + " hardwareProfile=" + runtimeHardwareProfile
+                + " driverFamily=" + runtimeDriverFamily + " status="
+                + guestCpuBackendStatus);
+    }
+
+    private String launchTitleId() {
+        Intent intent = getIntent();
+        String explicit = intent == null ? null
+                : intent.getStringExtra(GameProfileSettings.EXTRA_GAME_TITLE_ID);
+        explicit = CpuTuningSettings.normalizeTitleId(explicit);
+        if (!explicit.isEmpty()) {
+            return explicit;
+        }
+        String launchPath = intent == null
+                ? null : intent.getStringExtra(EXTRA_LAUNCH_GAME_PATH);
+        if (launchPath == null || launchPath.isEmpty()) {
+            return "";
+        }
+        Matcher matcher = TITLE_ID_PATTERN.matcher(launchPath);
+        return matcher.find() ? matcher.group().toUpperCase(Locale.ROOT) : "";
+    }
+
+    private SharedPreferences gamePreferences() {
+        return liveSettings != null ? liveSettings
+                : SettingsActivity.prefsForGame(this, launchTitleId());
+    }
+
+    private void persistGuestCpuBackendStatus(String phase) {
+        String status = guestCpuBackendStatus == null ? "" : guestCpuBackendStatus;
+        try {
+            writeBytesAtomically(
+                    new File(getFilesDir(), "guest-cpu-backend-status.json"),
+                    status.getBytes(StandardCharsets.UTF_8));
+        } catch (Exception error) {
+            Log.w(TAG, "Guest CPU backend status could not be persisted at " + phase,
+                    error);
+        }
+    }
+
+    private String runtimeLibraryName() {
+        return ps5Runtime
+                ? "liblsx4_executor_ps5_android.so"
+                : "liblsx4_executor_android.so";
+    }
+
+    private File sandboxRuntimeFile() {
+        return new File(new File(getFilesDir(), "runtime"), runtimeLibraryName());
+    }
+
+    private File defaultRuntimeFile() {
+        File packaged = new File(getApplicationInfo().nativeLibraryDir,
+                runtimeLibraryName());
+        return packaged.isFile() ? packaged : sandboxRuntimeFile();
+    }
+
+    private void applyVulkanDriverAxisSelection() {
+        SharedPreferences preferences = gamePreferences();
+        String requestedSelection =
+                VulkanDriverManager.readSelectionId(this, preferences);
+        String recoveryNotice = VulkanDriverManager.recoveryNotice(this);
+        if (!recoveryNotice.isEmpty()) {
+            requestedSelection = VulkanDriverManager.SELECTION_SYSTEM;
+            append("Vulkan driver safety recovery remains active: " + recoveryNotice);
+        }
+        boolean driverAxisSupported = VulkanDriverManager.isAdrenoPlatform()
+                && VulkanDriverManager.isLoaderBundleAvailable(this);
+        boolean requestedTurnip = !VulkanDriverManager.SELECTION_SYSTEM.equals(
+                requestedSelection) && !ps5Runtime && driverAxisSupported;
+        if (!VulkanDriverManager.SELECTION_SYSTEM.equals(requestedSelection)
+                && !requestedTurnip) {
+            append("Selected Vulkan driver cannot be used by this runtime/device: "
+                    + requestedSelection + "; using Qualcomm/system");
+        }
+        File nativeDir = new File(getApplicationInfo().nativeLibraryDir);
+        VulkanDriverManager.DriverPackage turnipPackage = requestedTurnip && !ps5Runtime
+                ? VulkanDriverManager.resolveSelection(this, requestedSelection) : null;
+        if (requestedTurnip && turnipPackage == null) {
+            append("Selected Vulkan driver is unavailable: " + requestedSelection
+                    + "; using Qualcomm/system");
+            Log.e(TAG, "EXECUTOR_VULKAN_DRIVER_SELECTION_UNAVAILABLE id="
+                    + requestedSelection);
+            VulkanDriverManager.recoverUnavailableSelection(
+                    this, preferences, requestedSelection,
+                    "deep-verification-failed-before-runtime-load");
+            requestedTurnip = false;
+        }
+        if (requestedTurnip && turnipPackage != null && turnipPackage.imported) {
+            try {
+                VulkanDriverManager.LaunchDecision decision =
+                        VulkanDriverManager.beginGameLaunch(this, turnipPackage);
+                if (decision.recoveredToSystem) {
+                    requestedTurnip = false;
+                    turnipPackage = null;
+                    VulkanDriverManager.writeSelection(
+                            preferences, VulkanDriverManager.DRIVER_QUALCOMM);
+                    append("Vulkan driver safety recovery: " + decision.message);
+                    Log.e(TAG, "EXECUTOR_VULKAN_DRIVER_RECOVERY " + decision.message);
+                    String message = decision.message;
+                    runOnUiThread(() -> Toast.makeText(
+                            this, message, Toast.LENGTH_LONG).show());
+                } else {
+                    turnipPackage = decision.driverPackage;
+                }
+            } catch (Exception error) {
+                requestedTurnip = false;
+                turnipPackage = null;
+                append("Imported Vulkan driver launch tracking failed: "
+                        + error.getMessage());
+            }
+        }
+        File turnipDir = turnipPackage == null ? nativeDir : turnipPackage.directory;
+        File report = new File(getFilesDir(), "vulkan-driver-status.json");
+        String previousVerifiedStatus = "";
+        if (report.isFile()) {
+            try {
+                previousVerifiedStatus = readUtf8File(report);
+            } catch (Exception error) {
+                Log.w(TAG, "Previous Vulkan driver identity could not be read", error);
+            }
+        }
+        String sha256 = turnipPackage == null ? "" : turnipPackage.sha256;
+        int configured = RuntimeBridge.setVulkanDriverAxis(
+                requestedTurnip, nativeDir.getAbsolutePath(), turnipDir.getAbsolutePath(),
+                report.getAbsolutePath(), sha256);
+        String status = RuntimeBridge.vulkanDriverStatus();
+        runtimeHardwareProfile = VulkanDriverManager.runtimeHardwareProfile(this, status);
+        runtimeDriverFamily = VulkanDriverManager.runtimeDriverFamily(
+                status, runtimeHardwareProfile);
+        runtimeDriverVersion = VulkanDriverManager.runtimeDriverVersion(status);
+        if (runtimeDriverVersion.isEmpty() && !previousVerifiedStatus.isEmpty()) {
+            String previousHardware = VulkanDriverManager.runtimeHardwareProfile(
+                    this, previousVerifiedStatus);
+            String previousFamily = VulkanDriverManager.runtimeDriverFamily(
+                    previousVerifiedStatus, previousHardware);
+            if (runtimeHardwareProfile.equals(previousHardware)
+                    && runtimeDriverFamily.equals(previousFamily)) {
+                runtimeDriverVersion = VulkanDriverManager.runtimeDriverVersion(
+                        previousVerifiedStatus);
+            }
+        }
+        Log.i(TAG, "EXECUTOR_VULKAN_DRIVER_AXIS configured=" + configured
+                + " requestedTurnip=" + requestedTurnip
+                + " driverSource=" + (turnipPackage == null ? "system"
+                        : turnipPackage.imported ? "imported" : "bundled")
+                + " driverDir=" + turnipDir.getAbsolutePath()
+                + " hardwareProfile=" + runtimeHardwareProfile
+                + " driverFamily=" + runtimeDriverFamily + " status=" + status);
+        append("Vulkan driver: " + status);
+        if (requestedTurnip && turnipPackage != null && turnipPackage.imported) {
+            armImportedTurnipHealthConfirmation(turnipPackage.sha256);
+        } else {
+            pendingVulkanDriverHealthSha = "";
+            runtimeHudHandler.removeCallbacks(vulkanDriverHealthCheck);
+        }
+    }
+
+    private void armImportedTurnipHealthConfirmation(String sha256) {
+        pendingVulkanDriverHealthSha = sha256 == null ? "" : sha256;
+        vulkanDriverHealthStartedAtMs = SystemClock.elapsedRealtime();
+        vulkanDriverHealthInitialPresentCount = Math.max(0L, readPresentCounter());
+        runtimeHudHandler.removeCallbacks(vulkanDriverHealthCheck);
+        if (!pendingVulkanDriverHealthSha.isEmpty()) {
+            runtimeHudHandler.postDelayed(vulkanDriverHealthCheck, 1_000L);
+        }
+    }
+
+    private boolean importedTurnipIsActuallyEffective(String expectedSha) {
+        try {
+            JSONObject status = new JSONObject(RuntimeBridge.vulkanDriverStatus());
+            return "turnip".equals(status.optString("requested"))
+                    && "turnip".equals(status.optString("effective"))
+                    && "none".equals(status.optString("fallbackReason"))
+                    && status.optBoolean("selectionLocked", false)
+                    && status.optBoolean("mappingVerified", false)
+                    && expectedSha.equalsIgnoreCase(status.optString("sha256", ""));
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private void refreshGuestCpuDriverAxisAfterVulkanLock(String source) {
+        String status = RuntimeBridge.vulkanDriverStatus();
+        String hardware = VulkanDriverManager.runtimeHardwareProfile(this, status);
+        String family = VulkanDriverManager.runtimeDriverFamily(status, hardware);
+        String version = VulkanDriverManager.runtimeDriverVersion(status);
+        if ("system-unknown".equals(family)) {
+            Log.w(TAG, "EXECUTOR_GUEST_CPU_DRIVER_AXIS_REFRESH source=" + source
+                    + " result=deferred reason=driver-not-authoritative");
+            return;
+        }
+        boolean changed = !hardware.equals(runtimeHardwareProfile)
+                || !family.equals(runtimeDriverFamily)
+                || !version.equals(runtimeDriverVersion);
+        Log.i(TAG, "EXECUTOR_GUEST_CPU_DRIVER_AXIS_REFRESH source=" + source
+                + " changed=" + changed
+                + " previous=" + runtimeHardwareProfile + "/" + runtimeDriverFamily
+                + " effective=" + hardware + "/" + family
+                + " driverVersion=" + version);
+        if (!changed) {
+            return;
+        }
+        runtimeHardwareProfile = hardware;
+        runtimeDriverFamily = family;
+        runtimeDriverVersion = version;
+
+
+
+
+        applyGuestCpuBackendSelection();
+        startAndroidMemoryPressureMonitor();
+    }
+
+    private File selectRuntimeFileForLaunch() {
+        File packaged = new File(getApplicationInfo().nativeLibraryDir,
+                runtimeLibraryName());
+        File staged = sandboxRuntimeFile();
+        if (!intentFlag(EXTRA_AUTOLOAD_EXISTING_RUNTIME) || !staged.isFile()) {
+            return packaged.isFile() ? packaged : staged;
+        }
+        if (!packaged.isFile()) {
+            return staged;
+        }
+
+        long packageUpdateTime = 0L;
+        try {
+            packageUpdateTime = getPackageManager()
+                    .getPackageInfo(getPackageName(), 0).lastUpdateTime;
+        } catch (Exception error) {
+            Log.w(TAG, "Could not read package update time for runtime freshness", error);
+        }
+        if (packageUpdateTime > 0L && staged.lastModified() < packageUpdateTime) {
+            Log.i(TAG, "Ignoring stale sandbox runtime after APK update: staged="
+                    + staged.getAbsolutePath() + " stagedMtime=" + staged.lastModified()
+                    + " packageUpdateTime=" + packageUpdateTime + " packaged="
+                    + packaged.getAbsolutePath());
+            return packaged;
+        }
+        return staged;
+    }
+
     private void applyManagedOptimizations() {
-        SharedPreferences preferences = SettingsActivity.prefs(this);
+        SharedPreferences preferences = gamePreferences();
         boolean armGpuFastPath = preferences.getBoolean(
-                SettingsActivity.K_ARM_GPU_FAST_PATH, false);
+                SettingsActivity.K_ARM_GPU_FAST_PATH, true);
         boolean coarseFragment2x2 = preferences.getBoolean(
                 SettingsActivity.K_COARSE_FRAGMENT_2X2, false);
         int anisotropyMode = preferences.contains(
@@ -4217,10 +6644,15 @@ public class MainActivity extends Activity {
                 SettingsActivity.K_ASYNC_PIPELINE, true);
         boolean adaptiveMobileGpu = preferences.getBoolean(
                 SettingsActivity.K_ADAPTIVE_MOBILE_GPU, true);
+        boolean fsrEnabled = requestedFsrEnabled(preferences);
+        boolean rcasEnabled = preferences.getBoolean(
+                SettingsActivity.K_RCAS_ENABLED, true);
         boolean audioSimd = preferences.getBoolean(
                 SettingsActivity.K_AUDIO_SIMD, true);
         boolean fastGuestMemory = preferences.getBoolean(
                 SettingsActivity.K_FAST_GUEST_MEMORY, false);
+        boolean guestSpinWaitEvent = preferences.getBoolean(
+                SettingsActivity.K_GUEST_SPIN_WAIT_EVENT, true);
         boolean relaxedFpFusion = preferences.getBoolean(
                 SettingsActivity.K_RELAXED_FP_FUSION, false);
         boolean androidPerformanceHint = preferences.getBoolean(
@@ -4234,7 +6666,7 @@ public class MainActivity extends Activity {
         if (jitTraceCompilation) {
             tieredJit = true;
         }
-        boolean[] requested = new boolean[19];
+        boolean[] requested = new boolean[22];
         requested[RuntimeBridge.MANAGED_OPTIMIZATION_ARM_GPU_FAST_PATH] = armGpuFastPath;
         requested[RuntimeBridge.MANAGED_OPTIMIZATION_COARSE_FRAGMENT_2X2] =
                 coarseFragment2x2;
@@ -4264,11 +6696,15 @@ public class MainActivity extends Activity {
         requested[RuntimeBridge.MANAGED_OPTIMIZATION_HOST_FLAGM] = hostFlagM;
         requested[RuntimeBridge.MANAGED_OPTIMIZATION_HOST_SVE2] = hostSve2;
         requested[RuntimeBridge.MANAGED_OPTIMIZATION_HOST_RCPC] = hostRcpc;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_GUEST_SPIN_WAIT_EVENT] =
+                guestSpinWaitEvent;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_FSR] = fsrEnabled;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_RCAS] = rcasEnabled;
 
-        // Establish a deterministic A/B baseline before enabling the requested
-        // set. Trace must be disabled before Tiered JIT; the final enable phase
-        // uses the opposite dependency order. Native metric resets happen as
-        // part of each state transition, so no prior run leaks into this one.
+
+
+
+
         int[] resetOrder = {
                 RuntimeBridge.MANAGED_OPTIMIZATION_JIT_TRACE_COMPILATION,
                 RuntimeBridge.MANAGED_OPTIMIZATION_TIERED_JIT,
@@ -4287,11 +6723,18 @@ public class MainActivity extends Activity {
                 RuntimeBridge.MANAGED_OPTIMIZATION_ANDROID_PERFORMANCE_HINT,
                 RuntimeBridge.MANAGED_OPTIMIZATION_HOST_SVE2,
                 RuntimeBridge.MANAGED_OPTIMIZATION_HOST_FLAGM,
-                RuntimeBridge.MANAGED_OPTIMIZATION_HOST_RCPC
+                RuntimeBridge.MANAGED_OPTIMIZATION_HOST_RCPC,
+                RuntimeBridge.MANAGED_OPTIMIZATION_GUEST_SPIN_WAIT_EVENT,
+                RuntimeBridge.MANAGED_OPTIMIZATION_RCAS,
+                RuntimeBridge.MANAGED_OPTIMIZATION_FSR
         };
-        int[] resetResults = new int[19];
-        int[] finalResults = new int[19];
+        int[] resetResults = new int[22];
+        int[] finalResults = new int[22];
         for (int option : resetOrder) {
+            if (ps5Runtime && (option == RuntimeBridge.MANAGED_OPTIMIZATION_FSR
+                    || option == RuntimeBridge.MANAGED_OPTIMIZATION_RCAS)) {
+                continue;
+            }
             int result = RuntimeBridge.setManagedOptimization(option, false);
             resetResults[option] = result;
             finalResults[option] = result;
@@ -4314,9 +6757,16 @@ public class MainActivity extends Activity {
                 RuntimeBridge.MANAGED_OPTIMIZATION_ANDROID_PERFORMANCE_HINT,
                 RuntimeBridge.MANAGED_OPTIMIZATION_HOST_FLAGM,
                 RuntimeBridge.MANAGED_OPTIMIZATION_HOST_RCPC,
-                RuntimeBridge.MANAGED_OPTIMIZATION_HOST_SVE2
+                RuntimeBridge.MANAGED_OPTIMIZATION_HOST_SVE2,
+                RuntimeBridge.MANAGED_OPTIMIZATION_GUEST_SPIN_WAIT_EVENT,
+                RuntimeBridge.MANAGED_OPTIMIZATION_FSR,
+                RuntimeBridge.MANAGED_OPTIMIZATION_RCAS
         };
         for (int option : enableOrder) {
+            if (ps5Runtime && (option == RuntimeBridge.MANAGED_OPTIMIZATION_FSR
+                    || option == RuntimeBridge.MANAGED_OPTIMIZATION_RCAS)) {
+                continue;
+            }
             if (requested[option]) {
                 finalResults[option] =
                         RuntimeBridge.setManagedOptimization(option, true);
@@ -4332,8 +6782,11 @@ public class MainActivity extends Activity {
                 + " vulkanDriverCalls=" + vulkanDriverCalls
                 + " asyncPipeline=" + asyncPipeline
                 + " adaptiveMobileGpu=" + adaptiveMobileGpu
+                + " fsrEnabled=" + fsrEnabled
+                + " rcasEnabled=" + rcasEnabled
                 + " audioSimd=" + audioSimd
                 + " fastGuestMemory=" + fastGuestMemory
+                + " guestSpinWaitEvent=" + guestSpinWaitEvent
                 + " relaxedFpFusion=" + relaxedFpFusion
                 + " androidPerformanceHint=" + androidPerformanceHint
                 + " hostFlagM=" + hostFlagM
@@ -4346,7 +6799,8 @@ public class MainActivity extends Activity {
                 + "/" + resetResults[12] + "/" + resetResults[13] + "/"
                 + resetResults[14] + "/" + resetResults[15] + "/"
                 + resetResults[16] + "/" + resetResults[17] + "/"
-                + resetResults[18]
+                + resetResults[18] + "/" + resetResults[19] + "/"
+                + resetResults[20] + "/" + resetResults[21]
                 + " finalResults=" + finalResults[1] + "/" + finalResults[2] + "/"
                 + finalResults[3] + "/" + finalResults[4] + "/" + finalResults[5] + "/"
                 + finalResults[6] + "/" + finalResults[7] + "/" + finalResults[8] + "/"
@@ -4354,7 +6808,8 @@ public class MainActivity extends Activity {
                 + "/" + finalResults[12] + "/" + finalResults[13] + "/"
                 + finalResults[14] + "/" + finalResults[15] + "/"
                 + finalResults[16] + "/" + finalResults[17] + "/"
-                + finalResults[18]);
+                + finalResults[18] + "/" + finalResults[19] + "/"
+                + finalResults[20] + "/" + finalResults[21]);
     }
 
     private void initializeRuntime() {
@@ -4365,12 +6820,31 @@ public class MainActivity extends Activity {
             }
             materializeJitPersistentJitCacheSetting(root);
             materializeGraphicsEffectSettings(root);
+            if (!ps5Runtime) {
+                materializeBundledGamePatches(this);
+            }
             materializeRenderResolutionSetting(root);
             writeNativeTranslatorPath(root);
             int result = ps5Runtime
                     ? RuntimeBridge.initializePs5(root.getAbsolutePath(), "local")
                     : RuntimeBridge.initialize(root.getAbsolutePath(), "local");
             append("Initialize result: " + result);
+            guestCpuBackendStatus = RuntimeBridge.guestCpuBackendStatus();
+            if (result == 0) {
+
+
+
+
+
+                persistGuestCpuBackendStatus("initialized");
+                if (runtimePauseController != null) {
+                    runtimePauseController.setRuntimeReady(true);
+                }
+            } else if (runtimePauseController != null) {
+                runtimePauseController.setRuntimeReady(false);
+            }
+            Log.i(TAG, "EXECUTOR_GUEST_CPU_BACKEND phase=initialized status="
+                    + guestCpuBackendStatus);
             if (ps5Runtime) {
                 attachSurfaceIfReady();
                 append("PS5 runtime status: " + RuntimeBridge.ps5Status());
@@ -4380,7 +6854,7 @@ public class MainActivity extends Activity {
             append("AArch64 JIT self-test skipped in the interactive app; use the headless native probe.");
             append("Vortek ashmem ring selftest result: " + RuntimeBridge.vortekRingSelfTest());
             append("Audio init result: " + RuntimeBridge.audioInit());
-            RuntimeBridge.setAudioEnabled(SettingsActivity.prefs(this).getBoolean(
+            RuntimeBridge.setAudioEnabled(gamePreferences().getBoolean(
                     SettingsActivity.K_AUDIO, true));
             setDebugHud("AUDIO init requested");
             if (shouldAutoRunAudioProbe()) {
@@ -4393,6 +6867,9 @@ public class MainActivity extends Activity {
         } catch (Throwable e) {
             append("Initialize failed: " + e.getMessage());
             runtimeLoaded = false;
+            if (runtimePauseController != null) {
+                runtimePauseController.setRuntimeReady(false);
+            }
         }
     }
 
@@ -4452,8 +6929,10 @@ public class MainActivity extends Activity {
                     new File(getFilesDir(), "lsx4-home"));
             materializeGraphicsEffectSettings(
                     new File(getFilesDir(), "lsx4-home"));
+            materializeBundledGamePatches(this);
             materializeRenderResolutionSetting(
                     new File(getFilesDir(), "lsx4-home"));
+            applySceneRenderScale();
             append("AArch64 JIT status before launch: " + RuntimeBridge.jitStatus());
             int result = RuntimeBridge.launchGameJit(path);
             append("AArch64 JIT launch result: " + result);
@@ -4471,7 +6950,7 @@ public class MainActivity extends Activity {
 
     private void materializeJitPersistentJitCacheSetting(File root) throws Exception {
         final boolean enabled = GameCacheManager.applyStoredSetting(
-                this, SettingsActivity.prefs(this));
+                this, gamePreferences());
         final File marker = GameCacheManager.enableMarker(this);
         append("Persistent compiled block cache: enabled=" + enabled +
                 " marker=" + marker.getAbsolutePath());
@@ -4483,7 +6962,7 @@ public class MainActivity extends Activity {
             return;
         }
 
-        final SharedPreferences preferences = SettingsActivity.prefs(this);
+        final SharedPreferences preferences = gamePreferences();
         final String[][] settings = {
                 {SettingsActivity.K_DISABLE_DYNAMIC_SHADOWS,
                         DISABLE_DYNAMIC_SHADOWS_MARKER, "dynamic shadows"},
@@ -4524,10 +7003,243 @@ public class MainActivity extends Activity {
         }
     }
 
+    static void materializeBundledGamePatches(Context context) {
+        File home = new File(context.getFilesDir(), "lsx4-home");
+        File nativeRoot = new File(home, "native");
+        File repository = new File(home, BUNDLED_PATCH_DIRECTORY);
+        if ((!nativeRoot.isDirectory() && !nativeRoot.mkdirs())
+                || (!repository.isDirectory() && !repository.mkdirs())) {
+            Log.e(TAG, "Bundled patch directory could not be created: " + repository);
+            return;
+        }
+
+        for (String name : BUNDLED_PATCH_FILES) {
+            try {
+                copyAssetAtomically(context,
+                        BUNDLED_PATCH_ASSET_DIRECTORY + "/" + name,
+                        new File(repository, name));
+            } catch (IOException error) {
+                Log.e(TAG, "Bundled patch asset could not be published: " + name, error);
+            }
+        }
+
+        SharedPreferences preferences = SettingsActivity.prefs(context);
+        List<GamePatchCatalog.Patch> patches = GamePatchCatalog.allPatches(context);
+        Set<String> activeGroups = new HashSet<>();
+        List<GamePatchCatalog.Patch> activePatches = new ArrayList<>();
+        SharedPreferences.Editor cleanup = null;
+        for (GamePatchCatalog.Patch patch : patches) {
+            if (!patch.hasMarker() || !patch.isChecked(preferences)) {
+                continue;
+            }
+
+            boolean groupConflict = !patch.group.isEmpty()
+                    && activeGroups.contains(patch.group);
+            GamePatchCatalog.Patch explicitConflict = null;
+            for (GamePatchCatalog.Patch active : activePatches) {
+                if (patch.conflictsWith(active)) {
+                    explicitConflict = active;
+                    break;
+                }
+            }
+            if (!groupConflict && explicitConflict == null) {
+                activePatches.add(patch);
+                if (!patch.group.isEmpty()) {
+                    activeGroups.add(patch.group);
+                }
+                continue;
+            }
+            if (cleanup == null) {
+                cleanup = preferences.edit();
+            }
+            cleanup.putBoolean(patch.preferenceKey, patch.inverted);
+            String reason = explicitConflict != null
+                    ? "explicit=" + explicitConflict.id
+                    : "group=" + patch.group;
+            Log.w(TAG, "Bundled patch preference conflict cleared: "
+                    + reason + " patch=" + patch.id);
+        }
+        if (cleanup != null && !cleanup.commit()) {
+            Log.e(TAG, "Bundled patch preference conflict cleanup failed");
+        }
+
+        for (GamePatchCatalog.Patch patch : patches) {
+            if (!patch.hasMarker()) {
+                continue;
+            }
+            boolean enabled = patch.isChecked(preferences);
+            File marker = new File(nativeRoot, patch.marker);
+            try {
+                if (enabled) {
+                    if (marker.exists() && !marker.isFile()) {
+                        throw new IOException("Marker is not a file: " + marker);
+                    }
+                    if (!marker.isFile()) {
+                        writeBytesAtomically(marker,
+                                "1\n".getBytes(StandardCharsets.UTF_8));
+                    }
+                } else if (marker.exists() && !marker.delete()) {
+                    throw new IOException("Cannot remove marker: " + marker);
+                }
+                Log.i(TAG, "EXECUTOR_BUNDLED_PATCH_SETTING id=" + patch.id
+                        + " enabled=" + enabled + " marker=" + marker);
+            } catch (IOException error) {
+                Log.e(TAG, "Bundled patch marker could not be materialized: "
+                        + patch.id, error);
+            }
+        }
+    }
+
+    private static void copyAssetAtomically(
+            Context context, String assetPath, File destination) throws IOException {
+        File parent = destination.getParentFile();
+        if (parent == null || (!parent.isDirectory() && !parent.mkdirs())) {
+            throw new IOException("Cannot create asset directory: " + parent);
+        }
+        File temporary = File.createTempFile(destination.getName(), ".lsx4-stage", parent);
+        try {
+            try (InputStream input = context.getAssets().open(assetPath);
+                 FileOutputStream output = new FileOutputStream(temporary, false)) {
+                byte[] buffer = new byte[64 * 1024];
+                int count;
+                while ((count = input.read(buffer)) >= 0) {
+                    output.write(buffer, 0, count);
+                }
+                output.getFD().sync();
+            }
+            if (sameFileContents(temporary, destination)) {
+                return;
+            }
+            moveAtomically(temporary, destination);
+        } finally {
+            if (temporary.exists() && !temporary.delete()) {
+                Log.w(TAG, "Bundled patch staging file could not be removed: " + temporary);
+            }
+        }
+    }
+
+    private static boolean sameFileContents(File first, File second) throws IOException {
+        if (!second.isFile() || first.length() != second.length()) {
+            return false;
+        }
+        try (FileInputStream left = new FileInputStream(first);
+             FileInputStream right = new FileInputStream(second)) {
+            byte[] leftBuffer = new byte[64 * 1024];
+            byte[] rightBuffer = new byte[64 * 1024];
+            while (true) {
+                int leftCount = left.read(leftBuffer);
+                int rightCount = right.read(rightBuffer);
+                if (leftCount != rightCount) {
+                    return false;
+                }
+                if (leftCount < 0) {
+                    return true;
+                }
+                for (int i = 0; i < leftCount; ++i) {
+                    if (leftBuffer[i] != rightBuffer[i]) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    private static void writeBytesAtomically(File destination, byte[] contents)
+            throws IOException {
+        File parent = destination.getParentFile();
+        if (parent == null || (!parent.isDirectory() && !parent.mkdirs())) {
+            throw new IOException("Cannot create marker directory: " + parent);
+        }
+        File temporary = File.createTempFile(destination.getName(), ".lsx4-stage", parent);
+        try {
+            try (FileOutputStream output = new FileOutputStream(temporary, false)) {
+                output.write(contents);
+                output.getFD().sync();
+            }
+            moveAtomically(temporary, destination);
+        } finally {
+            if (temporary.exists() && !temporary.delete()) {
+                Log.w(TAG, "Marker staging file could not be removed: " + temporary);
+            }
+        }
+    }
+
+    private static void moveAtomically(File source, File destination) throws IOException {
+        try {
+            Files.move(source.toPath(), destination.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException unsupported) {
+            Files.move(source.toPath(), destination.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+
+
+
+
+
+    private static final int SCENE_SCALE_REFERENCE_HEIGHT = 900;
+
+    private int sceneRenderScalePercentFor(int mode) {
+        if (mode == SettingsActivity.RES_NATIVE) {
+            return 0;
+        }
+        int height = SettingsActivity.resolutionHeight(mode);
+        if (height <= 0) {
+            return 0;
+        }
+        int percent = Math.round(height * 100f / SCENE_SCALE_REFERENCE_HEIGHT);
+        return Math.max(20, Math.min(100, percent));
+    }
+
+    static final String EXTRA_SCENE_RENDER_SCALE = "scene_render_scale";
+
+    private boolean requestedFsrEnabled(SharedPreferences preferences) {
+        Intent intent = getIntent();
+        if (!renderSettingsEdited && BuildConfig.DEBUG && intent != null &&
+                intent.hasExtra(EXTRA_PROFILE_FSR_ENABLED)) {
+            return intent.getBooleanExtra(EXTRA_PROFILE_FSR_ENABLED, true);
+        }
+        return preferences.getBoolean(SettingsActivity.K_FSR_ENABLED, true);
+    }
+
+    private void applySceneRenderScale() {
+        final boolean fsrEnabled = requestedFsrEnabled(gamePreferences());
+        int percent = sceneRenderScalePercentFor(renderResolutionMode);
+        Intent intent = getIntent();
+        if (intent != null && intent.hasExtra(EXTRA_SCENE_RENDER_SCALE)) {
+
+            percent = intent.getIntExtra(EXTRA_SCENE_RENDER_SCALE, percent);
+        }
+        try {
+            int applied = RuntimeBridge.setRenderScalePercent(percent);
+            if (applied < 0) {
+                append("Scene render scale unsupported by this runtime build");
+            } else {
+                append("Scene render scale: mode=" + renderResolutionMode
+                        + " fsr=" + fsrEnabled + " requested=" + percent
+                        + "% applied=" + applied + "%");
+            }
+        } catch (Throwable t) {
+            append("Scene render scale failed: " + t);
+        }
+    }
+
     private void materializeRenderResolutionSetting(File root) {
-        final int mode = renderResolutionMode;
-        final int width = SettingsActivity.resolutionWidth(mode);
-        final int height = SettingsActivity.resolutionHeight(mode);
+        final int sourceMode = renderResolutionMode;
+        final int sourceWidth = SettingsActivity.resolutionWidth(sourceMode);
+        final int sourceHeight = SettingsActivity.resolutionHeight(sourceMode);
+        final SharedPreferences renderPreferences = gamePreferences();
+        final boolean fsrEnabled = requestedFsrEnabled(renderPreferences);
+        final int selectedUpscalerMode = SettingsActivity.sanitizeUpscalerMode(
+                upscalerMode);
+        final int outputMode = fsrEnabled
+                ? SettingsActivity.sanitizeUpscaledOutputMode(
+                        sourceMode, upscaledOutputResolutionMode)
+                : sourceMode;
+        final int outputWidth = SettingsActivity.resolutionWidth(outputMode);
+        final int outputHeight = SettingsActivity.resolutionHeight(outputMode);
         final File config = new File(root, RENDER_RESOLUTION_CONFIG);
         final File parent = config.getParentFile();
         try {
@@ -4535,14 +7247,56 @@ public class MainActivity extends Activity {
                 append("Render resolution bridge unavailable: cannot create " + parent);
                 return;
             }
-            writeSmallFile(config, "version=1\nmode=" + mode + "\nwidth=" + width
-                    + "\nheight=" + height + "\n");
-            append("Render resolution bridge: mode=" + mode + " extent=" + width + "x"
-                    + height + " config=" + config.getAbsolutePath());
+            int sharpBilinearStrength = percentPreference(renderPreferences,
+                    SettingsActivity.K_SHARP_BILINEAR_STRENGTH, 100);
+            int bicubicKernel = Math.max(0, Math.min(2,
+                    renderPreferences.getInt(SettingsActivity.K_BICUBIC_KERNEL, 0)));
+            int fsr1RcasSharpness = percentPreference(renderPreferences,
+                    SettingsActivity.K_FSR1_RCAS_SHARPNESS, 75);
+            int sgsr1EdgeSharpness = percentPreference(renderPreferences,
+                    SettingsActivity.K_SGSR1_EDGE_SHARPNESS, 100);
+            int nisSharpness = percentPreference(renderPreferences,
+                    SettingsActivity.K_NIS_SHARPNESS, 50);
+            int sgsr2TemporalStability = percentPreference(renderPreferences,
+                    SettingsActivity.K_SGSR2_TEMPORAL_STABILITY, 70);
+            int armAsrSharpness = percentPreference(renderPreferences,
+                    SettingsActivity.K_ARM_ASR_SHARPNESS, 25);
+            writeSmallFile(config, "version=4\nfsr_enabled=" + (fsrEnabled ? 1 : 0)
+                    + "\nupscaler_mode=" + selectedUpscalerMode
+                    + "\nsource_mode=" + sourceMode
+                    + "\nsource_width=" + sourceWidth
+                    + "\nsource_height=" + sourceHeight
+                    + "\noutput_mode=" + outputMode
+                    + "\noutput_width=" + outputWidth
+                    + "\noutput_height=" + outputHeight
+                    + "\nsharp_bilinear_strength_milli=" + sharpBilinearStrength * 10
+                    + "\nbicubic_kernel=" + bicubicKernel
+                    + "\nfsr1_rcas_enabled="
+                    + (renderPreferences.getBoolean(SettingsActivity.K_RCAS_ENABLED, true) ? 1 : 0)
+                    + "\nfsr1_rcas_sharpness_milli=" + fsr1RcasSharpness * 10
+                    + "\nsgsr1_edge_sharpness_milli=" + (1000 + sgsr1EdgeSharpness * 10)
+                    + "\nnis_sharpness_milli=" + nisSharpness * 10
+                    + "\nsgsr2_temporal_stability_milli=" + sgsr2TemporalStability * 10
+                    + "\narm_asr_sharpening="
+                    + (renderPreferences.getBoolean(
+                            SettingsActivity.K_ARM_ASR_SHARPENING, true) ? 1 : 0)
+                    + "\narm_asr_sharpness_milli=" + armAsrSharpness * 10 + "\n");
+            append("Render resolution bridge: sourceMode=" + sourceMode
+                    + " source=" + sourceWidth + "x" + sourceHeight
+                    + " outputMode=" + outputMode
+                    + " output=" + outputWidth + "x" + outputHeight
+                    + " upscaler=" + selectedUpscalerMode
+                    + " enabled=" + fsrEnabled
+                    + " config=" + config.getAbsolutePath());
         } catch (Exception e) {
             append("Render resolution bridge unavailable; surface extent still applies: "
                     + e.getMessage());
         }
+    }
+
+    private static int percentPreference(
+            SharedPreferences preferences, String key, int defaultValue) {
+        return Math.max(0, Math.min(100, preferences.getInt(key, defaultValue)));
     }
 
     private void relocateImports() {
@@ -4667,7 +7421,7 @@ public class MainActivity extends Activity {
     }
 
     private void attachSurfaceIfReady() {
-        if (!runtimeLoaded || currentSurface == null || !currentSurface.isValid()) {
+        if (gameExitRequested || !runtimeLoaded || currentSurface == null || !currentSurface.isValid()) {
             return;
         }
 
@@ -4679,6 +7433,8 @@ public class MainActivity extends Activity {
                     ? "PS5 presenter surface attached"
                     : "Surface attached: " + RuntimeBridge.surfaceInfo());
             append("Attach surface result: " + result);
+            setRuntimePauseReason(RuntimePauseController.REASON_SURFACE_UNAVAILABLE,
+                    result != 0, "surface-attach");
         } catch (Exception e) {
             setSurfaceStatus("Surface attach failed: " + e.getMessage());
             append("Surface attach failed: " + e.getMessage());
@@ -4824,9 +7580,10 @@ public class MainActivity extends Activity {
     }
 
     private void latchCaughtGuestFrame() {
-        if (frameCaught) {
+        if (frameCaught || loadingState.status() == LoadingProgressState.Status.ERROR) {
             return;
         }
+        loadingState.frameReady();
         frameCaught = true;
         if (loadingProgressPanel != null) {
             loadingProgressPanel.setVisibility(View.GONE);
@@ -4969,6 +7726,8 @@ public class MainActivity extends Activity {
     }
 
     private void detachSurface() {
+        setRuntimePauseReason(RuntimePauseController.REASON_SURFACE_UNAVAILABLE, true,
+                "surface-detach");
         if (!runtimeLoaded) {
             setSurfaceStatus(getString(R.string.surface_not_attached));
             return;
@@ -5120,6 +7879,18 @@ public class MainActivity extends Activity {
         if (Looper.myLooper() != Looper.getMainLooper()) {
             runOnUiThread(() -> append(line));
             return;
+        }
+        if (!frameCaught) {
+
+
+            loadingState.event(line);
+            if (line != null && line.startsWith("Runtime status: {")) {
+                try {
+                    loadingState.runtimeState(new JSONObject(
+                            line.substring("Runtime status: ".length())).optString("state"));
+                } catch (Exception ignored) {   }
+            }
+            renderLoadingProgress();
         }
         if (output != null) {
             output.append("\n\n" + line);

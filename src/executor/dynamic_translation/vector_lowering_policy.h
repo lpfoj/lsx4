@@ -13,6 +13,7 @@ namespace Executor::Jit {
 enum class DirectVectorKernel : std::uint8_t {
     None,
     PackedBitTest,
+    PackedSignBitTest,
     DuplicateEvenDwords,
     DuplicateOddDwords,
     DuplicateLowQwords,
@@ -21,6 +22,7 @@ enum class DirectVectorKernel : std::uint8_t {
 struct DirectVectorPlan {
     DirectVectorKernel kernel{DirectVectorKernel::None};
     std::uint32_t width_bytes{};
+    std::uint8_t lane_bytes{};
 
     explicit operator bool() const noexcept {
         return kernel != DirectVectorKernel::None;

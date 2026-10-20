@@ -161,6 +161,11 @@ struct Lsx4Ps5GameProbeReport {
 
 extern "C" const char* executor_lsx4_ps5_runtime_abi();
 extern "C" const char* executor_lsx4_ps5_runtime_status();
+extern "C" int executor_lsx4_ps5_runtime_set_guest_cpu_backend(
+    int requested_backend, const char* adapter_path,
+    const char* runtime_root);
+extern "C" const char*
+executor_lsx4_ps5_runtime_guest_cpu_backend_status();
 extern "C" int executor_lsx4_ps5_runtime_attach_surface(
     void* native_window);
 extern "C" int executor_lsx4_ps5_runtime_detach_surface();

@@ -1,0 +1,244 @@
+{
+  "schema": "lsx4-bloodborne-expected-state-bootstrap-declaration/v1",
+  "device": {
+    "serial": "10AG263F1B001HM",
+    "adbTarget": "adb-10AG263F1B001HM-2MNzzP._adb-tls-connect._tcp",
+    "soc": "SM8850",
+    "board": "canoe"
+  },
+  "package": {
+    "name": "app.lsx4.android"
+  },
+  "process": {
+    "cmdline": "app.lsx4.android:game",
+    "foregroundComponent": "app.lsx4.android/.GameActivity"
+  },
+  "libraries": {
+    "executor": {
+      "basename": "liblsx4_executor_android.so"
+    },
+    "adapter": {
+      "basename": "liblsx4_fex_backend_v3.so"
+    },
+    "bridge": {
+      "basename": "liblsx4_fex2608_context_bridge.so"
+    },
+    "fexCore": {
+      "basename": "libFEXCore.so"
+    },
+    "vulkanIcd": {
+      "basename": "libvulkan_freedreno.so"
+    }
+  },
+  "backend": {
+    "required": {
+      "requested": "fex-experimental",
+      "effective": "fex-experimental",
+      "supported": true,
+      "fallbackReason": "none",
+      "selectionLocked": true
+    }
+  },
+  "vulkan": {
+    "required": {
+      "requested": "turnip",
+      "effective": "turnip",
+      "fallbackReason": "none",
+      "driverInfo": "Mesa 26.2.1 (git-da14d65e44)",
+      "driverVersion": "109060097",
+      "packageSource": "bundled",
+      "selectionLocked": true,
+      "mappingVerified": true
+    }
+  },
+  "patches": {
+    "requiredStates": {
+      "dynamic_shadows": false,
+      "motion_blur": false,
+      "bloodborne_0109_performance_patch": false,
+      "bloodborne_0109_disable_dof": true,
+      "bloodborne_0109_disable_ssao": true,
+      "bloodborne_0109_enable_ssr": false,
+      "bloodborne_0109_text_scale_50": false,
+      "bloodborne_0109_fmod_crash_fix": false,
+      "bloodborne_0109_model_lod_2": false,
+      "bloodborne_0109_model_lod_1": false,
+      "bloodborne_0109_model_lod_minus_2": false,
+      "bloodborne_0109_increased_graphics_heap": false,
+      "bloodborne_0109_intel_sfx_workaround": false,
+      "bloodborne_0109_intel_black_tonemap_fix": false,
+      "bloodborne_0109_disable_http_requests": false,
+      "bloodborne_0109_ds1_like_physics": false,
+      "bloodborne_0109_lower_object_corpse_physics": false,
+      "bloodborne_0109_30_fps_plus_plus": false,
+      "bloodborne_0109_60_fps_no_deltatime": false,
+      "bloodborne_0109_60_fps_plus_plus": true,
+      "bloodborne_0109_90_fps_plus_plus": false
+    }
+  },
+  "markers": {
+    "allowlist": [
+      "diag-compute-pipeline-create.diag-off",
+      "diag-fex-proof-metrics-dynamic",
+      "diag-fex-proof-metrics-static",
+      "native/diag-audio-raw-preconvert-f32.pre-ajmfix-20260824.wav",
+      "native/diag-audio-raw-preconvert-f32.wav",
+      "native/lsx4-bb-0109-30-fps-plus-plus",
+      "native/lsx4-bb-0109-60-fps-no-deltatime",
+      "native/lsx4-bb-0109-60-fps-plus-plus",
+      "native/lsx4-bb-0109-90-fps-plus-plus",
+      "native/lsx4-bb-0109-90-fps-plus-plus.stale-off-20260824",
+      "native/lsx4-bb-0109-disable-http-requests",
+      "native/lsx4-bb-0109-ds1-like-physics",
+      "native/lsx4-bb-0109-enable-ssr",
+      "native/lsx4-bb-0109-fmod-crash-fix",
+      "native/lsx4-bb-0109-increased-graphics-heap",
+      "native/lsx4-bb-0109-intel-black-tonemap-fix",
+      "native/lsx4-bb-0109-intel-sfx-workaround",
+      "native/lsx4-bb-0109-lower-object-corpse-physics",
+      "native/lsx4-bb-0109-model-lod-1",
+      "native/lsx4-bb-0109-model-lod-2",
+      "native/lsx4-bb-0109-model-lod-minus-2",
+      "native/lsx4-bb-0109-performance-patch",
+      "native/lsx4-bb-0109-text-scale-50",
+      "native/run-disable-dof",
+      "native/run-disable-ssao",
+      "run-ab-present-thread-graphics-affinity.ab-off",
+      "run-ab-turnip-imgui-persistent-map",
+      "run-bisect-disable-jit-preserve-all-helper-abi",
+      "run-bisect-disable-jit-tiered-guard-direct-chain",
+      "run-bisect-enable-jit-fixed-xmm-dirty-observer",
+      "run-bisect-enable-jit-tier1-equal-footprint.codex-disabled-20260811",
+      "run-diagnostic-guest-invalidation-profile",
+      "run-diagnostic-present-stage-profile.diag-off",
+      "run-diagnostic-submit-mutex-profile.diag-off",
+      "run-disable-anti-aliasing",
+      "run-disable-anti-aliasing.ab-enabled",
+      "run-disable-anti-aliasing.diag-off",
+      "run-disable-chromatic-aberration",
+      "run-disable-chromatic-aberration.ab-enabled",
+      "run-disable-chromatic-aberration.diag-off",
+      "run-disable-dof",
+      "run-disable-dof.ab-enabled",
+      "run-disable-dof.diag-off",
+      "run-disable-dynamic-shadows",
+      "run-disable-dynamic-shadows.ab-enabled",
+      "run-disable-dynamic-shadows.diag-off",
+      "run-disable-motion-blur",
+      "run-disable-motion-blur.ab-enabled",
+      "run-disable-motion-blur.diag-off",
+      "run-disable-ssao",
+      "run-disable-ssao.ab-enabled",
+      "run-disable-ssao.diag-off",
+      "run-enable-bounded-guest-invalidation-drain",
+      "run-enable-bounded-guest-invalidation-drain.codex-r18-ab-20260815",
+      "run-enable-fex-buffer-capture-ack",
+      "run-enable-fex-buffer-capture-ack.codex-r18-ab-20260815",
+      "run-enable-fex-deferred-write-epoch",
+      "run-enable-fex-multiblock",
+      "run-enable-fex-relaxed-memcpyset-tso-ab",
+      "run-enable-fex-relaxed-vector-tso-ab",
+      "run-enable-hle-clean-buffer-fastpath",
+      "run-enable-exact-demand-readback-window.ab-off",
+      "run-jit-persistent-jit-cache",
+      "run-jit-persistent-jit-cache.ab-enabled",
+      "run-jit-persistent-jit-cache.diag-off",
+      "run-jit-persistent-jit-cache.layout-probe-backup",
+      "run-live-quiet",
+      "run-profile-guest-invalidation-overlap",
+      "run-readback-contract-trace.codex-off-20260820",
+      "run-readback-contract-trace.diag-off",
+      "run-render-wave-trace.strict-ab-off",
+      "run-use-vivo-moderate-cpu-floor"
+    ],
+    "requiredPresent": [
+      "native/lsx4-bb-0109-60-fps-plus-plus",
+      "run-ab-turnip-imgui-persistent-map",
+      "run-bisect-disable-jit-preserve-all-helper-abi",
+      "run-bisect-disable-jit-tiered-guard-direct-chain",
+      "run-bisect-enable-jit-fixed-xmm-dirty-observer",
+      "run-disable-anti-aliasing",
+      "run-disable-chromatic-aberration",
+      "run-disable-dof",
+      "run-disable-dynamic-shadows",
+      "run-disable-motion-blur",
+      "run-disable-ssao",
+      "run-jit-persistent-jit-cache",
+      "run-live-quiet",
+      "run-use-vivo-moderate-cpu-floor"
+    ],
+    "forbidden": [
+      "diag-fex-proof-metrics-dynamic",
+      "diag-fex-proof-metrics-static",
+      "run-enable-bounded-guest-invalidation-drain",
+      "run-enable-fex-buffer-capture-ack",
+      "run-enable-fex-deferred-write-epoch",
+      "run-enable-fex-multiblock",
+      "run-enable-fex-relaxed-memcpyset-tso-ab",
+      "run-enable-fex-relaxed-vector-tso-ab",
+      "run-enable-hle-clean-buffer-fastpath"
+    ]
+  },
+  "inventories": {
+    "route": {
+      "source": "host",
+      "roots": [
+        "tools/bloodborne-proof/routes/hunters_dream_forward_swipe_14s.json"
+      ]
+    },
+    "input": {
+      "source": "host",
+      "roots": [
+        "tools/bloodborne-proof/inputs/hunters_dream_forward_swipe_14s.json"
+      ]
+    },
+    "save": {
+      "source": "app",
+      "roots": [
+        "files/lsx4-home/native/savedata"
+      ]
+    },
+    "pipelineCache": {
+      "source": "app",
+      "roots": [
+        "files/lsx4-home/native/cache"
+      ]
+    },
+    "fexCache": {
+      "source": "app",
+      "roots": [
+        "files/lsx4-home/cache"
+      ]
+    }
+  },
+  "surface": {
+    "requiredComponent": "SurfaceView[app.lsx4.android/app.lsx4.android.GameActivity](BLAST)",
+    "displayId": "0",
+    "identityRegex": "layerId=(?P<layerId>\\d+).*generation=(?P<generation>\\d+).*displayId=(?P<displayId>\\d+)"
+  },
+  "display": {
+    "extractRegex": "mode=(?P<mode>\\d+x\\d+) refresh=(?P<refreshHz>[0-9.]+)",
+    "requiredState": {
+      "mode": "3168x1440",
+      "refreshHz": "60.0"
+    }
+  },
+  "environment": {
+    "requiredRegexes": {
+      "thermal": "Temperature",
+      "battery": "level:",
+      "power": "mWakefulness=Awake",
+      "cpuFreq": "policy0",
+      "gpuFreq": "kgsl"
+    }
+  },
+  "collection": {
+    "backendStatusPath": "files/guest-cpu-backend-status.json",
+    "vulkanStatusPath": "files/vulkan-driver-status.json",
+    "preferencesPath": "shared_prefs/lsx4_settings.xml",
+    "markerRoots": {
+      "runtime": "files/lsx4-home",
+      "patch": "files/lsx4-home/native"
+    }
+  }
+}

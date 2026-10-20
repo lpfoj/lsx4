@@ -9,6 +9,7 @@
 namespace Lsx4::Translation {
 
 [[nodiscard]] bool IsExecutableGuestAddress(std::uint64_t address) noexcept;
+[[nodiscard]] bool IsWritableGuestAddress(std::uint64_t address) noexcept;
 [[nodiscard]] bool IsGuestAddressRange(std::uint64_t address,
                                        std::size_t byte_count) noexcept;
 

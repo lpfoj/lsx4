@@ -351,4 +351,4 @@ bool TryCompileGen5Compute(
     return !spirv.empty();
 }
 
-} // namespace Lsx4::Ps5Desktop
+}
