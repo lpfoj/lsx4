@@ -1,3 +1,5 @@
+<p align="center"><a href="https://lsx45.app"><strong>Official website — lsx45.app</strong></a></p>
+
 <p align="center">
   <img src="assets/lsx4-banner.png" width="640" alt="LSX4, open-source PlayStation 4 emulator for Android">
 </p>
@@ -328,9 +330,22 @@ These games reach gameplay and can be played, but performance still needs work o
   </tr>
 </table>
 
-#### In game
+#### PS5 Playable
 
-These games reach gameplay but are not yet classified as playable.
+Two PS5 games with confirmed gameplay on Vivo. These screenshots come from the tester’s October 21 recordings.
+
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/dreaming-sarah-ps5-vivo.png" alt="Dreaming Sarah gameplay in LSX4 on Vivo"><br><sub><b>Dreaming Sarah</b> · PS5 · Vivo</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/void-terrarium-plus-plus-ps5-vivo.png" alt="Void Terrarium++ gameplay in LSX4 on Vivo"><br><sub><b>void tRrLM();++ //Void Terrarium++</b> · PS5 · Vivo</sub></td>
+  </tr>
+</table>
+
+[PS5 screenshot provenance](assets/screenshots/PS5_VIVO_SOURCES.md).
+
+#### PS5 Low FPS
+
+These PS5 games reach gameplay on Vivo, but low frame rates still need improvement.
 
 <table>
   <tr>
