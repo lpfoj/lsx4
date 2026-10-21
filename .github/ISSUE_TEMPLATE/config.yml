@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Contribution guide
+    url: https://github.com/lpfoj/lsx4/blob/main/CONTRIBUTING.md
+    about: Fork and PR workflow, AI-assisted changes and game regression safety.

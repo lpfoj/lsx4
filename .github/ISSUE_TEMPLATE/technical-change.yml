@@ -1,0 +1,20 @@
+name: Bug or technical proposal
+description: Report an app/runtime problem or discuss a substantial change before coding.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and reproduction
+      description: Expected and observed behavior, current build and concrete steps. For optimization proposals include the measured bottleneck.
+    validations:
+      required: true
+  - type: textarea
+    id: approach
+    attributes:
+      label: Proposed approach and affected boundaries
+      description: Separate facts from hypotheses. State PS4/PS5 scope, ownership/lifetime risks, fallback and relevant code paths.
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation plan or existing evidence
+      description: Focused checks, affected gameplay controls and matched performance anchors. Do not attach copyrighted game content or private diagnostics.

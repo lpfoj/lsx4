@@ -1,5 +1,13 @@
 # LSX4 repository instructions
 
+## Contributions and AI-assisted changes
+
+Read `CONTRIBUTING.md` before preparing a public change. Use
+`docs/GAME_REGRESSION_SAFETY.md` to identify sensitive ownership boundaries and the
+appropriate evidence. These guides supplement the mandatory contracts below; they
+do not relax their gates. Keep private branches, credentials, personal diagnostics
+and game content out of public commits. Model output is unreviewed until verified.
+
 ## Playable and performance regression contract
 
 Before changing Android CPU profiles, FEX/JIT geometry, HLE/AIO lifecycle, guest-worker
