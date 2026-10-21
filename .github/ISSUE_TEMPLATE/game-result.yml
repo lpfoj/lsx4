@@ -1,0 +1,42 @@
+name: Game result or regression
+description: Report a real gameplay result, a broken game or a performance regression.
+title: "[Game] "
+body:
+  - type: markdown
+    attributes:
+      value: "Share your own test. Do not upload games, firmware, personal saves, serial numbers or private logs. Menu-only results are not Playable."
+  - type: input
+    id: game
+    attributes:
+      label: Game title and title ID
+      placeholder: Title, CUSA... or PPSA...
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - PS4
+        - PS5
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Build and device
+      description: App version or commit, phone model, Android, GPU/driver, backend, render resolution, settings and patches. No unique device identifiers.
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Tested scene, actions and observed result
+      description: Explain how to reproduce it, what should happen and what actually happens. Separate sustained gameplay FPS from menu/loading FPS.
+    validations:
+      required: true
+  - type: textarea
+    id: baseline
+    attributes:
+      label: Regression baseline and evidence
+      description: Last known good build, first bad build and matched-scene comparison if available. Optional redacted screenshots or public video links.

@@ -19,6 +19,12 @@ LSX4 does not include games, firmware, or other copyrighted system content.
 
 Development also makes use of current-generation large language models (LLMs).
 
+## Contributing
+
+Contributions are open: [report a bug or test result](https://github.com/lpfoj/lsx4/issues/new/choose), or fork the repository and send a pull request to `main`. You do not need write access to this repository. Contributor branches belong in your fork; they do not have to become permanent branches here.
+
+Start with [CONTRIBUTING.md](CONTRIBUTING.md). It covers the PR workflow, AI-assisted changes, review expectations and the [game regression checklist](docs/GAME_REGRESSION_SAFETY.md). Small fixes and documentation improvements can go straight to a PR. Discuss large architectural changes in an issue first.
+
 ## Download
 
 <p align="center">
@@ -468,10 +474,6 @@ This list includes only games that have been tested. The broader set of supporte
 | Minit | ✅ | |
 
 </details>
-
-## Contributing
-
-Contributions are welcome. Bug reports, compatibility results, performance traces, and focused pull requests are especially useful. Please open an issue before starting a substantial architectural change.
 
 ## Repository layout
 
