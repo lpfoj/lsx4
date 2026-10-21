@@ -25,6 +25,14 @@ Contributions are open: [report a bug or test result](https://github.com/lpfoj/l
 
 Start with [CONTRIBUTING.md](CONTRIBUTING.md). It covers the PR workflow, AI-assisted changes, review expectations and the [game regression checklist](docs/GAME_REGRESSION_SAFETY.md). Small fixes and documentation improvements can go straight to a PR. Discuss large architectural changes in an issue first.
 
+### Share a game test
+
+Use the [game report form](https://lsx45.app/playable/#submit-report) to share a Playable, Low FPS, In game or Not playable result. No GitHub account is needed. Add the game, device model, LSX4 version and a short note about actual gameplay. You can attach a local screenshot (PNG, JPEG or WebP, up to 8 MB), a local screencast (MP4 or WebM, up to 100 MB), or a public YouTube link. Review the fields and files before publishing: they will be public.
+
+In app v0.1.4, open **Library view > List** and hold a game without moving your finger. Release after 4 seconds to mark it Not playable (Unsupported), or after 5 seconds for Playable (Supported). These marks are local, not uploaded. Publish the short report using the linked form. A menu, title screen or single frame is not enough evidence of playable gameplay.
+
+Submitted tests appear in [Community reports](https://lsx45.app/playable/#community-reports), separately from the curated compatibility list. They do not automatically increase the Playable total. Keep the private removal key to remove your report and attachments later. Do not upload game files, saves, logs or private information.
+
 ## Download
 
 <p align="center">
