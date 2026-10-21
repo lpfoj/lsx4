@@ -1,4 +1,4 @@
-<p align="center"><a href="https://lsx45.app"><strong>Official website — lsx45.app</strong></a></p>
+<p align="center"><a href="https://lsx45.app/">lsx45.app</a></p>
 
 <p align="center">
   <img src="assets/lsx4-banner.png" width="640" alt="LSX4, open-source PlayStation 4 emulator for Android">
