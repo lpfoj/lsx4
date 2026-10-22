@@ -1,0 +1,168 @@
+LSX4 for iOS — JIT 128.9294
+Installation with Sideloadly
+
+DOWNLOAD
+https://github.com/lpfoj/lsx4/releases/tag/ios-jit-128.9294
+Get the English ZIP for the IPA and these instructions together, or download
+LSX4-JIT-128.9294.ipa separately. Install this update over the existing app
+with the same Apple Account and bundle ID. Do not uninstall to update.
+
+REQUIREMENTS
+An iPhone running iOS 26 or later, Wi-Fi, your own Apple Account, and a Windows
+PC or Mac for the initial installation and creation of your phone's pairing
+file. Games and pairing files are not included.
+
+1. INSTALL THE IPA
+Get Sideloadly from https://sideloadly.io/ . On Windows, install the Apple
+components required by Sideloadly using the links on its official site.
+Connect your unlocked iPhone by USB and tap Trust when asked.
+Drop LSX4-JIT-128.9294.ipa into Sideloadly, select your iPhone, enter your own
+Apple ID, choose Apple ID Sideload, and press Start. Complete verification
+if prompted.
+
+Leave Remove App Extensions OFF. Keep LSX4JITHelper: it enables JIT on the
+phone. Do not remove it to save an App ID.
+If iOS asks, enable Settings > Privacy & Security > Developer Mode, restart
+and confirm. Trust the developer profile in Settings > General > VPN &
+Device Management if required.
+
+2. CONNECT LOCALDEVVPN
+Install https://apps.apple.com/app/id6755608044 on the iPhone.
+Open LocalDevVPN, connect, and allow the VPN configuration when asked.
+Keep Wi-Fi and LocalDevVPN enabled when starting a game.
+
+3. IMPORT YOUR IPHONE'S PAIRING FILE — ONCE
+Get iloader from https://github.com/nab138/iloader/releases/latest .
+With the iPhone connected, select it in iloader > Manage Pairing File > Export.
+Put the exported pairingFile.plist in Files on the iPhone, for example through
+iCloud Drive or Apple's file sharing.
+Open LSX4 > Settings (gear icon) > Set up JIT > Choose pairing file.
+Import your phone's file, then use Check connection. Initial preparation can
+take longer. This update accepts both remote-pairing and classic certificate
+pairing plist formats. Working records are preserved across an update.
+Use your own phone's file; do not send it back to the IPA supplier.
+
+If necessary, dismiss the setup sheet with Done and select English in Settings.
+Importing games does not require enabling JIT first; playing them does.
+
+LIBRARY AND APPEARANCE
+List is the default on a new installation. Your selected view is remembered.
+The view button at the top switches between seven library layouts. Tap the
+magnifying-glass button to open search; close it to recover the list height.
+Device, Tested compatible games, Themes and Render cache are cards at the
+start of the same scrolling library, like games, in every view.
+Use Themes to preview and apply Azure, Classic, Sakura or Autumn. Cards use
+translucent frosted backgrounds; text and covers stay sharp. iOS Reduce
+Transparency is respected. Settings > Audio controls menu music and effects.
+Menu sound and background animations stop when a game starts.
+Settings > Graphics changes game/output resolution for the next launch.
+The JIT preparation message stays centered within the safe screen area,
+including landscape mode.
+In List view, tap a game to play. In the other views, select a cover and
+tap Play at the bottom. Use search or the Sort button to find a title.
+
+4. ADD A GAME
+Use your own complete PS4 base-game files. There are two import choices:
+
+Option A — PKG
+Open LSX4 > + (Import game) > Choose PKG file… and select the package in Files.
+LSX4 extracts it on this iPhone, checks eboot.bin and param.sfo, then adds the
+game to the library. Keep LSX4 open until completion. Progress and Cancel
+are available. The original PKG is left unchanged.
+
+Option B — already-extracted folder
+Open LSX4 > + (Import game) > Choose extracted game folder… . Select the folder
+that directly contains eboot.bin and the sce_sys folder with param.sfo.
+Do not select eboot.bin alone or a parent containing several games.
+The selected folder can have any name: LSX4 reads TITLE_ID and TITLE from
+param.sfo and installs its own correctly named copy. The source is preserved.
+
+The installed layout created by either importer is:
+  LSX4/Games/CUSA12345/eboot.bin
+  LSX4/Games/CUSA12345/sce_sys/param.sfo
+
+Manual copy also works after copying has fully finished:
+  Files > On My iPhone > LSX4 > CUSA12345 > eboot.bin
+or:
+  Files > On My iPhone > LSX4 > Games > CUSA12345 > eboot.bin
+Both require the complete game tree, including sce_sys/param.sfo.
+Games is OPTIONAL for a manual copy. Do not place loose game files directly
+at the LSX4 root. Use the real TITLE_ID from param.sfo as the CUSA folder name,
+or use Option B to avoid renaming it yourself.
+
+Reopen LSX4 or pull down the library to refresh. Games can appear even when
+absent from the built-in catalog. There is one library with search; the old
+Android playable and On iPhone filter tabs have been removed.
+Select the game to launch. JIT starts automatically through the phone's helper.
+
+Existing game folders are never overwritten by either importer. Cancelled or
+failed imports do not publish a partial game or change installed games/saves.
+Keep free storage for the extracted game in addition to the source package.
+Updates, DLC, split/incomplete PKGs and PS5 packages are not supported by
+this importer. Successful import confirms the file layout, not playability.
+Complete extracted folders with an update already merged into the base game
+are accepted. The importer does not apply standalone update PKGs.
+Game compatibility and the included launch profiles remain title-specific.
+
+IF A GAME DOES NOT APPEAR
+Clear the search field. Prefer Option B above for an extracted folder.
+Check that eboot.bin and sce_sys/param.sfo are inside the same game folder,
+not one extra wrapper folder deeper. Finish copying before refreshing.
+Do not rename an update/DLC package to pretend it is a base game.
+A missing compatibility report or title-specific launch profile does not
+block a PS4 game. Bundled profiles take priority; other valid CUSA games use
+the general FEX JIT configuration. This allows an attempt, not a playability
+guarantee. Report the CUSA ID and the actual startup error if a game fails.
+
+AFTER THE FIRST SETUP
+Connect LocalDevVPN and Wi-Fi > LSX4 > game. A computer is not needed to
+enable JIT for each session. SideStore and Sideloadly's Enable JIT menu are
+not required for this method. Re-export pairing if it expires or stops working.
+
+SIGNING AND MEMORY
+Free Apple Account signing lasts 7 days. Sideloadly Auto Refresh can renew it
+while your computer is available and the phone is reachable over USB or
+configured Wi-Fi sync. Keep the same Apple Account and bundle ID for updates.
+
+The IPA requests these development entitlements:
+  get-task-allow
+  com.apple.developer.kernel.extended-virtual-addressing
+  com.apple.developer.kernel.increased-memory-limit
+The memory requests are also in Support/Required-entitlements.plist.
+Recipient signing/provisioning must permit them for comparable heavy-game
+behavior. A free Apple Account alone does not guarantee the memory rights.
+Sideloadly's custom-entitlements feature requires Apple Developer Program
+membership and its Patreon feature. Installing successfully does not prove
+all requested entitlements survived re-signing.
+
+TROUBLESHOOTING JIT
+Missing helper: reinstall with Remove App Extensions OFF.
+Wrong signature: use Apple ID Sideload and development signing. Distribution
+or enterprise signing does not provide the required debugging permission.
+Connection failure: unlock the phone, check Wi-Fi and LocalDevVPN, and retry.
+Pairing failure: export a fresh file for this phone and import it in Settings.
+
+VERIFICATION
+See Support/PKG-VALIDATION.json and Support/BUILD-INFO.json for the exact
+checks performed. Real Downwell and Sonic Mania PKGs and extracted folders
+were tested in 128.9292 on a physical iPhone in isolated test storage, preserving the
+installed library. Extracted files matched known working copies by SHA-256.
+The new UI, all seven layouts, four themes, both import pickers, existing-game
+protection, local JIT startup and menu audio were checked again in 128.9294.
+The existing installed library remains discoverable. This update does
+not change the native CPU, renderer, bundled game profiles or PKG extraction
+core. The app launcher now supports games without a bundled profile, and
+the file/folder buttons use separate standard system importers.
+A cold game launch was verified with all bundled title profiles absent and
+the generated profile cache empty. Repeated folder-picker cancellation
+was also checked. Physical checks used iOS 26.6.1; other iOS versions were
+not physically tested.
+Different recipient Apple Account re-signing is not independently verified.
+This release is distributed for sideloading. It is not an App Store build.
+
+REFERENCES
+Sideloadly: https://sideloadly.io/
+Developer Mode, signing and renewal: https://sideloadly.io/faq.html
+Custom entitlements: https://sideloadly.io/changelog.html
+Pairing export: https://github.com/nab138/iloader
+Built-in JIT: https://github.com/StikDebug/StikJIT/blob/main/INTEGRATION.md
