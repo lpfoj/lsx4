@@ -94,10 +94,43 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
 ### Video demonstrations
 
-<p align="center">
-  <a href="https://www.youtube.com/watch?v=CQpTIQlKarM"><img src="https://img.youtube.com/vi/CQpTIQlKarM/hqdefault.jpg" width="49%" alt="Watch LSX4 video demonstration 1 on YouTube"></a>
-  <a href="https://www.youtube.com/watch?v=4UmC0u8DJmY"><img src="https://img.youtube.com/vi/4UmC0u8DJmY/hqdefault.jpg" width="49%" alt="Watch LSX4 video demonstration 2 on YouTube"></a>
-</p>
+Click a preview or title to watch on YouTube.
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <a href="https://www.youtube.com/watch?v=jRe0-FwPfY0"><img src="https://img.youtube.com/vi/jRe0-FwPfY0/hqdefault.jpg" width="480" alt="45 playable PS4 games on Android"></a><br>
+      <a href="https://www.youtube.com/watch?v=jRe0-FwPfY0"><b>45 playable PS4 games</b></a><br>
+      <sub>Android</sub>
+    </td>
+    <td align="center" width="50%">
+      <a href="https://www.youtube.com/watch?v=Mu7bgQQiUdA"><img src="https://img.youtube.com/vi/Mu7bgQQiUdA/hqdefault.jpg" width="480" alt="40 playable PS4 games on iOS"></a><br>
+      <a href="https://www.youtube.com/watch?v=Mu7bgQQiUdA"><b>40 playable PS4 games</b></a><br>
+      <sub>iOS</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <a href="https://www.youtube.com/watch?v=oNJ_ItPtlbI"><img src="https://img.youtube.com/vi/oNJ_ItPtlbI/hqdefault.jpg" width="480" alt="The Last of Us Remastered on Android, PS4 emulation"></a><br>
+      <a href="https://www.youtube.com/watch?v=oNJ_ItPtlbI"><b>The Last of Us Remastered</b></a><br>
+      <sub>Android · PS4</sub>
+    </td>
+    <td align="center" width="50%">
+      <a href="https://www.youtube.com/watch?v=20qtM8hfL0I"><img src="https://img.youtube.com/vi/20qtM8hfL0I/hqdefault.jpg" width="480" alt="The Last of Us Remastered on iOS, PS4 emulation"></a><br>
+      <a href="https://www.youtube.com/watch?v=20qtM8hfL0I"><b>The Last of Us Remastered</b></a><br>
+      <sub>iOS · PS4</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2">
+      <a href="https://www.youtube.com/watch?v=K7xqjYGLmSU"><img src="https://img.youtube.com/vi/K7xqjYGLmSU/hqdefault.jpg" width="480" alt="3 playable PS5 games on Android"></a><br>
+      <a href="https://www.youtube.com/watch?v=K7xqjYGLmSU"><b>3 playable PS5 games</b></a><br>
+      <sub>Android</sub>
+    </td>
+  </tr>
+</table>
+
+Earlier demonstrations: [Video 1](https://www.youtube.com/watch?v=CQpTIQlKarM) · [Video 2](https://www.youtube.com/watch?v=4UmC0u8DJmY).
 
 ### Device previews
 
