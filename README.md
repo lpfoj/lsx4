@@ -154,6 +154,12 @@ Earlier demonstrations: [Video 1](https://www.youtube.com/watch?v=CQpTIQlKarM) �
     <td align="center" width="50%"><img src="assets/screenshots/wizordum-poco.png" alt="Wizordum gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Wizordum</b> · Poco Snapdragon 8 Gen 3</sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/hollow-knight-poco.png" alt="Hollow Knight gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Hollow Knight</b> · Poco Snapdragon 8 Gen 3</sub></td>
   </tr>
+</table>
+
+<details>
+<summary>Show remaining gameplay screenshots</summary>
+
+<table>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/mortisomem-poco.png" alt="Mortisomem gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Mortisomem</b> · Poco Snapdragon 8 Gen 3</sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/cat-from-hell-2-poco.png" alt="Cat From Hell 2 gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Cat From Hell 2</b> · Poco Snapdragon 8 Gen 3</sub></td>
@@ -202,12 +208,6 @@ Earlier demonstrations: [Video 1](https://www.youtube.com/watch?v=CQpTIQlKarM) �
     <td align="center" width="50%"><img src="assets/screenshots/cant-drive-this.png" alt="Can&#39;t Drive This gameplay running in LSX4 on Vivo"><br><sub><b>Can&#39;t Drive This</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/a-short-hike.jpg" alt="A Short Hike running in LSX4 on Vivo"><br><sub><b>A Short Hike</b></sub></td>
   </tr>
-</table>
-
-<details>
-<summary>Show more gameplay screenshots</summary>
-
-<table>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/old-mans-journey.png" alt="Old Man's Journey running in LSX4 on Vivo"><br><sub><b>Old Man's Journey</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/nubla.jpg" alt="Nubla running in LSX4 on Vivo"><br><sub><b>Nubla</b></sub></td>
