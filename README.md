@@ -1,7 +1,7 @@
 <p align="center"><a href="https://lsx45.app/">lsx45.app</a></p>
 
 <p align="center">
-  <img src="assets/lsx4-banner.png" width="640" alt="LSX4, open-source PlayStation 4 emulator for Android">
+  <img src="assets/lsx4-banner.png" width="640" alt="LSX4, open-source PlayStation 4/5 emulator for Android and iOS">
 </p>
 
 <div align="center">
@@ -13,11 +13,19 @@
 
 # LSX4
 
-LSX4 is an open-source PlayStation 4 emulator application for Android.
+LSX4 is an open-source PlayStation 4/5 emulator for Android and iOS. The current iOS release supports PS4 gameplay; PS5 gameplay is currently available on Android.
 
 LSX4 does not include games, firmware, or other copyrighted system content.
 
 Development also makes use of current-generation large language models (LLMs).
+
+## Download
+
+<p align="center">
+  <a href="https://play.google.com/store/apps/details?id=com.jetcalls.lsx4"><img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" height="80" alt="Get it on Google Play"></a>
+</p>
+
+**iOS (PS4, iOS 26+):** [Latest release](https://github.com/lpfoj/lsx4/releases/tag/ios-jit-128.9294) · [Download IPA](https://github.com/lpfoj/lsx4/releases/download/ios-jit-128.9294/LSX4-JIT-128.9294.ipa) · [IPA + English installation instructions](https://github.com/lpfoj/lsx4/releases/download/ios-jit-128.9294/LSX4-iOS-JIT-128.9294-English.zip). Install with Sideloadly and follow the included on-device JIT setup instructions.
 
 ## Contributing
 
@@ -32,12 +40,6 @@ Use the [game report form](https://lsx45.app/playable/#submit-report) to share a
 In app v0.1.4, open **Library view > List** and hold a game without moving your finger. Release after 4 seconds to mark it Not playable (Unsupported), or after 5 seconds for Playable (Supported). These marks are local, not uploaded. Publish the short report using the linked form. A menu, title screen or single frame is not enough evidence of playable gameplay.
 
 Submitted tests appear in [Community reports](https://lsx45.app/playable/#community-reports), separately from the curated compatibility list. They do not automatically increase the Playable total. Keep the private removal key to remove your report and attachments later. Do not upload game files, saves, logs or private information.
-
-## Download
-
-<p align="center">
-  <a href="https://play.google.com/store/apps/details?id=com.jetcalls.lsx4"><img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" height="80" alt="Get it on Google Play"></a>
-</p>
 
 ## Implementation architecture
 
