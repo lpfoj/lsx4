@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="252" height="80" viewBox="0 0 252 80" role="img" aria-labelledby="title desc">
+  <title id="title">Download LSX4 for iOS</title>
+  <desc id="desc">IPA and installation instructions on GitHub Releases</desc>
+  <rect x="8.75" y="8.75" width="234.5" height="62.5" rx="8" fill="#080a0d" stroke="#a6a8ac" stroke-width="1.5"/>
+  <g fill="none" stroke="#f8fafc" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="25" y="21" width="23" height="38" rx="5" stroke-width="2"/>
+    <path d="M32 25h9M34 55h5" stroke-width="1.8"/>
+    <path d="M36.5 32v14m-5-5 5 5 5-5" stroke-width="2.2"/>
+  </g>
+  <g fill="#f8fafc" font-family="Arial, Helvetica, sans-serif">
+    <text x="62" y="29" font-size="10" letter-spacing=".65" fill="#cbd0d7">IPA · GITHUB RELEASES</text>
+    <text x="61" y="52" font-size="22" font-weight="600">Download for iOS</text>
+  </g>
+</svg>
