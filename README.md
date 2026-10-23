@@ -23,10 +23,10 @@ Development also makes use of current-generation large language models (LLMs).
 
 <p align="center">
   <a href="https://play.google.com/store/apps/details?id=com.jetcalls.lsx4"><img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" height="80" alt="Get it on Google Play"></a>
-  <a href="https://github.com/lpfoj/lsx4/releases/tag/ios-jit-128.9299"><img src="assets/ios-download.svg?v=20261023-2" height="80" alt="Download LSX4 for iOS: IPA and installation instructions on GitHub Releases"></a>
+  <a href="https://github.com/lpfoj/lsx4/releases/tag/ios-jit-128.9333"><img src="assets/ios-download.svg?v=20261023-2" height="80" alt="Download LSX4 for iOS: IPA and installation instructions on GitHub Releases"></a>
 </p>
 
-**iOS (PS4, iOS 26+):** [Latest release](https://github.com/lpfoj/lsx4/releases/tag/ios-jit-128.9299) · [Download IPA](https://github.com/lpfoj/lsx4/releases/download/ios-jit-128.9294/LSX4-JIT-128.9294.ipa) · [IPA + English installation instructions](https://github.com/lpfoj/lsx4/releases/download/ios-jit-128.9294/LSX4-iOS-JIT-128.9294-English.zip). Install with Sideloadly and follow the included on-device JIT setup instructions.
+**iOS (PS4, iOS 26+):** [Latest release](https://github.com/lpfoj/lsx4/releases/tag/ios-jit-128.9333) · [Download IPA](https://github.com/lpfoj/lsx4/releases/download/ios-jit-128.9294/LSX4-JIT-128.9294.ipa) · [IPA + English installation instructions](https://github.com/lpfoj/lsx4/releases/download/ios-jit-128.9294/LSX4-iOS-JIT-128.9294-English.zip). Install with Sideloadly and follow the included on-device JIT setup instructions.
 
 ## Contributing
 
