@@ -1,0 +1,994 @@
+[
+  {
+    "id": "CUSA30277",
+    "title": "A Short Hike",
+    "androidStatus": "supported",
+    "bytes": 377472000,
+    "source": "files/lsx4-home/games/CUSA30277",
+    "private": true
+  },
+  {
+    "id": "CUSA29346",
+    "title": "Axiom Verge 2",
+    "androidStatus": "supported",
+    "bytes": 221422592,
+    "source": "files/lsx4-home/games/CUSA29346",
+    "private": true
+  },
+  {
+    "id": "CUSA23985",
+    "title": "Carto",
+    "androidStatus": "supported",
+    "bytes": 2210495488,
+    "source": "/sdcard/Emulation/PS4/games/CUSA23985",
+    "private": false
+  },
+  {
+    "id": "CUSA10749",
+    "title": "Dandara",
+    "androidStatus": "supported",
+    "bytes": 1126578176,
+    "source": "/sdcard/Emulation/PS4/games/CUSA10749",
+    "private": false
+  },
+  {
+    "id": "CUSA10484",
+    "title": "Dead Cells",
+    "androidStatus": "supported",
+    "bytes": 471237632,
+    "source": "/sdcard/Emulation/PS4/games/CUSA10484",
+    "private": false
+  },
+  {
+    "id": "CUSA04550",
+    "title": "Downwell",
+    "androidStatus": "supported",
+    "bytes": 54436864,
+    "source": "/sdcard/Emulation/PS4/games/CUSA04550",
+    "private": false
+  },
+  {
+    "id": "CUSA14846",
+    "title": "FAR: Lone Sails",
+    "androidStatus": "supported",
+    "bytes": 2501627904,
+    "source": "/sdcard/Emulation/PS4/games/CUSA14846",
+    "private": false
+  },
+  {
+    "id": "CUSA52139",
+    "title": "Islets",
+    "androidStatus": "supported",
+    "bytes": 539534336,
+    "source": "files/lsx4-home/games/CUSA52139",
+    "private": true
+  },
+  {
+    "id": "CUSA05228",
+    "title": "Jazzpunk",
+    "androidStatus": "supported",
+    "bytes": 2189102080,
+    "source": "files/lsx4-home/games/CUSA05228",
+    "private": true
+  },
+  {
+    "id": "CUSA10349",
+    "title": "Just Shapes & Beats",
+    "androidStatus": "supported",
+    "bytes": 745100288,
+    "source": "/sdcard/Emulation/PS4/games/CUSA10349",
+    "private": false
+  },
+  {
+    "id": "CUSA59042",
+    "title": "Mega Shoot",
+    "androidStatus": "supported",
+    "bytes": 27210752,
+    "source": "/sdcard/Emulation/PS4/games/CUSA59042",
+    "private": false
+  },
+  {
+    "id": "CUSA09747",
+    "title": "Minit",
+    "androidStatus": "supported",
+    "bytes": 136181760,
+    "source": "/sdcard/Emulation/PS4/games/CUSA09747",
+    "private": false
+  },
+  {
+    "id": "CUSA00920",
+    "title": "Nidhogg",
+    "androidStatus": "supported",
+    "bytes": 87312384,
+    "source": "/sdcard/Emulation/PS4/games/CUSA00920",
+    "private": false
+  },
+  {
+    "id": "CUSA25416",
+    "title": "Ninja JaJaMaru Collection",
+    "androidStatus": "supported",
+    "bytes": 1037550592,
+    "source": "/sdcard/Emulation/PS4/games/CUSA25416",
+    "private": false
+  },
+  {
+    "id": "CUSA03902",
+    "title": "Nuclear Throne",
+    "androidStatus": "supported",
+    "bytes": 178697216,
+    "source": "files/lsx4-home/games/CUSA03902",
+    "private": true
+  },
+  {
+    "id": "CUSA05667",
+    "title": "Rain World",
+    "androidStatus": "supported",
+    "bytes": 1491233792,
+    "source": "/sdcard/Emulation/PS4/games/CUSA05667",
+    "private": false
+  },
+  {
+    "id": "CUSA16209",
+    "title": "Risk of Rain 2",
+    "androidStatus": "supported",
+    "bytes": 1255287808,
+    "source": "/sdcard/Emulation/PS4/games/CUSA16209",
+    "private": false
+  },
+  {
+    "id": "CUSA01867",
+    "title": "Shovel Knight",
+    "androidStatus": "supported",
+    "bytes": 150230016,
+    "source": "/sdcard/Emulation/PS4/games/CUSA01867",
+    "private": false
+  },
+  {
+    "id": "CUSA07010",
+    "title": "Sonic Mania",
+    "androidStatus": "supported",
+    "bytes": 195277824,
+    "source": "/sdcard/Emulation/PS4/games/CUSA07010",
+    "private": false
+  },
+  {
+    "id": "CUSA02473",
+    "title": "Spider: Rite of the Shrouded Moon",
+    "androidStatus": "supported",
+    "bytes": 1022932992,
+    "source": "files/lsx4-home/games/CUSA02473",
+    "private": true
+  },
+  {
+    "id": "CUSA00792",
+    "title": "The Binding of Isaac: Rebirth",
+    "androidStatus": "supported",
+    "bytes": 1116357632,
+    "source": "/sdcard/Emulation/PS4/games/CUSA00792",
+    "private": false
+  },
+  {
+    "id": "CUSA00909",
+    "title": "Thomas Was Alone",
+    "androidStatus": "supported",
+    "bytes": 319854592,
+    "source": "/sdcard/Emulation/PS4/games/CUSA00909",
+    "private": false
+  },
+  {
+    "id": "CUSA09415",
+    "title": "Undertale",
+    "androidStatus": "supported",
+    "bytes": 175982592,
+    "source": "/sdcard/Emulation/PS4/games/CUSA09415",
+    "private": false
+  },
+  {
+    "id": "CUSA00602",
+    "title": "Another World",
+    "androidStatus": "supported",
+    "bytes": 168349696,
+    "source": "files/lsx4-home/games/CUSA00602",
+    "private": true
+  },
+  {
+    "id": "CUSA28188",
+    "title": "Bonfire Peaks",
+    "androidStatus": "supported",
+    "bytes": 758248448,
+    "source": "/sdcard/Emulation/PS4/games/CUSA28188",
+    "private": false
+  },
+  {
+    "id": "CUSA03887",
+    "title": "Broforce",
+    "androidStatus": "supported",
+    "bytes": 525435904,
+    "source": "/sdcard/Emulation/PS4/games/CUSA03887",
+    "private": false
+  },
+  {
+    "id": "CUSA26423",
+    "title": "Can't Drive This",
+    "androidStatus": "supported",
+    "bytes": 1553203200,
+    "source": "/sdcard/Emulation/PS4/games/CUSA26423",
+    "private": false
+  },
+  {
+    "id": "CUSA18112",
+    "title": "CoffeeTalk",
+    "androidStatus": "supported",
+    "bytes": 609566720,
+    "source": "/sdcard/Emulation/PS4/games/CUSA18112",
+    "private": false
+  },
+  {
+    "id": "CUSA02483",
+    "title": "Cosmophony",
+    "androidStatus": "supported",
+    "bytes": 818181120,
+    "source": "files/lsx4-home/games/CUSA02483",
+    "private": true
+  },
+  {
+    "id": "CUSA24216",
+    "title": "Cyber Shadow",
+    "androidStatus": "supported",
+    "bytes": 242631680,
+    "source": "/sdcard/Emulation/PS4/games/CUSA24216",
+    "private": false
+  },
+  {
+    "id": "CUSA14657",
+    "title": "Dark Devotion",
+    "androidStatus": "supported",
+    "bytes": 709550080,
+    "source": "files/lsx4-home/games/CUSA14657",
+    "private": true
+  },
+  {
+    "id": "CUSA15250",
+    "title": "DELTARUNE Chapter 1&2",
+    "androidStatus": "supported",
+    "bytes": 219337728,
+    "source": "/sdcard/Emulation/PS4/games/CUSA15250",
+    "private": false
+  },
+  {
+    "id": "CUSA31748",
+    "title": "Despot's Game",
+    "androidStatus": "supported",
+    "bytes": 1036779520,
+    "source": "/sdcard/Emulation/PS4/games/CUSA31748",
+    "private": false
+  },
+  {
+    "id": "CUSA08921",
+    "title": "Don't Bite Me Bro!",
+    "androidStatus": "supported",
+    "bytes": 584480768,
+    "source": "/sdcard/Emulation/PS4/games/CUSA08921",
+    "private": false
+  },
+  {
+    "id": "CUSA35761",
+    "title": "DREDGE",
+    "androidStatus": "supported",
+    "bytes": 974444544,
+    "source": "/sdcard/Emulation/PS4/games/CUSA35761",
+    "private": false
+  },
+  {
+    "id": "CUSA49898",
+    "title": "Farlands Journey",
+    "androidStatus": "supported",
+    "bytes": 231171072,
+    "source": "/sdcard/Emulation/PS4/games/CUSA49898",
+    "private": false
+  },
+  {
+    "id": "CUSA17844",
+    "title": "Fight'N Rage",
+    "androidStatus": "supported",
+    "bytes": 304243712,
+    "source": "files/lsx4-home/games/CUSA17844",
+    "private": true
+  },
+  {
+    "id": "CUSA33818",
+    "title": "FINAL FANTASY",
+    "androidStatus": "supported",
+    "bytes": 693457920,
+    "source": "/sdcard/Emulation/PS4/games/CUSA33818",
+    "private": false
+  },
+  {
+    "id": "CUSA19050",
+    "title": "Going Under",
+    "androidStatus": "supported",
+    "bytes": 1462234112,
+    "source": "/sdcard/Emulation/PS4/games/CUSA19050",
+    "private": false
+  },
+  {
+    "id": "CUSA11628",
+    "title": "GoNNER",
+    "androidStatus": "supported",
+    "bytes": 239015936,
+    "source": "files/lsx4-home/games/CUSA11628",
+    "private": true
+  },
+  {
+    "id": "CUSA05840",
+    "title": "Grand Prix Rock'N Racing",
+    "androidStatus": "supported",
+    "bytes": 241678336,
+    "source": "/sdcard/Emulation/PS4/games/CUSA05840",
+    "private": false
+  },
+  {
+    "id": "CUSA32036",
+    "title": "Hillbilly Doomsday",
+    "androidStatus": "supported",
+    "bytes": 284308480,
+    "source": "files/lsx4-home/games/CUSA32036",
+    "private": true
+  },
+  {
+    "id": "CUSA00368",
+    "title": "Hotline Miami 2: Wrong Number",
+    "androidStatus": "supported",
+    "bytes": 437703680,
+    "source": "/sdcard/Emulation/PS4/games/CUSA00368",
+    "private": false
+  },
+  {
+    "id": "CUSA04570",
+    "title": "Hyper Light Drifter",
+    "androidStatus": "supported",
+    "bytes": 1037849600,
+    "source": "/sdcard/Emulation/PS4/games/CUSA04570",
+    "private": false
+  },
+  {
+    "id": "CUSA23515",
+    "title": "I AI",
+    "androidStatus": "supported",
+    "bytes": 1327295488,
+    "source": "/sdcard/Emulation/PS4/games/CUSA23515",
+    "private": false
+  },
+  {
+    "id": "CUSA46929",
+    "title": "Lucy Dreaming",
+    "androidStatus": "supported",
+    "bytes": 359920640,
+    "source": "files/lsx4-home/games/CUSA46929",
+    "private": true
+  },
+  {
+    "id": "CUSA31517",
+    "title": "Marble It Up! Ultra",
+    "androidStatus": "supported",
+    "bytes": 1263805440,
+    "source": "/sdcard/Emulation/PS4/games/CUSA31517",
+    "private": false
+  },
+  {
+    "id": "CUSA25391",
+    "title": "MEGALAN 11",
+    "androidStatus": "supported",
+    "bytes": 678701056,
+    "source": "/sdcard/Emulation/PS4/games/CUSA25391",
+    "private": false
+  },
+  {
+    "id": "CUSA32398",
+    "title": "Might & Magic: Clash of Heroes",
+    "androidStatus": "supported",
+    "bytes": 2231611392,
+    "source": "files/lsx4-home/games/CUSA32398",
+    "private": true
+  },
+  {
+    "id": "CUSA07640",
+    "title": "Nidhogg 2",
+    "androidStatus": "supported",
+    "bytes": 472382464,
+    "source": "/sdcard/Emulation/PS4/games/CUSA07640",
+    "private": false
+  },
+  {
+    "id": "CUSA02996",
+    "title": "NOT A HERO",
+    "androidStatus": "supported",
+    "bytes": 631741440,
+    "source": "files/lsx4-home/games/CUSA02996",
+    "private": true
+  },
+  {
+    "id": "CUSA03320",
+    "title": "Nubla",
+    "androidStatus": "supported",
+    "bytes": 1275573248,
+    "source": "files/lsx4-home/games/CUSA03320",
+    "private": true
+  },
+  {
+    "id": "CUSA09920",
+    "title": "Owlboy",
+    "androidStatus": "supported",
+    "bytes": 471155712,
+    "source": "/sdcard/Emulation/PS4/games/CUSA09920",
+    "private": false
+  },
+  {
+    "id": "CUSA02897",
+    "title": "Perfect Universe",
+    "androidStatus": "supported",
+    "bytes": 319390720,
+    "source": "/sdcard/Emulation/PS4/games/CUSA02897",
+    "private": false
+  },
+  {
+    "id": "CUSA02765",
+    "title": "REPLAY: VHS IS NOT DEAD",
+    "androidStatus": "supported",
+    "bytes": 400754688,
+    "source": "files/lsx4-home/games/CUSA02765",
+    "private": true
+  },
+  {
+    "id": "CUSA00038",
+    "title": "RESOGUN\u2122",
+    "androidStatus": "supported",
+    "bytes": 459674624,
+    "source": "/sdcard/Emulation/PS4/games/CUSA00038",
+    "private": false
+  },
+  {
+    "id": "CUSA25443",
+    "title": "Retrace: Memories of Death",
+    "androidStatus": "supported",
+    "bytes": 206324736,
+    "source": "/sdcard/Emulation/PS4/games/CUSA25443",
+    "private": false
+  },
+  {
+    "id": "CUSA05841",
+    "title": "Rock'N Racing Off Road DX",
+    "androidStatus": "supported",
+    "bytes": 254289920,
+    "source": "/sdcard/Emulation/PS4/games/CUSA05841",
+    "private": false
+  },
+  {
+    "id": "CUSA42371",
+    "title": "Rogue Legacy 2",
+    "androidStatus": "supported",
+    "bytes": 967117824,
+    "source": "/sdcard/Emulation/PS4/games/CUSA42371",
+    "private": false
+  },
+  {
+    "id": "CUSA16178",
+    "title": "Super Monkey Ball: Banana Blitz",
+    "androidStatus": "supported",
+    "bytes": 1554174976,
+    "source": "/sdcard/Emulation/PS4/games/CUSA16178",
+    "private": false
+  },
+  {
+    "id": "CUSA10848",
+    "title": "The Gardens Between",
+    "androidStatus": "supported",
+    "bytes": 1639568384,
+    "source": "/sdcard/Emulation/PS4/games/CUSA10848",
+    "private": false
+  },
+  {
+    "id": "CUSA20287",
+    "title": "The Pedestrian",
+    "androidStatus": "supported",
+    "bytes": 1843200000,
+    "source": "/sdcard/Emulation/PS4/games/CUSA20287",
+    "private": false
+  },
+  {
+    "id": "CUSA01775",
+    "title": "Toto Temple Deluxe",
+    "androidStatus": "supported",
+    "bytes": 235507712,
+    "source": "files/lsx4-home/games/CUSA01775",
+    "private": true
+  },
+  {
+    "id": "CUSA01126",
+    "title": "Trine",
+    "androidStatus": "supported",
+    "bytes": 1304238080,
+    "source": "/sdcard/Emulation/PS4/games/CUSA01126",
+    "private": false
+  },
+  {
+    "id": "CUSA35834",
+    "title": "Turnip Boy Commits Tax Evasion",
+    "androidStatus": "supported",
+    "bytes": 763734016,
+    "source": "/sdcard/Emulation/PS4/games/CUSA35834",
+    "private": false
+  },
+  {
+    "id": "CUSA08580",
+    "title": "Ultimate Chicken Horse",
+    "androidStatus": "supported",
+    "bytes": 1451790336,
+    "source": "/sdcard/Emulation/PS4/games/CUSA08580",
+    "private": false
+  },
+  {
+    "id": "CUSA03173",
+    "title": "Bloodborne\u2122",
+    "androidStatus": "supported",
+    "bytes": 31525581824,
+    "source": "/sdcard/Emulation/PS4/games/CUSA03173",
+    "private": false
+  },
+  {
+    "id": "CUSA29547",
+    "title": "Chained Echoes",
+    "androidStatus": "supported",
+    "bytes": 4070200320,
+    "source": "files/lsx4-home/games/CUSA29547",
+    "private": true
+  },
+  {
+    "id": "CUSA30423",
+    "title": "Death's Door",
+    "androidStatus": "supported",
+    "bytes": 2836875264,
+    "source": "/sdcard/Emulation/PS4/games/CUSA30423",
+    "private": false
+  },
+  {
+    "id": "PPSA02929",
+    "title": "Dreaming Sarah",
+    "androidStatus": "supported",
+    "bytes": 115032064,
+    "source": "files/lsx4-home/games/PPSA02929",
+    "private": true
+  },
+  {
+    "id": "CUSA13507",
+    "title": "Lethal League Blaze",
+    "androidStatus": "supported",
+    "bytes": 3715535872,
+    "source": "files/lsx4-home/games/CUSA13507",
+    "private": true
+  },
+  {
+    "id": "CUSA42759",
+    "title": "MediEvil",
+    "androidStatus": "supported",
+    "bytes": 3374534656,
+    "source": "/sdcard/Emulation/PS4/games/CUSA42759",
+    "private": false
+  },
+  {
+    "id": "CUSA11979",
+    "title": "Old Man's Journey",
+    "androidStatus": "supported",
+    "bytes": 3374146560,
+    "source": "files/lsx4-home/games/CUSA11979",
+    "private": true
+  },
+  {
+    "id": "CUSA34254",
+    "title": "ROLLERDROME",
+    "androidStatus": "supported",
+    "bytes": 4482382848,
+    "source": "files/lsx4-home/games/CUSA34254",
+    "private": true
+  },
+  {
+    "id": "PPSA03061",
+    "title": "void tRrLM();++ //Void Terrarium++",
+    "androidStatus": "supported",
+    "bytes": 1762244608,
+    "source": "/sdcard/Emulation/PS4/games/PPSA03061",
+    "private": false
+  },
+  {
+    "id": "CUSA03486",
+    "title": "5 Star Wrestling: ReGenesis",
+    "androidStatus": "unknown",
+    "bytes": 1502387200,
+    "source": "/sdcard/Emulation/PS4/games/CUSA03486",
+    "private": false
+  },
+  {
+    "id": "CUSA29979",
+    "title": "A Monster's Expedition",
+    "androidStatus": "unsupported",
+    "bytes": 622307328,
+    "source": "/sdcard/Emulation/PS4/games/CUSA29979",
+    "private": false
+  },
+  {
+    "id": "CUSA05148",
+    "title": "Absolute Drift",
+    "androidStatus": "unsupported",
+    "bytes": 373697536,
+    "source": "/sdcard/Emulation/PS4/games/CUSA05148",
+    "private": false
+  },
+  {
+    "id": "CUSA10606",
+    "title": "Bad North",
+    "androidStatus": "unknown",
+    "bytes": 355622912,
+    "source": "/sdcard/Emulation/PS4/games/CUSA10606",
+    "private": false
+  },
+  {
+    "id": "CUSA47498",
+    "title": "Balatro",
+    "androidStatus": "unsupported",
+    "bytes": 700426240,
+    "source": "/sdcard/Emulation/PS4/games/CUSA47498",
+    "private": false
+  },
+  {
+    "id": "CUSA26947",
+    "title": "Besiege",
+    "androidStatus": "unsupported",
+    "bytes": 1097053184,
+    "source": "/sdcard/Emulation/PS4/games/CUSA26947",
+    "private": false
+  },
+  {
+    "id": "CUSA50981",
+    "title": "Beyond the Ice Palace II",
+    "androidStatus": "unsupported",
+    "bytes": 2015271936,
+    "source": "/sdcard/Emulation/PS4/games/CUSA50981",
+    "private": false
+  },
+  {
+    "id": "CUSA58072",
+    "title": "Bluey's Quest for the Gold Pen",
+    "androidStatus": "unsupported",
+    "bytes": 2098043904,
+    "source": "/sdcard/Emulation/PS4/games/CUSA58072",
+    "private": false
+  },
+  {
+    "id": "CUSA50586",
+    "title": "Buildest",
+    "androidStatus": "unsupported",
+    "bytes": 2614841344,
+    "source": "files/lsx4-home/games/CUSA50586",
+    "private": true
+  },
+  {
+    "id": "CUSA26271",
+    "title": "Capcom Arcade Stadium",
+    "androidStatus": "unsupported",
+    "bytes": 1322860544,
+    "source": "/sdcard/Emulation/PS4/games/CUSA26271",
+    "private": false
+  },
+  {
+    "id": "CUSA54365",
+    "title": "Cat From Hell - Cat Simulator",
+    "androidStatus": "unsupported",
+    "bytes": 725943296,
+    "source": "/sdcard/Emulation/PS4/games/CUSA54365",
+    "private": false
+  },
+  {
+    "id": "CUSA56663",
+    "title": "Cat From Hell 2",
+    "androidStatus": "unsupported",
+    "bytes": 689550336,
+    "source": "/sdcard/Emulation/PS4/games/CUSA56663",
+    "private": false
+  },
+  {
+    "id": "CUSA14219",
+    "title": "Chocobo\u2019s Mystery Dungeon EVERY BUDDY!",
+    "androidStatus": "unsupported",
+    "bytes": 1580558336,
+    "source": "/sdcard/Emulation/PS4/games/CUSA14219",
+    "private": false
+  },
+  {
+    "id": "CUSA15461",
+    "title": "CrossCode",
+    "androidStatus": "unsupported",
+    "bytes": 1559149568,
+    "source": "/sdcard/Emulation/PS4/games/CUSA15461",
+    "private": false
+  },
+  {
+    "id": "CUSA23188",
+    "title": "Exit the Gungeon",
+    "androidStatus": "unknown",
+    "bytes": 531070976,
+    "source": "/sdcard/Emulation/PS4/games/CUSA23188",
+    "private": false
+  },
+  {
+    "id": "CUSA28066",
+    "title": "FAR: Changing Tides",
+    "androidStatus": "unsupported",
+    "bytes": 2112388096,
+    "source": "/sdcard/Emulation/PS4/games/CUSA28066",
+    "private": false
+  },
+  {
+    "id": "CUSA03587",
+    "title": "Fat City",
+    "androidStatus": "unsupported",
+    "bytes": 404932608,
+    "source": "/sdcard/Emulation/PS4/games/CUSA03587",
+    "private": false
+  },
+  {
+    "id": "CUSA49329",
+    "title": "FATE Reawakened",
+    "androidStatus": "unsupported",
+    "bytes": 1205988352,
+    "source": "/sdcard/Emulation/PS4/games/CUSA49329",
+    "private": false
+  },
+  {
+    "id": "CUSA48562",
+    "title": "Fear The Spotlight",
+    "androidStatus": "unsupported",
+    "bytes": 1430067200,
+    "source": "/sdcard/Emulation/PS4/games/CUSA48562",
+    "private": false
+  },
+  {
+    "id": "CUSA33822",
+    "title": "FINAL FANTASY II",
+    "androidStatus": "unknown",
+    "bytes": 680719360,
+    "source": "/sdcard/Emulation/PS4/games/CUSA33822",
+    "private": false
+  },
+  {
+    "id": "CUSA02824",
+    "title": "Funk of Titans",
+    "androidStatus": "unsupported",
+    "bytes": 711587840,
+    "source": "/sdcard/Emulation/PS4/games/CUSA02824",
+    "private": false
+  },
+  {
+    "id": "CUSA41240",
+    "title": "Grim Guardians: Demon Purge",
+    "androidStatus": "unsupported",
+    "bytes": 797320192,
+    "source": "/sdcard/Emulation/PS4/games/CUSA41240",
+    "private": false
+  },
+  {
+    "id": "CUSA00319",
+    "title": "Guacamelee!",
+    "androidStatus": "unsupported",
+    "bytes": 795001856,
+    "source": "/sdcard/Emulation/PS4/games/CUSA00319",
+    "private": false
+  },
+  {
+    "id": "CUSA13285",
+    "title": "Hollow Knight",
+    "androidStatus": "unsupported",
+    "bytes": 4991629312,
+    "source": "/sdcard/Emulation/PS4/games/CUSA13285",
+    "private": false
+  },
+  {
+    "id": "CUSA00486",
+    "title": "Hotline Miami",
+    "androidStatus": "unsupported",
+    "bytes": 797986816,
+    "source": "/sdcard/Emulation/PS4/games/CUSA00486",
+    "private": false
+  },
+  {
+    "id": "CUSA48053",
+    "title": "Iron Meat",
+    "androidStatus": "unsupported",
+    "bytes": 1728254976,
+    "source": "/sdcard/Emulation/PS4/games/CUSA48053",
+    "private": false
+  },
+  {
+    "id": "CUSA00470",
+    "title": "Journey",
+    "androidStatus": "unsupported",
+    "bytes": 2618157056,
+    "source": "/sdcard/Emulation/PS4/games/CUSA00470",
+    "private": false
+  },
+  {
+    "id": "CUSA02990",
+    "title": "LEVEL 22",
+    "androidStatus": "unsupported",
+    "bytes": 257216512,
+    "source": "/sdcard/Emulation/PS4/games/CUSA02990",
+    "private": false
+  },
+  {
+    "id": "CUSA53312",
+    "title": "Little Kitty, Big City",
+    "androidStatus": "unknown",
+    "bytes": 1486684160,
+    "source": "/sdcard/Emulation/PS4/games/CUSA53312",
+    "private": false
+  },
+  {
+    "id": "CUSA31684",
+    "title": "Little Noah: Scion of Paradise",
+    "androidStatus": "unsupported",
+    "bytes": 1336650752,
+    "source": "/sdcard/Emulation/PS4/games/CUSA31684",
+    "private": false
+  },
+  {
+    "id": "CUSA45554",
+    "title": "MediEvil II",
+    "androidStatus": "unsupported",
+    "bytes": 2242833408,
+    "source": "/sdcard/Emulation/PS4/games/CUSA45554",
+    "private": false
+  },
+  {
+    "id": "CUSA06983",
+    "title": "Megaton Rainfall",
+    "androidStatus": "unsupported",
+    "bytes": 2888408064,
+    "source": "/sdcard/Emulation/PS4/games/CUSA06983",
+    "private": false
+  },
+  {
+    "id": "CUSA35013",
+    "title": "Moonscars",
+    "androidStatus": "unknown",
+    "bytes": 716860416,
+    "source": "/sdcard/Emulation/PS4/games/CUSA35013",
+    "private": false
+  },
+  {
+    "id": "CUSA49726",
+    "title": "Mortisomem",
+    "androidStatus": "unsupported",
+    "bytes": 915650560,
+    "source": "/sdcard/Emulation/PS4/games/CUSA49726",
+    "private": false
+  },
+  {
+    "id": "CUSA50171",
+    "title": "NEEDY GIRL OVERDOSE",
+    "androidStatus": "unsupported",
+    "bytes": 1306924032,
+    "source": "/sdcard/Emulation/PS4/games/CUSA50171",
+    "private": false
+  },
+  {
+    "id": "CUSA05588",
+    "title": "Nex Machina",
+    "androidStatus": "unsupported",
+    "bytes": 1052619776,
+    "source": "/sdcard/Emulation/PS4/games/CUSA05588",
+    "private": false
+  },
+  {
+    "id": "CUSA03534",
+    "title": "Orc Slayer",
+    "androidStatus": "unsupported",
+    "bytes": 323508224,
+    "source": "/sdcard/Emulation/PS4/games/CUSA03534",
+    "private": false
+  },
+  {
+    "id": "CUSA06171",
+    "title": "Patapon\u2122",
+    "androidStatus": "unknown",
+    "bytes": 788048896,
+    "source": "/sdcard/Emulation/PS4/games/CUSA06171",
+    "private": false
+  },
+  {
+    "id": "CUSA42383",
+    "title": "Punch Club 2: Fast Forward",
+    "androidStatus": "unsupported",
+    "bytes": 1165982720,
+    "source": "/sdcard/Emulation/PS4/games/CUSA42383",
+    "private": false
+  },
+  {
+    "id": "CUSA14101",
+    "title": "Sea of Solitude",
+    "androidStatus": "unsupported",
+    "bytes": 1234335744,
+    "source": "/sdcard/Emulation/PS4/games/CUSA14101",
+    "private": false
+  },
+  {
+    "id": "CUSA02896",
+    "title": "Super Rude Bear Resurrection",
+    "androidStatus": "unsupported",
+    "bytes": 2603123712,
+    "source": "/sdcard/Emulation/PS4/games/CUSA02896",
+    "private": false
+  },
+  {
+    "id": "CUSA49405",
+    "title": "The Exit 8",
+    "androidStatus": "unsupported",
+    "bytes": 2277267456,
+    "source": "/sdcard/Emulation/PS4/games/CUSA49405",
+    "private": false
+  },
+  {
+    "id": "CUSA27266",
+    "title": "The Touryst",
+    "androidStatus": "unsupported",
+    "bytes": 541309952,
+    "source": "/sdcard/Emulation/PS4/games/CUSA27266",
+    "private": false
+  },
+  {
+    "id": "CUSA59219",
+    "title": "Thornkin",
+    "androidStatus": "unsupported",
+    "bytes": 301750272,
+    "source": "/sdcard/Emulation/PS4/games/CUSA59219",
+    "private": false
+  },
+  {
+    "id": "CUSA43665",
+    "title": "Turok 3: Shadow of Oblivion",
+    "androidStatus": "unsupported",
+    "bytes": 1074041856,
+    "source": "/sdcard/Emulation/PS4/games/CUSA43665",
+    "private": false
+  },
+  {
+    "id": "CUSA26631",
+    "title": "WHAT THE GOLF?",
+    "androidStatus": "unsupported",
+    "bytes": 1425420288,
+    "source": "/sdcard/Emulation/PS4/games/CUSA26631",
+    "private": false
+  },
+  {
+    "id": "CUSA55656",
+    "title": "Wizordum",
+    "androidStatus": "unsupported",
+    "bytes": 1062680576,
+    "source": "/sdcard/Emulation/PS4/games/CUSA55656",
+    "private": false
+  },
+  {
+    "id": "CUSA00192",
+    "title": "Worms Battlegrounds",
+    "androidStatus": "unknown",
+    "bytes": 1477828608,
+    "source": "/sdcard/Emulation/PS4/games/CUSA00192",
+    "private": false
+  },
+  {
+    "id": "CUSA00556",
+    "title": "The Last of Us Remastered",
+    "androidStatus": "unknown",
+    "bytes": 62959395251,
+    "source": "PC:H:/ps4/lsx4-tlou-20261006",
+    "private": false
+  }
+]

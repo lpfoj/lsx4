@@ -1,0 +1,53 @@
+# Shared source manifest. Android and Apple consume the same implementation.
+set(LSX4_JIT_COMMON_SOURCES
+    src/executor/android_glob_compat.cpp
+    src/executor/dynamic_translation/address_resolver.cpp
+    src/executor/dynamic_translation/native_address_emitter.cpp
+    src/executor/dynamic_translation/atomic_memory.cpp
+    src/executor/dynamic_translation/code_witness.cpp
+    src/executor/dynamic_translation/condition_materializer.cpp
+    src/executor/dynamic_translation/code_memory.cpp
+    src/executor/dynamic_translation/decode_frontend.cpp
+    src/executor/dynamic_translation/diagnostic_probe_policy.cpp
+    src/executor/dynamic_translation/edge_portal.cpp
+    src/executor/dynamic_translation/executable_range_registry.cpp
+    src/executor/dynamic_translation/execution_context.cpp
+    src/executor/dynamic_translation/execution_driver.cpp
+    src/executor/dynamic_translation/live_state_port.cpp
+    src/executor/dynamic_translation/process_memory.cpp
+    src/executor/dynamic_translation/trace_memory.cpp
+    src/executor/dynamic_translation/stack_windows.cpp
+    src/executor/dynamic_translation/foundation_checks.cpp
+    src/executor/dynamic_translation/floating_relation.cpp
+    src/executor/dynamic_translation/guest_capability_profile.cpp
+    src/executor/dynamic_translation/guest_mapping_policy.cpp
+    src/executor/dynamic_translation/host_isa_profile.cpp
+    src/executor/dynamic_translation/hle_invocation_frame.cpp
+    src/executor/dynamic_translation/instruction_diagnostics.cpp
+    src/executor/dynamic_translation/integer_math.cpp
+    src/executor/dynamic_translation/json_text.cpp
+    src/executor/dynamic_translation/machine_state.cpp
+    src/executor/dynamic_translation/native_encoder.cpp
+    src/executor/dynamic_translation/native_status_emitter.cpp
+    src/executor/dynamic_translation/native_compiler.cpp
+    src/executor/dynamic_translation/operation_ir.cpp
+    src/executor/dynamic_translation/region_plan.cpp
+    src/executor/dynamic_translation/register_access.cpp
+    src/executor/dynamic_translation/region_registry.cpp
+    src/executor/dynamic_translation/scalar_ir_builder.cpp
+    src/executor/dynamic_translation/scalar_semantics.cpp
+    src/executor/dynamic_translation/translation_service.cpp
+    src/executor/dynamic_translation/value_residency.cpp
+    src/executor/dynamic_translation/vector_semantics.cpp
+    src/executor/dynamic_translation/x87_semantics.cpp
+    src/executor/dynamic_translation/x87_state.cpp
+    src/executor/dynamic_translation/retiring_execution_core.cpp
+    src/executor/dynamic_translation/jit_aarch64_stubs.S
+    src/executor/dynamic_translation/artifact_repository.cpp
+    src/executor/dynamic_translation/decode_bridge.cpp
+    src/executor/dynamic_translation/vector_lowering_policy.cpp
+    src/executor/dynamic_translation/packed_lane_ops.cpp
+    src/executor/dynamic_translation/partial_move_plan.cpp
+    src/executor/dynamic_translation/partial_move_emitter.cpp
+)
+

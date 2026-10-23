@@ -1,0 +1,69 @@
+// SPDX-FileCopyrightText: Copyright 2026 LSX4 Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+
+// Reconstructs emulator-owned temporal inputs when a guest does not expose a
+// motion-vector attachment. A bounded 5x5 colour search produces current-to-
+// previous clip-space motion; depth is neutral unless a real guest depth view
+// is supplied by the renderer contract.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D CurrentColor;
+layout(set = 0, binding = 1) uniform sampler2D PreviousColor;
+layout(set = 0, binding = 2, r32f) uniform writeonly image2D ReconstructedDepth;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D EncodedVelocity;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D CurrentColorHistory;
+layout(set = 0, binding = 5, rg16f) uniform writeonly image2D RawVelocity;
+
+layout(push_constant) uniform TemporalInputConstants {
+    uvec2 renderSize;
+    uint reset;
+    uint reserved;
+} params;
+
+float Luma(vec3 color) {
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = ivec2(params.renderSize);
+    if (any(greaterThanEqual(pixel, extent))) {
+        return;
+    }
+    vec3 current = texelFetch(CurrentColor, pixel, 0).rgb;
+    float currentLuma = Luma(current);
+    ivec2 bestOffset = ivec2(0);
+    float sameError = abs(currentLuma - Luma(texelFetch(PreviousColor, pixel, 0).rgb));
+    float bestError = sameError;
+    if (params.reset == 0u && sameError > 1.0 / 255.0) {
+        for (int y = -2; y <= 2; ++y) {
+            for (int x = -2; x <= 2; ++x) {
+                ivec2 offset = ivec2(x, y);
+                ivec2 previousPixel = clamp(pixel + offset, ivec2(0), extent - 1);
+                vec3 previous = texelFetch(PreviousColor, previousPixel, 0).rgb;
+                float error = abs(currentLuma - Luma(previous)) +
+                              0.20 * dot(abs(current - previous), vec3(0.333333));
+                // Prefer shorter vectors when matches are nearly equivalent.
+                error += 0.0005 * dot(vec2(offset), vec2(offset));
+                if (error < bestError) {
+                    bestError = error;
+                    bestOffset = offset;
+                }
+            }
+        }
+    }
+    if (bestError > 0.12 || params.reset != 0u) {
+        bestOffset = ivec2(0);
+    }
+    vec2 motion = -2.0 * vec2(bestOffset) / vec2(params.renderSize);
+    vec2 encoded = motion * 0.2495 + vec2(32767.0 / 65535.0);
+    imageStore(ReconstructedDepth, pixel, vec4(0.5, 0.0, 0.0, 0.0));
+    imageStore(EncodedVelocity, pixel, vec4(encoded, 0.0, 0.0));
+    // Arm ASR/FSR2 consumes current-to-previous motion which becomes pixel
+    // displacement after multiplication by motionVectorScale=renderSize.
+    imageStore(RawVelocity, pixel,
+               vec4(vec2(bestOffset) / vec2(params.renderSize), 0.0, 0.0));
+    imageStore(CurrentColorHistory, pixel, vec4(current, 1.0));
+}

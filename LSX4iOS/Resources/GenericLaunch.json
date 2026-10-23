@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "environment": {
+    "LSX4_APPLE_MANAGED_LAUNCH": "options",
+    "LSX4_APPLE_MONO_SELFCHECK_OBJECTS": "1",
+    "LSX4_APPLE_MANAGED_READBACK_MODE": "1",
+    "LSX4_APPLE_RENDER_LAUNCH": "on",
+    "LSX4_APPLE_VULKAN_POLICY": "on",
+    "LSX4_APPLE_RENDER_DIAGNOSTICS": "quiet",
+    "LSX4_APPLE_PHYSICAL_DRS_POLICY": "mapped",
+    "LSX4_APPLE_CPU_BACKEND": "fex",
+    "LSX4_PROBE_PREPARED_POOL_MIB": "512"
+  }
+}

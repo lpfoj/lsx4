@@ -1,0 +1,3 @@
+// Generated from the unchanged common tiling shader.
+#pragma once
+inline constexpr char SharedTilingSource[]=R"lsx4glsl(@LSX4_TILING_SOURCE@)lsx4glsl";

@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "title": "CUSA16209",
+  "profileSha256": "e1251e8b413057a803889b2760bcfe1e676d27415b6c9cfb732ad739f9cf7765",
+  "backendDecision": {
+    "requested": "auto",
+    "effective": "fex",
+    "reason": "frozen-gameplay-backend",
+    "profileSha256": "e1251e8b413057a803889b2760bcfe1e676d27415b6c9cfb732ad739f9cf7765",
+    "currentPolicyFields": [],
+    "profilePolicy": {
+      "execution_mode": 0,
+      "fast_memory": 1,
+      "memory_manager": 1,
+      "ignore_bad_accesses": 0
+    }
+  },
+  "environment": {
+    "LSX4_APPLE_MANAGED_LAUNCH": "options",
+    "LSX4_APPLE_MONO_SELFCHECK_OBJECTS": "1",
+    "LSX4_APPLE_MANAGED_READBACK_MODE": "1",
+    "LSX4_APPLE_RENDER_LAUNCH": "on",
+    "LSX4_APPLE_VULKAN_POLICY": "on",
+    "LSX4_APPLE_RENDER_DIAGNOSTICS": "quiet",
+    "LSX4_APPLE_PHYSICAL_DRS_POLICY": "mapped",
+    "LSX4_APPLE_CPU_BACKEND": "fex",
+    "LSX4_PROBE_PREPARED_POOL_MIB": "512"
+  }
+}

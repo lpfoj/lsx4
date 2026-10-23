@@ -1,0 +1,14 @@
+build/
+.build/
+DerivedData/
+*.o
+*.a
+*.ipa
+*.dylib
+*.mobileprovision
+*.p12
+*.pem
+*.key
+__pycache__/
+target/
+.DS_Store

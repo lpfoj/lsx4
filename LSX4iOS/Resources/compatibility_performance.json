@@ -1,0 +1,39 @@
+{
+  "captured": "2026-10-09",
+  "kind": "sampled_gameplay_hud_not_benchmark",
+  "videos": [
+    {"id": "CQpTIQlKarM", "seconds": 4382, "device": "Vivo / Snapdragon 8 Gen 5", "device_source": "user_confirmed"},
+    {"id": "4UmC0u8DJmY", "seconds": 4541, "device": "Vivo / Snapdragon 8 Gen 5", "device_source": "user_confirmed"}
+  ],
+  "samples": {
+    "bloodborne.jpg": [{"video": "CQpTIQlKarM", "second": 45, "fps": 51}, {"video": "CQpTIQlKarM", "second": 103, "fps": 36}],
+    "inside.jpg": [{"video": "CQpTIQlKarM", "second": 438, "fps": 36}],
+    "dreaming-sarah.jpg": [{"video": "CQpTIQlKarM", "second": 663, "fps": 45}],
+    "owlboy.jpg": [{"video": "CQpTIQlKarM", "second": 906, "fps": 60}],
+    "dead-cells.jpg": [{"video": "CQpTIQlKarM", "second": 1314, "fps": 60}],
+    "medievil.jpg": [{"video": "CQpTIQlKarM", "second": 1752, "fps": 60}],
+    "hyper-light-drifter.jpg": [{"video": "CQpTIQlKarM", "second": 2191, "fps": 30}],
+    "sonic-mania.jpg": [{"video": "CQpTIQlKarM", "second": 2399, "fps": 60}],
+    "cyber-shadow.jpg": [{"video": "CQpTIQlKarM", "second": 3067, "fps": 50}],
+    "nidhogg.jpg": [{"video": "CQpTIQlKarM", "second": 3505, "fps": 60}],
+    "just-shapes-and-beats.jpg": [{"video": "CQpTIQlKarM", "second": 4004, "fps": 60}]
+  },
+  "gen3_user_estimate": {
+    "small_indie_fps": [50, 60],
+    "aaa_delta_fps": -10,
+    "aaa": ["bloodborne.jpg"],
+    "small_indie": [
+      "limbo.jpg", "sonic-mania.jpg", "hyper-light-drifter.jpg", "hotline-miami-2.jpg", "owlboy.jpg",
+      "shovel-knight.jpg", "rain-world.jpg", "nidhogg.jpg", "nidhogg-2.jpg", "deltarune.jpg",
+      "just-shapes-and-beats.jpg", "undertale.jpg", "downwell.jpg", "minit.jpg", "the-binding-of-isaac-rebirth.jpg",
+      "another-world.jpg", "axiom-verge-2.jpg", "cyber-shadow.jpg", "dark-devotion.jpg", "dead-cells.jpg",
+      "dreaming-sarah.jpg", "fight-n-rage.jpg", "hillbilly-doomsday.jpg", "lucy-dreaming.jpg", "not-a-hero.jpg",
+      "nuclear-throne.jpg", "perfect-universe.jpg", "replay-vhs-is-not-dead.jpg", "spider-rite-of-the-shrouded-moon.jpg",
+      "toto-temple-deluxe.jpg", "cosmophony.jpg", "old-mans-journey.png", "a-short-hike.jpg", "islets.png",
+      "the-messenger.png", "gonner.png", "mega-shoot.png", "retrace-memories-of-death.png", "farlands-journey.png",
+      "chained-echoes.png", "turnip-boy-commits-tax-evasion.png", "bonfire-peaks.png", "rogue-legacy-2.png",
+      "dandara.png", "despots-game.png", "the-gardens-between.png", "carto.png", "far-lone-sails.png",
+      "ultimate-chicken-horse.png", "i-ai.jpg", "thomas-was-alone.png", "dont-bite-me-bro.png", "broforce.png"
+    ]
+  }
+}

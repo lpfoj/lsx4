@@ -1,0 +1,145 @@
+{
+  "sourceReportSha256": "a705b465c00461609d6c3af2b2b6297fe627205a76bbfe732559a71d814e27c1",
+  "selection": "Accepted visually reviewed iPhone JIT gameplay windows",
+  "order": "Descending full-precision observedGameplayFps; original report order for ties",
+  "titles": [
+    {
+      "id": "CUSA05667",
+      "title": "Rain World",
+      "jitGameplayFps": 60.01852478512845,
+      "runId": "cbe5e09b-78ff-4489-93c5-89a1d55e2729"
+    },
+    {
+      "id": "CUSA23985",
+      "title": "Carto",
+      "jitGameplayFps": 60.00346493776407,
+      "runId": "4c5e7e46-3468-47c9-95a6-bd81caef16e1"
+    },
+    {
+      "id": "CUSA09747",
+      "title": "Minit",
+      "jitGameplayFps": 59.997515602874024,
+      "runId": "918ff7c7-74a2-4eb2-9a8d-dfd5b8e1204c"
+    },
+    {
+      "id": "CUSA59042",
+      "title": "Mega Shoot",
+      "jitGameplayFps": 59.99604338586512,
+      "runId": "7d42afac-cae0-426f-9ae7-4fa731b93928"
+    },
+    {
+      "id": "CUSA04550",
+      "title": "Downwell",
+      "jitGameplayFps": 59.99526894106829,
+      "runId": "27bc4a63-cb28-41e3-99a9-81580f9d21c8"
+    },
+    {
+      "id": "CUSA00792",
+      "title": "The Binding of Isaac: Rebirth",
+      "jitGameplayFps": 59.99518301171384,
+      "runId": "ad7ec629-938a-461d-ba57-d0a1ec21e2ac"
+    },
+    {
+      "id": "CUSA52139",
+      "title": "Islets",
+      "jitGameplayFps": 59.99136811695257,
+      "runId": "a9b815b3-d7fa-4511-b882-f27f7a1531b1"
+    },
+    {
+      "id": "CUSA00920",
+      "title": "Nidhogg",
+      "jitGameplayFps": 59.991226783018895,
+      "runId": "fa8a8863-1be9-48a4-8f93-0977d5d5f58a"
+    },
+    {
+      "id": "CUSA01867",
+      "title": "Shovel Knight",
+      "jitGameplayFps": 59.98992106846983,
+      "runId": "53180448-488b-4bad-aa70-7fcc13e5b484"
+    },
+    {
+      "id": "CUSA02473",
+      "title": "Spider: Rite of the Shrouded Moon",
+      "jitGameplayFps": 59.989723385502074,
+      "runId": "0e20d7bc-19ad-4b1f-948d-ac62f046002c"
+    },
+    {
+      "id": "CUSA10749",
+      "title": "Dandara",
+      "jitGameplayFps": 59.987090903035224,
+      "runId": "43870c08-5d9e-4d7a-bbef-7c204cfd3d5a"
+    },
+    {
+      "id": "CUSA25416",
+      "title": "Ninja JaJaMaru Collection",
+      "jitGameplayFps": 59.98666345631936,
+      "runId": "e245c01a-d3dc-49ef-b65e-088c932260b8"
+    },
+    {
+      "id": "CUSA29346",
+      "title": "Axiom Verge 2",
+      "jitGameplayFps": 59.98497826195982,
+      "runId": "ef85c9ad-19a7-431a-8bd9-2fd950a04f3b"
+    },
+    {
+      "id": "CUSA07010",
+      "title": "Sonic Mania",
+      "jitGameplayFps": 59.98475974703271,
+      "runId": "839f7629-ed9e-4e52-b279-d7ca4e0355e7"
+    },
+    {
+      "id": "CUSA10484",
+      "title": "Dead Cells",
+      "jitGameplayFps": 59.98470015253516,
+      "runId": "0f4c2431-69d1-449d-8dd5-fbf4021c27d3"
+    },
+    {
+      "id": "CUSA30277",
+      "title": "A Short Hike",
+      "jitGameplayFps": 59.975928161302406,
+      "runId": "ec28f1e1-47b3-4e93-9431-f241e9017824"
+    },
+    {
+      "id": "CUSA10349",
+      "title": "Just Shapes & Beats",
+      "jitGameplayFps": 59.79819795644484,
+      "runId": "bef914c2-e355-4c79-8043-b0b24224520e"
+    },
+    {
+      "id": "CUSA00909",
+      "title": "Thomas Was Alone",
+      "jitGameplayFps": 59.5447735816414,
+      "runId": "0a9c1c04-18c6-419b-bdbf-f2b0c834dcd4"
+    },
+    {
+      "id": "CUSA14846",
+      "title": "FAR: Lone Sails",
+      "jitGameplayFps": 43.784065154287894,
+      "runId": "9825f77b-a28c-4e81-87a2-216f373a3f87"
+    },
+    {
+      "id": "CUSA03902",
+      "title": "Nuclear Throne",
+      "jitGameplayFps": 30.046288031450665,
+      "runId": "68f82f69-d8c3-4e91-9567-ae3e2b775e8a"
+    },
+    {
+      "id": "CUSA09415",
+      "title": "Undertale",
+      "jitGameplayFps": 28.44136395759866,
+      "runId": "8e89db69-721e-4f4c-9f4a-fb7cf36fce28"
+    },
+    {
+      "id": "CUSA05228",
+      "title": "Jazzpunk: Director's Cut",
+      "jitGameplayFps": 20.7466258638377,
+      "runId": "cf7b9fba-2155-4290-bbdf-dc942e54bc71"
+    },
+    {
+      "id": "CUSA16209",
+      "title": "Risk of Rain 2",
+      "jitGameplayFps": 12.899011398273624,
+      "runId": "ce56af8f-ae4a-43c1-9a06-6ad0b19ec95f"
+    }
+  ]
+}

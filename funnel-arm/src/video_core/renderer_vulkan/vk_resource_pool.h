@@ -1,0 +1,101 @@
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <deque>
+#include <vector>
+#include <boost/container/static_vector.hpp>
+#include <tsl/robin_map.h>
+
+#include "common/types.h"
+#include "video_core/renderer_vulkan/vk_common.h"
+
+namespace Vulkan {
+
+class Instance;
+class MasterSemaphore;
+
+class ResourcePool {
+public:
+    explicit ResourcePool() = default;
+    explicit ResourcePool(MasterSemaphore* master_semaphore, std::size_t grow_step);
+    virtual ~ResourcePool() = default;
+
+    ResourcePool& operator=(ResourcePool&&) noexcept = default;
+    ResourcePool(ResourcePool&&) noexcept = default;
+
+    ResourcePool& operator=(const ResourcePool&) = default;
+    ResourcePool(const ResourcePool&) = default;
+
+protected:
+    std::size_t CommitResource();
+
+    virtual void Allocate(std::size_t begin, std::size_t end) = 0;
+
+private:
+    std::size_t ManageOverflow();
+
+protected:
+    MasterSemaphore* master_semaphore{nullptr};
+    std::size_t grow_step = 0;
+    std::size_t hint_iterator = 0;
+    std::vector<u64> ticks;
+};
+
+class CommandPool final : public ResourcePool {
+public:
+    explicit CommandPool(
+        const Instance& instance, MasterSemaphore* master_semaphore,
+        vk::CommandBufferLevel level = vk::CommandBufferLevel::ePrimary);
+    ~CommandPool() override;
+
+    void Allocate(std::size_t begin, std::size_t end) override;
+
+    vk::CommandBuffer Commit();
+
+private:
+    const Instance& instance;
+    vk::CommandBufferLevel level;
+    bool trace_exact_turnip_a750{};
+    u64 allocation_batches{};
+    vk::UniqueCommandPool cmd_pool;
+    std::vector<vk::CommandBuffer> cmd_buffers;
+};
+
+class DescriptorHeap final {
+    static constexpr u32 DescriptorSetBatchCapacity = 32;
+
+public:
+    explicit DescriptorHeap(const Instance& instance, MasterSemaphore* master_semaphore,
+                            std::span<const vk::DescriptorPoolSize> pool_sizes,
+                            u32 descriptor_heap_count = 1024);
+    ~DescriptorHeap();
+
+    vk::DescriptorSet Commit(vk::DescriptorSetLayout set_layout);
+
+private:
+    void CreateDescriptorPool();
+
+private:
+    vk::Device device;
+    MasterSemaphore* master_semaphore;
+    u32 descriptor_heap_count;
+    u32 descriptor_set_batch{DescriptorSetBatchCapacity};
+    bool trace_exact_qti_a750{};
+    u64 commit_count{};
+    u64 cached_set_hits{};
+    u64 allocation_batches{};
+    u64 pool_rollovers{};
+    u64 pool_resets{};
+    u64 pools_created{};
+    u64 peak_pending_pools{};
+    std::span<const vk::DescriptorPoolSize> pool_sizes;
+    vk::DescriptorPool curr_pool;
+    std::deque<std::pair<vk::DescriptorPool, u64>> pending_pools;
+    using DescSetBatch =
+        boost::container::static_vector<vk::DescriptorSet, DescriptorSetBatchCapacity>;
+    tsl::robin_map<u64, DescSetBatch> descriptor_sets;
+};
+
+}

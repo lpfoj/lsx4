@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "title": "CUSA25391",
+  "profileSha256": "6271a8516c36f426e4b3aef24a54f73bc5b9d09d0afcba9ae2dafa7c0021fb55",
+  "backendDecision": {
+    "requested": "auto",
+    "effective": "fex",
+    "reason": "profile-allows-fex",
+    "profileSha256": "6271a8516c36f426e4b3aef24a54f73bc5b9d09d0afcba9ae2dafa7c0021fb55",
+    "currentPolicyFields": [],
+    "profilePolicy": {
+      "execution_mode": 0,
+      "fast_memory": 1,
+      "memory_manager": 1,
+      "ignore_bad_accesses": 0
+    }
+  },
+  "environment": {
+    "LSX4_APPLE_MANAGED_LAUNCH": "options",
+    "LSX4_APPLE_MONO_SELFCHECK_OBJECTS": "1",
+    "LSX4_APPLE_MANAGED_READBACK_MODE": "1",
+    "LSX4_APPLE_RENDER_LAUNCH": "on",
+    "LSX4_APPLE_VULKAN_POLICY": "on",
+    "LSX4_APPLE_RENDER_DIAGNOSTICS": "quiet",
+    "LSX4_APPLE_PHYSICAL_DRS_POLICY": "mapped",
+    "LSX4_APPLE_CPU_BACKEND": "fex",
+    "LSX4_PROBE_PREPARED_POOL_MIB": "512"
+  }
+}

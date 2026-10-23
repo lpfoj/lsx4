@@ -1,0 +1,163 @@
+[
+  {
+    "id": "CUSA05667",
+    "title": "Rain World",
+    "fps": 60.01852478512845,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA23985",
+    "title": "Carto",
+    "fps": 60.00346493776407,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA09747",
+    "title": "Minit",
+    "fps": 59.997515602874024,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA59042",
+    "title": "Mega Shoot",
+    "fps": 59.99604338586512,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA04550",
+    "title": "Downwell",
+    "fps": 59.99526894106829,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA00792",
+    "title": "The Binding of Isaac: Rebirth",
+    "fps": 59.99518301171384,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA52139",
+    "title": "Islets",
+    "fps": 59.99136811695257,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA00920",
+    "title": "Nidhogg",
+    "fps": 59.991226783018895,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA01867",
+    "title": "Shovel Knight",
+    "fps": 59.98992106846983,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA02473",
+    "title": "Spider: Rite of the Shrouded Moon",
+    "fps": 59.989723385502074,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA10749",
+    "title": "Dandara",
+    "fps": 59.987090903035224,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA25416",
+    "title": "Ninja JaJaMaru Collection",
+    "fps": 59.98666345631936,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA29346",
+    "title": "Axiom Verge 2",
+    "fps": 59.98497826195982,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA07010",
+    "title": "Sonic Mania",
+    "fps": 59.98475974703271,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA10484",
+    "title": "Dead Cells",
+    "fps": 59.98470015253516,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA30277",
+    "title": "A Short Hike",
+    "fps": 59.975928161302406,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA10349",
+    "title": "Just Shapes & Beats",
+    "fps": 59.79819795644484,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA00909",
+    "title": "Thomas Was Alone",
+    "fps": 59.5447735816414,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA14846",
+    "title": "FAR: Lone Sails",
+    "fps": 43.784065154287894,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA03902",
+    "title": "Nuclear Throne",
+    "fps": 30.046288031450665,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA09415",
+    "title": "Undertale",
+    "fps": 28.44136395759866,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA05228",
+    "title": "Jazzpunk: Director's Cut",
+    "fps": 20.7466258638377,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  },
+  {
+    "id": "CUSA16209",
+    "title": "Risk of Rain 2",
+    "fps": 12.899011398273624,
+    "build": "128.9101",
+    "scope": "Prior bounded iPhone JIT gameplay observation; not full-game acceptance or a fresh measurement."
+  }
+]

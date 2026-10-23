@@ -1,0 +1,21 @@
+[package]
+name = "lsx4-pkg-import"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+path = "lib.rs"
+
+[dependencies]
+memmap2 = "0.9"
+rayon = "1.10"
+orbis-pkg = { path = "vendor/orbis/orbis-pkg" }
+orbis-pkg-util = { path = "vendor/orbis/orbis-pkg-util", default-features = false }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "unwind"

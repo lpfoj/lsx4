@@ -1,0 +1,2153 @@
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdarg>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <span>
+#include <stop_token>
+#include <thread>
+#include <utility>
+#include <vector>
+#include <magic_enum/magic_enum.hpp>
+#define SDL_MAIN_HANDLED 1
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <sys/syscall.h>
+#include <sys/system_properties.h>
+#include <unistd.h>
+#endif
+#include <SDL3/SDL_error.h>
+#include <SDL3/SDL_init.h>
+#include <SDL3/SDL_main.h>
+
+#include "common/assert.h"
+#include "common/config.h"
+#include "common/logging/log.h"
+#include "common/thread.h"
+#include "common/cpu_tuning_policy.h"
+#include "core/libraries/audio/audioout.h"
+#include "core/libraries/audio/audioout_backend.h"
+#include "core/libraries/audio/audioout_error.h"
+#include "core/libraries/kernel/time.h"
+#include "core/libraries/libs.h"
+
+namespace Libraries::AudioOut {
+
+#ifdef __ANDROID__
+static_assert(sizeof(OrbisAudioOutParamExtendedInformation) == sizeof(u32));
+static_assert(Core::AeroLib::HleAbiDetail::TypeAbi<
+                  OrbisAudioOutParamExtendedInformation>::supported);
+static_assert(Core::AeroLib::HleAbiDetail::TypeAbi<
+                  OrbisAudioOutParamExtendedInformation>::classes[0] ==
+              Core::AeroLib::AndroidX64SysVClass::Integer);
+#endif
+
+std::array<std::shared_ptr<PortOut>, ORBIS_AUDIO_OUT_NUM_PORTS> port_table{};
+std::shared_mutex port_table_mutex;
+std::mutex port_allocation_mutex;
+
+static std::unique_ptr<AudioOutBackend> audio;
+static std::atomic<int> lazy_init{0};
+static std::atomic_bool host_output_enabled{true};
+static std::atomic_bool session_paused{false};
+static std::mutex audio_lifecycle_mutex;
+
+#ifdef __ANDROID__
+static void AndroidAudioOutLog(const char* format, ...);
+#endif
+
+void SetHostOutputEnabled(const bool enabled) {
+    const bool previous = host_output_enabled.exchange(enabled, std::memory_order_acq_rel);
+#ifdef __ANDROID__
+    if (previous != enabled) {
+        AndroidAudioOutLog("[LSX4_AUDIO_STATE] op=host_output enabled=%d", enabled ? 1 : 0);
+    }
+#endif
+}
+
+bool IsHostOutputEnabled() {
+    return host_output_enabled.load(std::memory_order_acquire);
+}
+
+static bool ExecutorLiveNullAudioEnabled() {
+    const char* value = std::getenv("EXECUTOR_LIVE_AUDIO_NULL_OUTPUT");
+    return value && value[0] != '\0' && value[0] != '0';
+}
+
+static bool ExecutorLiveNullAudioFastOutputEnabled() {
+    const char* value = std::getenv("EXECUTOR_LIVE_AUDIO_NULL_FAST_OUTPUT");
+    return value && value[0] != '\0' && value[0] != '0';
+}
+
+static void ExecutorLiveNullAudioPace(u32 buffer_frames, u32 sample_rate) {
+    if (buffer_frames == 0 || sample_rate == 0) {
+        return;
+    }
+    const auto wait_us = (1000000ULL * static_cast<unsigned long long>(buffer_frames)) /
+                         static_cast<unsigned long long>(sample_rate);
+    if (wait_us != 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
+    }
+}
+
+#ifdef __ANDROID__
+static void AndroidAudioOutLog(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    __android_log_vprint(ANDROID_LOG_INFO, "LSX4Native", format, args);
+    va_end(args);
+}
+
+static void AndroidAudioProbeWarn(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    __android_log_vprint(ANDROID_LOG_WARN, "LSX4AudioProbe", format, args);
+    va_end(args);
+}
+
+enum class AndroidAudioProbeMode : u8 {
+    Disabled,
+    All,
+    FirstS16Stereo48k1024,
+};
+
+static AndroidAudioProbeMode AndroidAudioProbeModeRequested() {
+    char value[PROP_VALUE_MAX]{};
+    if (__system_property_get("debug.lsx4.audio_probe", value) <= 0) {
+        return AndroidAudioProbeMode::Disabled;
+    }
+    if (value[0] == '1') {
+        return AndroidAudioProbeMode::All;
+    }
+    if (std::strcmp(value, "s16-2ch-48k-1024") == 0) {
+        return AndroidAudioProbeMode::FirstS16Stereo48k1024;
+    }
+    return AndroidAudioProbeMode::Disabled;
+}
+
+static bool AndroidAudioProbeMatches(const PortOut& port, const AndroidAudioProbeMode mode) {
+    if (mode == AndroidAudioProbeMode::All) {
+        return true;
+    }
+    return mode == AndroidAudioProbeMode::FirstS16Stereo48k1024 &&
+           !port.format_info.is_float && port.format_info.sample_size == sizeof(s16) &&
+           port.format_info.num_channels == 2 && port.sample_rate == 48000 &&
+           port.buffer_frames == 1024;
+}
+
+static u64 AndroidAudioProbeHash(const void* data, const size_t size) {
+    constexpr u64 Offset = UINT64_C(1469598103934665603);
+    constexpr u64 Prime = UINT64_C(1099511628211);
+    const auto* bytes = static_cast<const u8*>(data);
+    u64 hash = Offset;
+    size_t offset{};
+    for (; offset + sizeof(u64) <= size; offset += sizeof(u64)) {
+        u64 word{};
+        std::memcpy(&word, bytes + offset, sizeof(word));
+        hash ^= word;
+        hash *= Prime;
+    }
+    for (; offset < size; ++offset) {
+        hash ^= bytes[offset];
+        hash *= Prime;
+    }
+    return hash;
+}
+
+static void AndroidAudioProbeCopy(PortOut& port, const u8 slot, void* destination,
+                                  const void* source, const size_t size, const u64 sequence,
+                                  const s32 handle, const u64 arrival_ns) {
+    const AndroidAudioProbeMode mode = AndroidAudioProbeModeRequested();
+    const bool enabled = AndroidAudioProbeMatches(port, mode);
+    if (!enabled) {
+        port.diagnostic_probe_active = false;
+        port.diagnostic_probe_exhausted = false;
+        port.diagnostic_slot_probe_ordinal[slot] = 0;
+        std::memcpy(destination, source, size);
+        return;
+    }
+
+    const bool first_s16_block = mode == AndroidAudioProbeMode::FirstS16Stereo48k1024;
+    if (port.diagnostic_probe_exhausted) {
+        port.diagnostic_slot_probe_ordinal[slot] = 0;
+        std::memcpy(destination, source, size);
+        return;
+    }
+    if (first_s16_block && !port.diagnostic_probe_active) {
+        const auto* bytes = static_cast<const u8*>(source);
+        if (std::all_of(bytes, bytes + size, [](const u8 byte) { return byte == 0; })) {
+            port.diagnostic_slot_probe_ordinal[slot] = 0;
+            std::memcpy(destination, source, size);
+            return;
+        }
+    }
+
+    if (!port.diagnostic_probe_active && !port.diagnostic_probe_exhausted) {
+        port.diagnostic_slot_hash.fill(0);
+        port.diagnostic_slot_sequence.fill(0);
+        port.diagnostic_slot_probe_ordinal.fill(0);
+        port.diagnostic_previous_hash = 0;
+        port.diagnostic_two_back_hash = 0;
+        port.diagnostic_probe_ordinal = 0;
+        port.diagnostic_last_arrival_ns = 0;
+        port.diagnostic_last_submit_ns = 0;
+        port.diagnostic_arrival_delta_sum_ns = 0;
+        port.diagnostic_submit_delta_sum_ns = 0;
+        port.diagnostic_arrival_delta_min_ns = std::numeric_limits<u64>::max();
+        port.diagnostic_arrival_delta_max_ns = 0;
+        port.diagnostic_submit_delta_min_ns = std::numeric_limits<u64>::max();
+        port.diagnostic_submit_delta_max_ns = 0;
+        port.diagnostic_timing_samples = 0;
+        port.diagnostic_exact_n2_count = 0;
+        port.diagnostic_dup_arrival_late_count = 0;
+        port.diagnostic_dup_arrival_ontime_count = 0;
+        port.diagnostic_unique_arrival_late_count = 0;
+        port.diagnostic_unique_arrival_ontime_count = 0;
+        port.diagnostic_probe_active = true;
+    }
+    if (!port.diagnostic_probe_active) {
+        port.diagnostic_slot_probe_ordinal[slot] = 0;
+        std::memcpy(destination, source, size);
+        return;
+    }
+
+    const u64 probe_limit = first_s16_block ? 1 : 128;
+    const u64 ordinal = ++port.diagnostic_probe_ordinal;
+    const u64 submit_ns = AudioMonotonicNanoseconds();
+    const u64 arrival_delta_ns = port.diagnostic_last_arrival_ns == 0
+                                     ? 0
+                                     : arrival_ns - port.diagnostic_last_arrival_ns;
+    const u64 submit_delta_ns = port.diagnostic_last_submit_ns == 0
+                                    ? 0
+                                    : submit_ns - port.diagnostic_last_submit_ns;
+    const u64 wait_ns = submit_ns - arrival_ns;
+    const u64 old_sequence = port.diagnostic_slot_sequence[slot];
+    const u64 recycled_hash = old_sequence == 0 ? 0 : AndroidAudioProbeHash(destination, size);
+    const u64 guest_pre_hash = AndroidAudioProbeHash(source, size);
+    const bool exact_recycled = old_sequence + 2 == sequence &&
+                                std::memcmp(source, destination, size) == 0;
+    std::memcpy(destination, source, size);
+    const u64 guest_post_hash = AndroidAudioProbeHash(source, size);
+    const u64 copied_hash = AndroidAudioProbeHash(destination, size);
+    const bool same_previous = port.diagnostic_previous_hash != 0 &&
+                               guest_pre_hash == port.diagnostic_previous_hash;
+    const bool same_two_back = port.diagnostic_two_back_hash != 0 &&
+                               guest_pre_hash == port.diagnostic_two_back_hash;
+    const bool stable_copy = guest_pre_hash == guest_post_hash && guest_pre_hash == copied_hash;
+
+    const u64 expected_period_ns =
+        (UINT64_C(1000000000) * port.buffer_frames) / std::max<u32>(port.sample_rate, 1);
+    const bool has_timing_sample = arrival_delta_ns != 0 && submit_delta_ns != 0;
+    const bool arrival_late = has_timing_sample &&
+                              arrival_delta_ns > expected_period_ns + UINT64_C(2000000);
+    if (has_timing_sample) {
+        ++port.diagnostic_timing_samples;
+        port.diagnostic_arrival_delta_sum_ns += arrival_delta_ns;
+        port.diagnostic_submit_delta_sum_ns += submit_delta_ns;
+        port.diagnostic_arrival_delta_min_ns =
+            std::min(port.diagnostic_arrival_delta_min_ns, arrival_delta_ns);
+        port.diagnostic_arrival_delta_max_ns =
+            std::max(port.diagnostic_arrival_delta_max_ns, arrival_delta_ns);
+        port.diagnostic_submit_delta_min_ns =
+            std::min(port.diagnostic_submit_delta_min_ns, submit_delta_ns);
+        port.diagnostic_submit_delta_max_ns =
+            std::max(port.diagnostic_submit_delta_max_ns, submit_delta_ns);
+        if (exact_recycled) {
+            ++port.diagnostic_exact_n2_count;
+            if (arrival_late) {
+                ++port.diagnostic_dup_arrival_late_count;
+            } else {
+                ++port.diagnostic_dup_arrival_ontime_count;
+            }
+        } else if (arrival_late) {
+            ++port.diagnostic_unique_arrival_late_count;
+        } else {
+            ++port.diagnostic_unique_arrival_ontime_count;
+        }
+    }
+
+    port.diagnostic_slot_hash[slot] = copied_hash;
+    port.diagnostic_slot_sequence[slot] = sequence;
+    port.diagnostic_slot_probe_ordinal[slot] = ordinal;
+    port.diagnostic_two_back_hash = port.diagnostic_previous_hash;
+    port.diagnostic_previous_hash = guest_pre_hash;
+    port.diagnostic_last_arrival_ns = arrival_ns;
+    port.diagnostic_last_submit_ns = submit_ns;
+
+    if (ordinal <= 8 || same_previous || same_two_back || exact_recycled || !stable_copy) {
+        AndroidAudioProbeWarn(
+            "[EXECUTOR_AUDIO_SLOT_SUBMIT] ordinal=%llu seq=%llu slot=%u oldSeq=%llu "
+            "guestPre=%016llx guestPost=%016llx recycled=%016llx copied=%016llx "
+            "same1=%u same2=%u exactN2=%u stable=%u arrivalDeltaUs=%llu "
+            "submitDeltaUs=%llu waitUs=%llu late=%u handle=0x%x source=%p tid=%ld "
+            "frames=%u sampleRate=%u channels=%u sample=%s",
+            static_cast<unsigned long long>(ordinal),
+            static_cast<unsigned long long>(sequence), slot,
+            static_cast<unsigned long long>(old_sequence),
+            static_cast<unsigned long long>(guest_pre_hash),
+            static_cast<unsigned long long>(guest_post_hash),
+            static_cast<unsigned long long>(recycled_hash),
+            static_cast<unsigned long long>(copied_hash), same_previous ? 1u : 0u,
+            same_two_back ? 1u : 0u, exact_recycled ? 1u : 0u, stable_copy ? 1u : 0u,
+            static_cast<unsigned long long>(arrival_delta_ns / 1000),
+            static_cast<unsigned long long>(submit_delta_ns / 1000),
+            static_cast<unsigned long long>(wait_ns / 1000), arrival_late ? 1u : 0u, handle,
+            source, static_cast<long>(::syscall(SYS_gettid)), port.buffer_frames,
+            port.sample_rate, port.format_info.num_channels,
+            port.format_info.is_float ? "f32" : "s16");
+    }
+    if (ordinal >= probe_limit) {
+        const u64 samples = std::max<u64>(port.diagnostic_timing_samples, 1);
+        AndroidAudioProbeWarn(
+            "[EXECUTOR_AUDIO_TIMING_SUMMARY] blocks=%llu timing=%llu exactN2=%llu "
+            "dupLate=%llu dupOnTime=%llu uniqueLate=%llu uniqueOnTime=%llu "
+            "arrivalMinUs=%llu arrivalAvgUs=%llu arrivalMaxUs=%llu "
+            "submitMinUs=%llu submitAvgUs=%llu submitMaxUs=%llu expectedUs=%llu",
+            static_cast<unsigned long long>(ordinal),
+            static_cast<unsigned long long>(port.diagnostic_timing_samples),
+            static_cast<unsigned long long>(port.diagnostic_exact_n2_count),
+            static_cast<unsigned long long>(port.diagnostic_dup_arrival_late_count),
+            static_cast<unsigned long long>(port.diagnostic_dup_arrival_ontime_count),
+            static_cast<unsigned long long>(port.diagnostic_unique_arrival_late_count),
+            static_cast<unsigned long long>(port.diagnostic_unique_arrival_ontime_count),
+            static_cast<unsigned long long>(port.diagnostic_arrival_delta_min_ns / 1000),
+            static_cast<unsigned long long>(port.diagnostic_arrival_delta_sum_ns / samples / 1000),
+            static_cast<unsigned long long>(port.diagnostic_arrival_delta_max_ns / 1000),
+            static_cast<unsigned long long>(port.diagnostic_submit_delta_min_ns / 1000),
+            static_cast<unsigned long long>(port.diagnostic_submit_delta_sum_ns / samples / 1000),
+            static_cast<unsigned long long>(port.diagnostic_submit_delta_max_ns / 1000),
+            static_cast<unsigned long long>(expected_period_ns / 1000));
+        port.diagnostic_probe_active = false;
+        port.diagnostic_probe_exhausted = true;
+    }
+}
+#endif
+
+class ExecutorNullPortBackend final : public PortBackend {
+public:
+    explicit ExecutorNullPortBackend(const PortOut& port)
+        : buffer_frames(port.buffer_frames), sample_rate(port.sample_rate) {}
+
+    void Output(void*) override {
+        ExecutorLiveNullAudioPace(buffer_frames, sample_rate);
+    }
+    void OutputFloat(const float*, u32, u32) override {
+        ExecutorLiveNullAudioPace(buffer_frames, sample_rate);
+    }
+    void SetVolume(const std::array<int, 8>&) override {}
+
+private:
+    u32 buffer_frames = 0;
+    u32 sample_rate = 0;
+};
+
+class ExecutorNullAudioOut final : public AudioOutBackend {
+public:
+    std::unique_ptr<PortBackend> Open(PortOut& port) override {
+        return std::make_unique<ExecutorNullPortBackend>(port);
+    }
+};
+
+constexpr struct PortRange {
+    s32 start;
+    s32 end;
+    s32 count() const {
+        return end - start + 1;
+    }
+} port_ranges[] = {
+    {0, 7}, {8, 8}, {9, 12}, {13, 16}, {17, 20}, {21, 21}, {22, 22}, {23, 23}, {24, 24},
+};
+
+static AudioFormatInfo GetFormatInfo(const OrbisAudioOutParamFormat format) {
+    static constexpr std::array<AudioFormatInfo, 8> format_infos = {{
+        {false, 2, 1, {0}, false},
+        {false, 2, 2, {0, 1}, false},
+        {false, 2, 8, {0, 1, 2, 3, 4, 5, 6, 7}, false},
+        {true, 4, 1, {0}, false},
+        {true, 4, 2, {0, 1}, false},
+        {true, 4, 8, {0, 1, 2, 3, 4, 5, 6, 7}, false},
+        {false, 2, 8, {0, 1, 2, 3, 6, 7, 4, 5}, true},
+        {true, 4, 8, {0, 1, 2, 3, 6, 7, 4, 5}, true},
+    }};
+    const auto index = static_cast<u32>(format);
+    ASSERT_MSG(index < format_infos.size(), "Unknown audio format {}", index);
+    return format_infos[index];
+}
+
+static int GetPortRange(OrbisAudioOutPort type) {
+    s32 _type = static_cast<s32>(type);
+
+    switch (_type) {
+    case 0:
+        return 0;
+    case 1:
+        return 1;
+    case 2:
+        return 2;
+    case 3:
+        return 3;
+    case 4:
+        return 4;
+    case 5:
+        return 5;
+    case 6:
+        return 5;
+    case 7:
+        return 5;
+    case 8:
+        return 5;
+    case 126:
+        return 6;
+    case 125:
+        return 8;
+    case 127:
+        return 7;
+    default:
+        return -1;
+    }
+}
+
+static int GetPortId(s32 handle) {
+    int port_id = handle & 0xFF;
+
+    if (port_id >= ORBIS_AUDIO_OUT_NUM_PORTS) {
+        LOG_ERROR(Lib_AudioOut, "Invalid port");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT;
+    }
+
+    if ((handle & 0x3F000000) != 0x20000000) {
+        LOG_ERROR(Lib_AudioOut, "Invalid port");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT;
+    }
+
+    return port_id;
+}
+
+static s32 GetPortType(s32 handle) {
+    return (handle >> 16) & 0xFF;
+}
+
+static int AllocatePort(OrbisAudioOutPort type) {
+    int range_idx = GetPortRange(type);
+    if (range_idx < 0) {
+        return -1;
+    }
+
+    const auto& range = port_ranges[range_idx];
+    for (int i = range.start; i <= range.end; i++) {
+        std::shared_lock read_lock{port_table_mutex};
+        if (!port_table[i]) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void AdjustVol() {
+    if (lazy_init.load(std::memory_order_relaxed) == 0 && audio == nullptr) {
+        return;
+    }
+
+    std::shared_lock read_lock{port_table_mutex};
+    for (int i = 0; i < ORBIS_AUDIO_OUT_NUM_PORTS; i++) {
+        if (auto port = port_table[i]) {
+            std::unique_lock lock{port->mutex, std::try_to_lock};
+            if (lock.owns_lock()) {
+                std::scoped_lock backend_lock{port->backend_mutex};
+                if (port->impl) {
+                    port->impl->SetVolume(port->volume);
+                }
+            }
+        }
+    }
+}
+
+class SharedAudioOutputScheduler {
+public:
+    SharedAudioOutputScheduler() = default;
+
+    ~SharedAudioOutputScheduler() {
+        Stop();
+    }
+
+    void EnsureStarted() {
+        const auto policy = Common::GetCpuTuningPolicy();
+        if (policy.subsystem_multithreading == 0 ||
+            policy.separate_audio_hle_thread == 0) {
+            return;
+        }
+        std::scoped_lock lock{worker_mutex};
+        if (worker.joinable()) {
+            return;
+        }
+        worker = std::jthread([this](const std::stop_token stop) { WorkerLoop(stop); });
+    }
+
+    void NotifyReady(const u32 count = 1) {
+        pending_ready.fetch_add(count, std::memory_order_release);
+        const auto policy = Common::GetCpuTuningPolicy();
+        if (policy.subsystem_multithreading != 0 &&
+            policy.separate_audio_hle_thread != 0) {
+            EnsureStarted();
+            ready_cv.notify_one();
+        } else if (!session_paused.load(std::memory_order_acquire)) {
+            ProcessReadyBatch();
+        }
+    }
+
+    void NotifyLifecycleChange() {
+        const auto policy = Common::GetCpuTuningPolicy();
+        if (policy.subsystem_multithreading != 0 &&
+            policy.separate_audio_hle_thread != 0) {
+            ready_cv.notify_all();
+        } else if (!session_paused.load(std::memory_order_acquire) &&
+                   pending_ready.load(std::memory_order_acquire) != 0) {
+            ProcessReadyBatch();
+        }
+    }
+
+    void StopAndReset() {
+        Stop();
+        pending_ready.store(0, std::memory_order_release);
+    }
+
+private:
+    struct BatchItem {
+        std::shared_ptr<PortOut> port;
+        u8 slot{};
+        u64 sequence{};
+        u64 submit_timestamp_ns{};
+        u64 deadline_ns{};
+        float mix_gain{1.0f};
+        bool mixed_to_main{};
+        bool has_normalized_output{};
+#ifdef __ANDROID__
+        u64 expected_hash{};
+        u64 probe_ordinal{};
+#endif
+
+        [[nodiscard]] void* Data() const {
+            return port->output_buffers[slot].data();
+        }
+
+        [[nodiscard]] const float* NormalizedData() const {
+            return port->normalized_output_buffer.data();
+        }
+    };
+
+    static AudioBufferFormat MixFormat(const PortOut& port) {
+        return {
+            .sample_type =
+                port.format_info.is_float ? AudioSampleType::Float32 : AudioSampleType::S16,
+            .channels = port.format_info.num_channels,
+            .standard_8ch = port.format_info.is_std,
+        };
+    }
+
+    static bool CanMixToMain(const BatchItem& source, const BatchItem& destination) {
+        const auto& src = *source.port;
+        const auto& dst = *destination.port;
+        return src.is_mix_to_main && dst.type == OrbisAudioOutPort::Main &&
+               src.buffer_frames == dst.buffer_frames && src.sample_rate == dst.sample_rate;
+    }
+
+    static float PortMixGain(const PortOut& port) {
+        const u32 channels = std::min<u32>(port.format_info.num_channels, 8);
+        s32 volume{};
+        for (u32 channel = 0; channel < channels; ++channel) {
+            volume = std::max(volume, port.volume[channel]);
+        }
+        return std::clamp(static_cast<float>(volume) /
+                              static_cast<float>(ORBIS_AUDIO_OUT_VOLUME_0DB),
+                          0.0f, 1.0f);
+    }
+
+    void AcquireBatch(std::vector<BatchItem>& batch) {
+        std::array<std::shared_ptr<PortOut>, ORBIS_AUDIO_OUT_NUM_PORTS> snapshot{};
+        {
+            std::shared_lock table_lock{port_table_mutex};
+            snapshot = port_table;
+        }
+
+        batch.clear();
+        for (auto& port : snapshot) {
+            if (!port) {
+                continue;
+            }
+            std::unique_lock port_lock{port->mutex, std::try_to_lock};
+            if (!port_lock.owns_lock()) {
+                continue;
+            }
+            if (port->ready_slot < 0) {
+                continue;
+            }
+            const u8 slot = static_cast<u8>(port->ready_slot);
+            batch.push_back({
+                .port = port,
+                .slot = slot,
+                .sequence = port->ready_sequence,
+                .submit_timestamp_ns = port->ready_timestamp_ns,
+                .deadline_ns = port->next_output_deadline_ns,
+                .mix_gain = PortMixGain(*port),
+#ifdef __ANDROID__
+                .expected_hash = port->diagnostic_slot_hash[slot],
+                .probe_ordinal = port->diagnostic_slot_probe_ordinal[slot],
+#endif
+            });
+            port->processing_slot = static_cast<s8>(slot);
+            port->ready_slot = -1;
+            pending_ready.fetch_sub(1, std::memory_order_acq_rel);
+            RecordAudioZeroCopyHandoff();
+            port_lock.unlock();
+            port->output_cv.notify_all();
+        }
+    }
+
+    static void PaceBatch(const std::span<const BatchItem> batch) {
+        u64 target_deadline = std::numeric_limits<u64>::max();
+        for (const auto& item : batch) {
+            if (item.deadline_ns == 0) {
+                return;
+            }
+            target_deadline = std::min(target_deadline, item.deadline_ns);
+        }
+        const u64 now = AudioMonotonicNanoseconds();
+        if (target_deadline > now) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(target_deadline - now));
+        }
+    }
+
+    static u32 MixBatch(const std::span<BatchItem> batch) {
+        u32 mixed_ports{};
+        for (auto& source : batch) {
+            if (!source.port->is_mix_to_main || source.mixed_to_main) {
+                continue;
+            }
+            auto destination = std::ranges::find_if(batch, [&](const BatchItem& candidate) {
+                return &candidate != &source && !candidate.mixed_to_main &&
+                       CanMixToMain(source, candidate);
+            });
+            if (destination == batch.end()) {
+                continue;
+            }
+
+            const u32 frames = destination->port->buffer_frames;
+            const u32 destination_channels = destination->port->format_info.num_channels;
+            const size_t sample_count = static_cast<size_t>(frames) * destination_channels;
+            if (!destination->has_normalized_output) {
+                (void)ConvertAudioBufferToFloat(
+                    destination->Data(), frames, MixFormat(*destination->port),
+                    destination_channels, 1.0f,
+                    std::span<float>{destination->port->normalized_output_buffer.data(),
+                                     sample_count},
+                    destination->port->normalize_guard);
+                destination->has_normalized_output = true;
+            }
+
+            (void)ConvertAudioBufferToFloat(
+                source.Data(), frames, MixFormat(*source.port), destination_channels,
+                source.mix_gain,
+                std::span<float>{source.port->mix_scratch_buffer.data(), sample_count},
+                source.port->normalize_guard);
+            const AudioBufferFormat normalized_format{
+                .sample_type = AudioSampleType::Float32,
+                .channels = static_cast<u8>(destination_channels),
+                .standard_8ch = false,
+            };
+            (void)MixAudioBufferInPlace(destination->port->normalized_output_buffer.data(),
+                                        source.port->mix_scratch_buffer.data(), frames,
+                                        normalized_format, 1.0f, destination->port->mix_guard);
+            source.mixed_to_main = true;
+            ++mixed_ports;
+        }
+        return mixed_ports;
+    }
+
+    static void OutputBatch(const std::span<BatchItem> batch) {
+        if (!IsHostOutputEnabled()) {
+            u64 longest_period_ns{};
+            for (const auto& item : batch) {
+                if (item.port->sample_rate != 0) {
+                    longest_period_ns = std::max(longest_period_ns, UINT64_C(1000000000) *
+                                                                        item.port->buffer_frames /
+                                                                        item.port->sample_rate);
+                }
+            }
+            if (longest_period_ns != 0) {
+                std::this_thread::sleep_for(std::chrono::nanoseconds(longest_period_ns));
+            }
+            return;
+        }
+
+        for (auto& item : batch) {
+            if (item.mixed_to_main) {
+                continue;
+            }
+#ifdef __ANDROID__
+            u64 hash_before{};
+            if (item.probe_ordinal != 0) {
+                hash_before = AndroidAudioProbeHash(item.Data(), item.port->BufferSize());
+                if (item.probe_ordinal <= 8 || hash_before != item.expected_hash) {
+                    AndroidAudioProbeWarn(
+                        "[EXECUTOR_AUDIO_SLOT_ACQUIRE] ordinal=%llu seq=%llu slot=%u "
+                        "expected=%016llx actual=%016llx match=%u",
+                        static_cast<unsigned long long>(item.probe_ordinal),
+                        static_cast<unsigned long long>(item.sequence), item.slot,
+                        static_cast<unsigned long long>(item.expected_hash),
+                        static_cast<unsigned long long>(hash_before),
+                        hash_before == item.expected_hash ? 1u : 0u);
+                }
+            }
+#endif
+            try {
+                std::scoped_lock backend_lock{item.port->backend_mutex};
+                if (item.port->impl) {
+                    if (item.has_normalized_output) {
+                        item.port->impl->OutputFloat(item.NormalizedData(),
+                                                     item.port->buffer_frames,
+                                                     item.port->format_info.num_channels);
+                    } else {
+                        item.port->impl->Output(item.Data());
+                    }
+                }
+            } catch (const std::exception& exception) {
+                LOG_ERROR(Lib_AudioOut, "Shared audio scheduler output failed: {}",
+                          exception.what());
+            } catch (...) {
+                LOG_ERROR(Lib_AudioOut, "Shared audio scheduler output failed with unknown error");
+            }
+#ifdef __ANDROID__
+            if (item.probe_ordinal != 0) {
+                const u64 hash_after =
+                    AndroidAudioProbeHash(item.Data(), item.port->BufferSize());
+                if (hash_after != hash_before) {
+                    AndroidAudioProbeWarn(
+                        "[EXECUTOR_AUDIO_SLOT_MUTATION] ordinal=%llu seq=%llu slot=%u "
+                        "before=%016llx after=%016llx",
+                        static_cast<unsigned long long>(item.probe_ordinal),
+                        static_cast<unsigned long long>(item.sequence), item.slot,
+                        static_cast<unsigned long long>(hash_before),
+                        static_cast<unsigned long long>(hash_after));
+                }
+            }
+#endif
+        }
+    }
+
+    static void CompleteBatch(const std::span<BatchItem> batch, const u64 scheduled_at_ns) {
+        const u64 completed_at_ns = AudioMonotonicNanoseconds();
+        const u64 process_time = Kernel::sceKernelGetProcessTime();
+        for (auto& item : batch) {
+            auto& port = *item.port;
+            const u64 period_ns = port.sample_rate == 0 ? 0
+                                                        : UINT64_C(1000000000) *
+                                                              port.buffer_frames / port.sample_rate;
+            std::unique_lock port_lock{port.mutex};
+            const auto observation =
+                ObserveAudioStreamConsume(port.stream_guard, item.sequence,
+                                          item.submit_timestamp_ns, completed_at_ns, period_ns);
+            (void)observation;
+            port.processing_slot = -1;
+            port.last_output_time = process_time;
+            // The reference scheduler advances its clock even when no guest buffer is ready.
+            // Do not repay such an empty missed tick by emitting later buffers in a burst.
+            const bool buffer_arrived_after_deadline =
+                item.deadline_ns != 0 && item.submit_timestamp_ns > item.deadline_ns;
+            if (period_ns == 0 || item.deadline_ns == 0 || buffer_arrived_after_deadline ||
+                scheduled_at_ns > item.deadline_ns + period_ns * UINT64_C(4)) {
+                port.next_output_deadline_ns = scheduled_at_ns + period_ns;
+            } else {
+                port.next_output_deadline_ns = item.deadline_ns + period_ns;
+            }
+            port_lock.unlock();
+            port.output_cv.notify_all();
+        }
+    }
+
+    void ProcessReadyBatch() {
+        std::vector<BatchItem> batch;
+        batch.reserve(ORBIS_AUDIO_OUT_NUM_PORTS);
+        AcquireBatch(batch);
+        if (batch.empty()) {
+            return;
+        }
+        RecordAudioSchedulerWakeup();
+        std::ranges::sort(batch, {}, [](const BatchItem& item) {
+            return std::pair{item.port->sample_rate, item.port->buffer_frames};
+        });
+        for (size_t first = 0; first < batch.size();) {
+            size_t last = first + 1;
+            while (last < batch.size() &&
+                   batch[last].port->sample_rate == batch[first].port->sample_rate &&
+                   batch[last].port->buffer_frames == batch[first].port->buffer_frames) {
+                ++last;
+            }
+            const std::span<BatchItem> cadence_group{batch.data() + first, last - first};
+            const auto batch_started = std::chrono::steady_clock::now();
+            PaceBatch(cadence_group);
+            const u64 scheduled_at_ns = AudioMonotonicNanoseconds();
+            const u32 mixed_ports = MixBatch(cadence_group);
+            OutputBatch(cadence_group);
+            CompleteBatch(cadence_group, scheduled_at_ns);
+            RecordAudioSchedulerBatch(
+                static_cast<u32>(cadence_group.size()), mixed_ports,
+                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - batch_started)
+                                     .count()));
+            first = last;
+        }
+    }
+
+    void WorkerLoop(const std::stop_token stop) {
+        Common::SetCurrentThreadName("shadPS4:AudioBatch");
+#ifdef __ANDROID__
+        AndroidAudioOutLog("[EXECUTOR_AUDIO_SCHEDULER] started mode=shared-batch");
+#endif
+        std::vector<BatchItem> batch;
+        batch.reserve(ORBIS_AUDIO_OUT_NUM_PORTS);
+        while (!stop.stop_requested()) {
+            {
+                std::unique_lock ready_lock{ready_mutex};
+                ready_cv.wait(ready_lock, stop, [this] {
+                    return !session_paused.load(std::memory_order_acquire) &&
+                           pending_ready.load(std::memory_order_acquire) != 0;
+                });
+            }
+            if (stop.stop_requested()) {
+                break;
+            }
+
+            AcquireBatch(batch);
+            if (batch.empty()) {
+                std::this_thread::yield();
+                continue;
+            }
+            // The worker already owns this local batch, so process it here
+            // without touching pending_ready a second time.
+            RecordAudioSchedulerWakeup();
+            std::ranges::sort(batch, {}, [](const BatchItem& item) {
+                return std::pair{item.port->sample_rate, item.port->buffer_frames};
+            });
+            for (size_t first = 0; first < batch.size();) {
+                size_t last = first + 1;
+                while (last < batch.size() &&
+                       batch[last].port->sample_rate == batch[first].port->sample_rate &&
+                       batch[last].port->buffer_frames == batch[first].port->buffer_frames) ++last;
+                const std::span<BatchItem> group{batch.data() + first, last - first};
+                const auto started = std::chrono::steady_clock::now();
+                PaceBatch(group);
+                const u64 scheduled = AudioMonotonicNanoseconds();
+                const u32 mixed = MixBatch(group);
+                OutputBatch(group);
+                CompleteBatch(group, scheduled);
+                RecordAudioSchedulerBatch(
+                    static_cast<u32>(group.size()), mixed,
+                    static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - started).count()));
+                first = last;
+            }
+        }
+    }
+
+    void Stop() {
+        std::jthread local;
+        {
+            std::scoped_lock lock{worker_mutex};
+            if (!worker.joinable()) {
+                return;
+            }
+            worker.request_stop();
+            ready_cv.notify_all();
+            local = std::move(worker);
+        }
+        local.join();
+    }
+
+    std::mutex worker_mutex;
+    std::mutex ready_mutex;
+    std::condition_variable_any ready_cv;
+    std::jthread worker;
+    std::atomic<u32> pending_ready{};
+};
+
+SharedAudioOutputScheduler& AudioScheduler() {
+    static SharedAudioOutputScheduler scheduler;
+    return scheduler;
+}
+
+void SetSessionPaused(const bool paused) {
+    const bool previous = session_paused.exchange(paused, std::memory_order_acq_rel);
+    if (previous == paused) {
+        return;
+    }
+    AudioScheduler().NotifyLifecycleChange();
+#ifdef __ANDROID__
+    AndroidAudioOutLog("[LSX4_AUDIO_STATE] op=session_pause paused=%d", paused ? 1 : 0);
+#endif
+}
+
+bool IsSessionPaused() {
+    return session_paused.load(std::memory_order_acquire);
+}
+
+void ResetForTitleSession() {
+    std::scoped_lock lifecycle_lock{audio_lifecycle_mutex};
+    std::unique_lock allocation_lock{port_allocation_mutex};
+
+    std::array<std::shared_ptr<PortOut>, ORBIS_AUDIO_OUT_NUM_PORTS> retired_ports{};
+    {
+        std::shared_lock table_lock{port_table_mutex};
+        retired_ports = port_table;
+    }
+
+    // Wake every guest producer before joining the consumer. This is the only
+    // lifecycle path that sets closing; a pause leaves all queue state intact.
+    for (auto& port : retired_ports) {
+        if (!port) {
+            continue;
+        }
+        {
+            std::scoped_lock port_lock{port->mutex};
+            port->closing = true;
+            port->ready_slot = -1;
+        }
+        port->output_cv.notify_all();
+    }
+
+    AudioScheduler().StopAndReset();
+    session_paused.store(false, std::memory_order_release);
+
+    {
+        std::unique_lock table_lock{port_table_mutex};
+        for (auto& port : port_table) {
+            port.reset();
+        }
+    }
+
+    // No table lock is held while AAudio/SDL callbacks and recovery workers
+    // are stopped. The scheduler is already joined, so backend destruction is
+    // single-owner and cannot race another Output() call from it.
+    for (auto& port : retired_ports) {
+        if (!port) {
+            continue;
+        }
+        std::scoped_lock backend_lock{port->backend_mutex};
+        port->impl.reset();
+    }
+    for (auto& port : retired_ports) {
+        port.reset();
+    }
+
+    audio.reset();
+    lazy_init.store(0, std::memory_order_release);
+#ifdef __ANDROID__
+    if ((SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO) != 0) {
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    }
+    AndroidAudioOutLog("[LSX4_AUDIO_STATE] op=session_reset result=clean");
+#endif
+}
+
+s32 PS4_SYSV_ABI sceAudioOutInit() {
+    LOG_TRACE(Lib_AudioOut, "called");
+
+    std::scoped_lock lifecycle_lock{audio_lifecycle_mutex};
+
+    int expected = 0;
+    if (!lazy_init.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+        if (audio == nullptr) {
+            if (ExecutorLiveNullAudioEnabled()) {
+                audio = std::make_unique<ExecutorNullAudioOut>();
+            } else {
+                audio = std::make_unique<SDLAudioOut>();
+            }
+        }
+        AudioScheduler().EnsureStarted();
+#ifdef __ANDROID__
+        AndroidAudioOutLog("[LSX4_AUDIO_STATE] op=init repeated=1 backend=%s",
+                           ExecutorLiveNullAudioEnabled() ? "null" : "sdl");
+#endif
+        return ORBIS_OK;
+    }
+
+#ifdef __ANDROID__
+    SDL_SetMainReady();
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        LOG_WARNING(Lib_AudioOut, "SDL audio subsystem init failed: {}", SDL_GetError());
+    }
+#endif
+    if (ExecutorLiveNullAudioEnabled()) {
+        audio = std::make_unique<ExecutorNullAudioOut>();
+#ifdef __ANDROID__
+        AndroidAudioOutLog("[EXECUTOR_LIVE_AUDIO_NULL] op=init backend=null");
+#endif
+    } else {
+        audio = std::make_unique<SDLAudioOut>();
+    }
+    AudioScheduler().EnsureStarted();
+
+#ifdef __ANDROID__
+    AndroidAudioOutLog("[LSX4_AUDIO_STATE] op=init repeated=0 backend=%s sdl_audio=%d",
+                       ExecutorLiveNullAudioEnabled() ? "null" : "sdl",
+                       (SDL_WasInit(SDL_INIT_AUDIO) & SDL_INIT_AUDIO) != 0 ? 1 : 0);
+#endif
+    LOG_INFO(Lib_AudioOut, "Audio system initialized");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
+                                 OrbisAudioOutPort port_type, s32 index, u32 length,
+                                 u32 sample_rate,
+                                 OrbisAudioOutParamExtendedInformation param_type) {
+    LOG_INFO(Lib_AudioOut,
+             "called, user_id={}, port_type={}({}), index={}, length={}, "
+             "sample_rate={}, data_format={}({}), attributes={}({})",
+             user_id, magic_enum::enum_name(port_type), static_cast<u32>(port_type), index, length,
+             sample_rate, magic_enum::enum_name(param_type.data_format.Value()),
+             static_cast<u32>(param_type.data_format.Value()),
+             magic_enum::enum_name(param_type.attributes.Value()),
+             static_cast<u32>(param_type.attributes.Value()));
+
+    if (lazy_init.load(std::memory_order_relaxed) == 0 || audio == nullptr) {
+        LOG_ERROR(Lib_AudioOut, "Audio out not initialized");
+        return ORBIS_AUDIO_OUT_ERROR_NOT_INIT;
+    }
+
+    if (length == 0 || length > 2048 || (length & 0xFF) != 0) {
+        LOG_ERROR(Lib_AudioOut, "Invalid size");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_SIZE;
+    }
+
+    s32 _type = static_cast<s32>(port_type);
+    u32 param_raw = param_type.Unpack();
+
+    bool is_restricted = (param_raw & ORBIS_AUDIO_OUT_PARAM_ATTR_RESTRICTED) != 0;
+    bool is_mix_to_main = (param_raw & ORBIS_AUDIO_OUT_PARAM_ATTR_MIX_TO_MAIN) != 0;
+
+    if (_type != 3 && is_mix_to_main) {
+        LOG_ERROR(Lib_AudioOut, "Invalid format");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_FORMAT;
+    }
+
+    if (_type != 0 && (param_raw & 0x70000000) != 0) {
+        LOG_ERROR(Lib_AudioOut, "Invalid format");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_FORMAT;
+    }
+
+    if ((port_type < OrbisAudioOutPort::Main || port_type > OrbisAudioOutPort::PadSpk) &&
+        (port_type != OrbisAudioOutPort::Audio3d && port_type != OrbisAudioOutPort::Aux)) {
+        LOG_ERROR(Lib_AudioOut, "Invalid port type");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
+    }
+    if (sample_rate != 48000) {
+        LOG_ERROR(Lib_AudioOut, "Invalid sample rate");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_SAMPLE_FREQ;
+    }
+
+    if (index != 0) {
+        LOG_ERROR(Lib_AudioOut, "index is not valid !=0 {}", index);
+    }
+
+    const auto format = param_type.data_format.Value();
+    if (format < OrbisAudioOutParamFormat::S16Mono ||
+        format > OrbisAudioOutParamFormat::Float_8CH_Std) {
+        LOG_ERROR(Lib_AudioOut, "Invalid format");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_FORMAT;
+    }
+    const auto attr = param_type.attributes;
+    if (attr < OrbisAudioOutParamAttr::None || attr > OrbisAudioOutParamAttr::MixToMain) {
+        LOG_ERROR(Lib_AudioOut, "Invalid format attribute");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_FORMAT;
+    }
+
+    std::unique_lock lock{port_allocation_mutex};
+
+    int port_id = AllocatePort(port_type);
+    if (port_id < 0) {
+        LOG_ERROR(Lib_AudioOut, "Error allocated port");
+        return ORBIS_AUDIO_OUT_ERROR_PORT_FULL;
+    }
+
+    std::shared_ptr<PortOut> port;
+    try {
+        port = std::make_shared<PortOut>();
+
+        port->userId = user_id;
+        port->type = static_cast<OrbisAudioOutPort>(_type);
+        port->format_info = GetFormatInfo(param_type.data_format.Value());
+        port->sample_rate = sample_rate;
+        port->buffer_frames = length;
+        port->volume.fill(ORBIS_AUDIO_OUT_VOLUME_0DB);
+        port->mixLevelPadSpk = ORBIS_AUDIO_OUT_MIXLEVEL_PADSPK_DEFAULT;
+
+        port->is_restricted = is_restricted;
+        port->is_mix_to_main = is_mix_to_main;
+
+        if (is_restricted) {
+            LOG_INFO(Lib_AudioOut, "Audio port opened with RESTRICTED attribute");
+        }
+        if (is_mix_to_main) {
+            LOG_INFO(Lib_AudioOut, "Audio port opened with MIX_TO_MAIN attribute");
+        }
+
+        port->impl = audio->Open(*port);
+        if (!port->impl) {
+            throw std::runtime_error("Failed to create audio backend");
+        }
+
+        for (auto& output_buffer : port->output_buffers) {
+            output_buffer.resize(port->BufferSize());
+        }
+        port->normalized_output_buffer.resize(static_cast<size_t>(port->buffer_frames) *
+                                              port->format_info.num_channels);
+        if (port->is_mix_to_main) {
+            port->mix_scratch_buffer.resize(static_cast<size_t>(port->buffer_frames) * 8);
+        }
+
+#ifdef __ANDROID__
+        if (ExecutorLiveNullAudioEnabled()) {
+            AndroidAudioOutLog("[EXECUTOR_LIVE_AUDIO_NULL] op=open backend=threaded port=%p "
+                               "frames=%u rate=%u channels=%u "
+                               "format=%u",
+                               port.get(), port->buffer_frames, port->sample_rate,
+                               port->format_info.num_channels,
+                               static_cast<u32>(param_type.data_format.Value()));
+        }
+#endif
+
+        {
+            std::scoped_lock backend_lock{port->backend_mutex};
+            port->impl->SetVolume(port->volume);
+        }
+
+    } catch (const std::bad_alloc&) {
+        return ORBIS_AUDIO_OUT_ERROR_OUT_OF_MEMORY;
+    } catch (const std::exception& e) {
+        LOG_ERROR(Lib_AudioOut, "Failed to open audio port: {}", e.what());
+        return ORBIS_AUDIO_OUT_ERROR_TRANS_EVENT;
+    }
+
+    {
+        std::unique_lock write_lock{port_table_mutex};
+        port_table[port_id] = port;
+    }
+
+    s32 handle = (_type << 16) | port_id | 0x20000000;
+#ifdef __ANDROID__
+    AndroidAudioOutLog(
+        "[LSX4_AUDIO_STATE] op=open handle=0x%x port=%d type=%d frames=%u rate=%u channels=%u "
+        "format=%u volume0=%d host_output=%d",
+        handle, port_id, _type, port->buffer_frames, port->sample_rate,
+        port->format_info.num_channels, static_cast<u32>(param_type.data_format.Value()),
+        port->volume[0], IsHostOutputEnabled() ? 1 : 0);
+#endif
+    return handle;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutClose(s32 handle) {
+    LOG_INFO(Lib_AudioOut, "handle = {:#x}", handle);
+
+    if (lazy_init.load(std::memory_order_relaxed) == 0 || audio == nullptr) {
+        LOG_ERROR(Lib_AudioOut, "Audio out not initialized");
+        return ORBIS_AUDIO_OUT_ERROR_NOT_INIT;
+    }
+
+    int port_id = GetPortId(handle);
+    if (port_id < 0) {
+        LOG_ERROR(Lib_AudioOut, "Invalid port id");
+        return port_id;
+    }
+
+    s32 port_type = GetPortType(handle);
+    if (port_type >= 5 && port_type <= 13) {
+        LOG_ERROR(Lib_AudioOut, "Invalid port type");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
+    }
+
+    if (!((port_type >= 0 && port_type <= 4) || port_type == 14 || port_type == 126 ||
+          port_type == 127)) {
+        LOG_ERROR(Lib_AudioOut, "Invalid port type");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
+    }
+
+    std::unique_lock lock{port_allocation_mutex};
+
+    std::shared_ptr<PortOut> port;
+    {
+        std::shared_lock read_lock{port_table_mutex};
+        port = port_table[port_id];
+    }
+
+    if (!port) {
+        LOG_ERROR(Lib_AudioOut, "Port wasn't open {}", port_id);
+        return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+    }
+
+    {
+        std::unique_lock port_lock{port->mutex};
+        port->closing = true;
+        port->output_cv.wait(port_lock, [&] { return port->IsIdle(); });
+    }
+    {
+        std::unique_lock write_lock{port_table_mutex};
+        if (port_table[port_id] == port) {
+            port_table[port_id].reset();
+        }
+    }
+    {
+        std::scoped_lock backend_lock{port->backend_mutex};
+        port->impl.reset();
+    }
+
+    LOG_DEBUG(Lib_AudioOut, "Closed audio port {}", port_id);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutGetLastOutputTime(s32 handle, u64* output_time) {
+    if (lazy_init.load(std::memory_order_relaxed) == 0 || audio == nullptr) {
+        LOG_ERROR(Lib_AudioOut, "audio is not init");
+        return ORBIS_AUDIO_OUT_ERROR_NOT_INIT;
+    }
+
+    int port_id = GetPortId(handle);
+    if (port_id < 0) {
+        LOG_ERROR(Lib_AudioOut, "Invalid port id");
+        return port_id;
+    }
+
+    if (!output_time) {
+        LOG_ERROR(Lib_AudioOut, "Invalid pointer");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_POINTER;
+    }
+
+    std::shared_ptr<PortOut> port;
+    {
+        std::shared_lock read_lock{port_table_mutex};
+        port = port_table[port_id];
+    }
+
+    if (!port) {
+        LOG_ERROR(Lib_AudioOut, "Port not opened {}", port_id);
+        return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+    }
+
+    std::unique_lock lock{port->mutex};
+    *output_time = port->last_output_time;
+
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutGetPortState(s32 handle, OrbisAudioOutPortState* state) {
+    if (lazy_init.load(std::memory_order_relaxed) == 0 || audio == nullptr) {
+        LOG_ERROR(Lib_AudioOut, "audio is not init");
+        return ORBIS_AUDIO_OUT_ERROR_NOT_INIT;
+    }
+
+    int port_id = GetPortId(handle);
+    if (port_id < 0) {
+        LOG_ERROR(Lib_AudioOut, "Invalid port id");
+        return port_id;
+    }
+
+    if (!state) {
+        LOG_ERROR(Lib_AudioOut, "Invalid pointer");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_POINTER;
+    }
+
+    std::shared_ptr<PortOut> port;
+    {
+        std::shared_lock read_lock{port_table_mutex};
+        port = port_table[port_id];
+    }
+
+    if (!port) {
+        LOG_ERROR(Lib_AudioOut, "Port is not open {}", port_id);
+        return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+    }
+
+    std::unique_lock lock{port->mutex};
+
+    switch (port->type) {
+    case OrbisAudioOutPort::Main:
+    case OrbisAudioOutPort::Bgm:
+    case OrbisAudioOutPort::Audio3d:
+        state->output = ORBIS_AUDIO_OUT_STATE_OUTPUT_CONNECTED_PRIMARY;
+        state->channel = port->format_info.num_channels > 2 ? 2 : port->format_info.num_channels;
+        break;
+    case OrbisAudioOutPort::Voice:
+    case OrbisAudioOutPort::Personal:
+        state->output = ORBIS_AUDIO_OUT_STATE_OUTPUT_CONNECTED_HEADPHONE;
+        state->channel = 1;
+        break;
+    case OrbisAudioOutPort::PadSpk:
+        state->output = ORBIS_AUDIO_OUT_STATE_OUTPUT_CONNECTED_TERTIARY;
+        state->channel = 1;
+        state->volume = 127;
+        break;
+    case OrbisAudioOutPort::Aux:
+        state->output = ORBIS_AUDIO_OUT_STATE_OUTPUT_CONNECTED_EXTERNAL;
+        state->channel = 0;
+        break;
+    default:
+        state->output = ORBIS_AUDIO_OUT_STATE_OUTPUT_UNKNOWN;
+        state->channel = 0;
+        break;
+    }
+
+    if (port->type != OrbisAudioOutPort::PadSpk) {
+        state->volume = -1;
+    }
+
+    state->rerouteCounter = 0;
+    state->flag = 0;
+    LOG_DEBUG(Lib_AudioOut,
+              "called, handle={:#x}, state={}, output={}, channel={}, volume={}, "
+              "rerouteCounter={}, flag={}",
+              handle, fmt::ptr(state), state->output, state->channel, state->volume,
+              state->rerouteCounter, state->flag);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
+    LOG_TRACE(Lib_AudioOut, "(STUBBED) called, handle={:#x}, ptr={}", handle, fmt::ptr(ptr));
+
+    if (lazy_init.load(std::memory_order_relaxed) == 0 || audio == nullptr) {
+        LOG_ERROR(Lib_AudioOut, "audio is not init");
+        return ORBIS_AUDIO_OUT_ERROR_NOT_INIT;
+    }
+
+    int port_id = GetPortId(handle);
+    if (port_id < 0) {
+        LOG_ERROR(Lib_AudioOut, "invalid port id");
+        return port_id;
+    }
+
+    s32 port_type = GetPortType(handle);
+    if (port_type >= 5 && port_type <= 13) {
+        LOG_ERROR(Lib_AudioOut, "Invalid port type");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
+    }
+
+    if (!((port_type >= 0 && port_type <= 4) || port_type == 14 || port_type == 126 ||
+          port_type == 127)) {
+        LOG_ERROR(Lib_AudioOut, "Invalid port type");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
+    }
+
+    std::shared_ptr<PortOut> port;
+    {
+        std::shared_lock read_lock{port_table_mutex};
+        port = port_table[port_id];
+    }
+
+    if (!port) {
+        LOG_ERROR(Lib_AudioOut, "Port is not opened {}", port_id);
+        return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+    }
+
+    if (ExecutorLiveNullAudioFastOutputEnabled()) {
+        const s32 samples_sent = port->buffer_frames * port->format_info.num_channels;
+        {
+            std::unique_lock lock{port->mutex};
+            port->last_output_time = Kernel::sceKernelGetProcessTime();
+        }
+        ExecutorLiveNullAudioPace(port->buffer_frames, port->sample_rate);
+#ifdef __ANDROID__
+        static std::atomic<u32> null_output_log_count{0};
+        const u32 count = null_output_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 8 || (count & 0x3ff) == 0) {
+            AndroidAudioOutLog("[EXECUTOR_LIVE_AUDIO_NULL] op=output handle=0x%x ptr=%p samples=%d "
+                               "frames=%u rate=%u count=%u",
+                               handle, ptr, samples_sent, port->buffer_frames, port->sample_rate,
+                               count);
+        }
+#endif
+        return samples_sent;
+    }
+
+    const u64 wait_started_ns = AudioMonotonicNanoseconds();
+    s32 samples_sent = 0;
+    {
+        std::unique_lock lock{port->mutex};
+        port->output_cv.wait(lock, [&] { return port->CanAcceptBuffer() || port->closing; });
+        if (port->closing) {
+            return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+        }
+
+        if (ptr != nullptr) {
+            const u8 slot = port->next_write_slot;
+            auto& output_buffer = port->output_buffers[slot];
+#ifdef __ANDROID__
+            AndroidAudioProbeCopy(*port, slot, output_buffer.data(), ptr, port->BufferSize(),
+                                  port->submitted_sequence + 1, handle, wait_started_ns);
+#else
+            std::memcpy(output_buffer.data(), ptr, port->BufferSize());
+#endif
+            const u64 sequence = ++port->submitted_sequence;
+            const u64 timestamp_ns = AudioMonotonicNanoseconds();
+            ObserveAudioStreamSubmit(port->stream_guard, sequence, timestamp_ns);
+            port->ready_slot = static_cast<s8>(slot);
+            port->ready_sequence = sequence;
+            port->ready_timestamp_ns = timestamp_ns;
+            port->next_write_slot ^= 1;
+            samples_sent = port->buffer_frames * port->format_info.num_channels;
+        }
+    }
+    if (ptr != nullptr) {
+        AudioScheduler().NotifyReady();
+        RecordAudioGuestCopy(port->BufferSize(), AudioMonotonicNanoseconds() - wait_started_ns);
+    }
+
+    return samples_sent;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
+    if (param) {
+        LOG_TRACE(Lib_AudioOut, "(STUBBED) called, param={}, num={}", fmt::ptr(param), num);
+        for (u32 i = 0; i < num; i++) {
+            LOG_TRACE(Lib_AudioOut, "  [{}] handle={:#x}, ptr={}", i, param[i].handle,
+                      fmt::ptr(param[i].ptr));
+        }
+    } else {
+        LOG_TRACE(Lib_AudioOut, "(STUBBED) called, param=nullptr, num={}", num);
+    }
+    if (lazy_init.load(std::memory_order_relaxed) == 0 || audio == nullptr) {
+        LOG_ERROR(Lib_AudioOut, "audio is not init");
+        return ORBIS_AUDIO_OUT_ERROR_NOT_INIT;
+    }
+
+    if (num == 0 || num > 25) {
+        LOG_ERROR(Lib_AudioOut, "ports is full");
+        return ORBIS_AUDIO_OUT_ERROR_PORT_FULL;
+    }
+
+    if (!param) {
+        LOG_ERROR(Lib_AudioOut, "invalid pointer");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_POINTER;
+    }
+
+    std::vector<std::shared_ptr<PortOut>> ports;
+    ports.reserve(num);
+
+    u32 buffer_frames = 0;
+
+    {
+        std::shared_lock read_lock{port_table_mutex};
+
+        for (u32 i = 0; i < num; i++) {
+            int port_id = GetPortId(param[i].handle);
+            if (port_id < 0) {
+                LOG_ERROR(Lib_AudioOut, "invalid port id");
+                return port_id;
+            }
+
+            s32 port_type = GetPortType(param[i].handle);
+            if (port_type >= 5 && port_type <= 13) {
+                LOG_ERROR(Lib_AudioOut, "Invalid port type");
+                return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
+            }
+
+            if (!((port_type >= 0 && port_type <= 4) || port_type == 14 || port_type == 126 ||
+                  port_type == 127)) {
+                LOG_ERROR(Lib_AudioOut, "Invalid port type");
+                return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
+            }
+
+            for (u32 j = 0; j < i; j++) {
+                if (param[i].handle == param[j].handle) {
+                    LOG_ERROR(Lib_AudioOut, "Duplicate audio handles: {:#x}", param[i].handle);
+                    return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT;
+                }
+            }
+
+            auto port = port_table[port_id];
+            if (!port) {
+                LOG_ERROR(Lib_AudioOut, "Port not opened {}", port_id);
+                return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+            }
+
+            ports.push_back(port);
+
+            if (i == 0) {
+                buffer_frames = port->buffer_frames;
+            } else if (port->buffer_frames != buffer_frames) {
+                LOG_ERROR(Lib_AudioOut, "Invalid port size");
+                return ORBIS_AUDIO_OUT_ERROR_INVALID_SIZE;
+            }
+        }
+    }
+
+    if (ExecutorLiveNullAudioFastOutputEnabled()) {
+        u32 sample_rate = 0;
+        for (u32 i = 0; i < ports.size(); i++) {
+            auto& port = ports[i];
+            port->last_output_time = Kernel::sceKernelGetProcessTime();
+            if (i == 0) {
+                sample_rate = port->sample_rate;
+            }
+        }
+        ExecutorLiveNullAudioPace(buffer_frames, sample_rate);
+#ifdef __ANDROID__
+        static std::atomic<u32> null_outputs_log_count{0};
+        const u32 count = null_outputs_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 8 || (count & 0x3ff) == 0) {
+            AndroidAudioOutLog(
+                "[EXECUTOR_LIVE_AUDIO_NULL] op=outputs num=%u frames=%u rate=%u count=%u", num,
+                buffer_frames, sample_rate, count);
+        }
+#endif
+        return buffer_frames;
+    }
+
+    const u64 wait_started_ns = AudioMonotonicNanoseconds();
+    std::vector<std::shared_ptr<PortOut>> lock_order = ports;
+    std::ranges::sort(lock_order, {}, [](const auto& port) {
+        return reinterpret_cast<std::uintptr_t>(port.get());
+    });
+    std::vector<std::unique_lock<std::mutex>> locks;
+    locks.reserve(num);
+    for (;;) {
+        locks.clear();
+        for (const auto& port : lock_order) {
+            locks.emplace_back(port->mutex);
+        }
+
+        std::size_t wait_index = lock_order.size();
+        for (std::size_t index = 0; index < lock_order.size(); ++index) {
+            const auto& port = lock_order[index];
+            if (port->closing) {
+                locks.clear();
+                return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+            }
+            if (!port->CanAcceptBuffer()) {
+                wait_index = index;
+                break;
+            }
+        }
+        if (wait_index == lock_order.size()) {
+            break;
+        }
+
+        // Never retain an earlier port lock while waiting for a later port.
+        // The shared scheduler completes ports one at a time and needs those
+        // same locks before it can notify output_cv.  Retaining the prefix here
+        // creates an ABBA cycle for multi-port output: the guest waits for the
+        // later port while the scheduler waits for the retained earlier one.
+        // Keep only the lock paired with the condition variable, then reacquire
+        // and validate the whole sorted set after the wake.  The normal ready
+        // path remains a single lock pass and the contended path blocks rather
+        // than polls.
+        for (std::size_t index = 0; index < locks.size(); ++index) {
+            if (index != wait_index) {
+                locks[index].unlock();
+            }
+        }
+        auto& wait_port = lock_order[wait_index];
+        wait_port->output_cv.wait(
+            locks[wait_index],
+            [&] { return wait_port->CanAcceptBuffer() || wait_port->closing; });
+        const bool closing = wait_port->closing;
+        locks.clear();
+        if (closing) {
+            return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+        }
+    }
+
+    u32 ready_count{};
+    for (u32 i = 0; i < num; ++i) {
+        auto& port = *ports[i];
+        if (param[i].ptr != nullptr) {
+            const u8 slot = port.next_write_slot;
+            auto& output_buffer = port.output_buffers[slot];
+#ifdef __ANDROID__
+            AndroidAudioProbeCopy(port, slot, output_buffer.data(), param[i].ptr,
+                                  port.BufferSize(), port.submitted_sequence + 1,
+                                  param[i].handle, wait_started_ns);
+#else
+            std::memcpy(output_buffer.data(), param[i].ptr, port.BufferSize());
+#endif
+            const u64 sequence = ++port.submitted_sequence;
+            const u64 timestamp_ns = AudioMonotonicNanoseconds();
+            ObserveAudioStreamSubmit(port.stream_guard, sequence, timestamp_ns);
+            port.ready_slot = static_cast<s8>(slot);
+            port.ready_sequence = sequence;
+            port.ready_timestamp_ns = timestamp_ns;
+            port.next_write_slot ^= 1;
+            ++ready_count;
+        }
+    }
+    locks.clear();
+    if (ready_count != 0) {
+        AudioScheduler().NotifyReady(ready_count);
+    }
+
+    const u64 copy_wait_ns = AudioMonotonicNanoseconds() - wait_started_ns;
+    for (u32 i = 0; i < num; ++i) {
+        if (param[i].ptr != nullptr) {
+            RecordAudioGuestCopy(ports[i]->BufferSize(), copy_wait_ns);
+        }
+    }
+    return buffer_frames;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetVolume(s32 handle, s32 flag, s32* vol) {
+    if (lazy_init.load(std::memory_order_relaxed) == 0 || audio == nullptr) {
+        LOG_ERROR(Lib_AudioOut, "audio is not init");
+        return ORBIS_AUDIO_OUT_ERROR_NOT_INIT;
+    }
+
+    int port_id = GetPortId(handle);
+    if (port_id < 0) {
+        LOG_ERROR(Lib_AudioOut, "invalid port_id");
+        return port_id;
+    }
+
+    s32 port_type = GetPortType(handle);
+    if (port_type >= 5 && port_type <= 13) {
+        LOG_ERROR(Lib_AudioOut, "Invalid port type");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
+    }
+
+    if (!((port_type >= 0 && port_type <= 4) || port_type == 14 || port_type == 126 ||
+          port_type == 127)) {
+        LOG_ERROR(Lib_AudioOut, "Invalid port type");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
+    }
+
+    if (!vol) {
+        LOG_ERROR(Lib_AudioOut, "Invalid pointer");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_POINTER;
+    }
+
+    static constexpr std::array<u32, 8> VolumeFlags{
+        ORBIS_AUDIO_VOLUME_FLAG_L_CH,   ORBIS_AUDIO_VOLUME_FLAG_R_CH,
+        ORBIS_AUDIO_VOLUME_FLAG_C_CH,   ORBIS_AUDIO_VOLUME_FLAG_LFE_CH,
+        ORBIS_AUDIO_VOLUME_FLAG_LS_CH,  ORBIS_AUDIO_VOLUME_FLAG_RS_CH,
+        ORBIS_AUDIO_VOLUME_FLAG_LE_CH,  ORBIS_AUDIO_VOLUME_FLAG_RE_CH,
+    };
+    const u32 channel_mask = static_cast<u32>(flag);
+    for (u32 channel = 0; channel < VolumeFlags.size(); ++channel) {
+        if ((channel_mask & VolumeFlags[channel]) != 0 &&
+            vol[channel] > ORBIS_AUDIO_OUT_VOLUME_0DB) {
+            LOG_ERROR(Lib_AudioOut, "Invalid volume for channel {}", channel);
+            return ORBIS_AUDIO_OUT_ERROR_INVALID_VOLUME;
+        }
+    }
+
+#ifdef __ANDROID__
+    static std::atomic<u32> volume_log_count{0};
+    const u32 volume_call = volume_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (volume_call <= 64) {
+        AndroidAudioOutLog(
+            "[LSX4_AUDIO_VOLUME] call=%u handle=0x%x flag=0x%x requested=%d,%d,%d,%d,%d,%d,%d,%d",
+            volume_call, handle, flag, vol[0], vol[1], vol[2], vol[3], vol[4], vol[5], vol[6],
+            vol[7]);
+    }
+#endif
+
+    std::shared_ptr<PortOut> port;
+    {
+        std::shared_lock read_lock{port_table_mutex};
+        port = port_table[port_id];
+    }
+
+    if (!port) {
+        LOG_ERROR(Lib_AudioOut, "Port not opened {}", port_id);
+        return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+    }
+
+    std::unique_lock lock{port->mutex};
+
+    for (u32 channel = 0; channel < VolumeFlags.size(); ++channel) {
+        if ((channel_mask & VolumeFlags[channel]) != 0) {
+            port->volume[channel] = vol[channel];
+        }
+    }
+
+    {
+        std::scoped_lock backend_lock{port->backend_mutex};
+        if (port->impl) {
+            port->impl->SetVolume(port->volume);
+        }
+    }
+
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetMixLevelPadSpk(s32 handle, s32 mixLevel) {
+    LOG_INFO(Lib_AudioOut, "(STUBBED) called");
+    if (lazy_init.load(std::memory_order_relaxed) == 0 || audio == nullptr) {
+        LOG_ERROR(Lib_AudioOut, "audio is not init");
+        return ORBIS_AUDIO_OUT_ERROR_NOT_INIT;
+    }
+
+    int port_id = GetPortId(handle);
+    if (port_id < 0) {
+        LOG_ERROR(Lib_AudioOut, "Invalid port_id");
+        return port_id;
+    }
+
+    if (GetPortType(handle) != 4) {
+        LOG_ERROR(Lib_AudioOut, "Invalid port type");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
+    }
+
+    if (mixLevel > ORBIS_AUDIO_OUT_VOLUME_0DB) {
+        LOG_ERROR(Lib_AudioOut, "Invalid mix level");
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_MIXLEVEL;
+    }
+
+    std::shared_ptr<PortOut> port;
+    {
+        std::shared_lock read_lock{port_table_mutex};
+        port = port_table[port_id];
+    }
+
+    if (!port) {
+        LOG_ERROR(Lib_AudioOut, "Port not opened");
+        return ORBIS_AUDIO_OUT_ERROR_NOT_OPENED;
+    }
+
+    std::unique_lock lock{port->mutex};
+    port->mixLevelPadSpk = mixLevel;
+
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutGetSystemState(OrbisAudioOutSystemState* state) {
+    if (lazy_init.load(std::memory_order_relaxed) == 0 || audio == nullptr) {
+        LOG_ERROR(Lib_AudioOut, "audio is not init");
+        return ORBIS_AUDIO_OUT_ERROR_NOT_INIT;
+    }
+    if (state == nullptr) {
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_POINTER;
+    }
+    memset(state, 0, sizeof(*state));
+    LOG_DEBUG(Lib_AudioOut, "called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutDeviceIdOpen() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioDeviceControlGet() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioDeviceControlSet() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutA3dControl() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutA3dExit() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutA3dInit() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutAttachToApplicationByPid() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutChangeAppModuleState() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutDetachFromApplicationByPid() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutExConfigureOutputMode() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutExGetSystemInfo() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutExPtClose() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutExPtGetLastOutputTime() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutExPtOpen() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutExSystemInfoIsSupportedAudioOutExMode() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutGetFocusEnablePid() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutGetHandleStatusInfo() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutGetInfo() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutGetInfoOpenNum() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutOpenEx() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutGetSimulatedBusUsableStatusByBusType() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutGetSimulatedHandleStatusInfo() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutGetSimulatedHandleStatusInfo2() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutGetSparkVss() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutInitIpmiGetSession() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutMasteringGetState() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutMasteringInit(u32 flags) {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    if (flags != 0) {
+        return ORBIS_AUDIO_OUT_ERROR_MASTERING_INVALID_API_PARAM;
+    }
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutMasteringSetParam() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutMasteringTerm() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutMbusInit() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutPtClose() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutPtGetLastOutputTime() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutPtOpen() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetConnections() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetConnectionsForUser() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetDevConnection() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetHeadphoneOutMode() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetJediJackVolume() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetJediSpkVolume() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetMainOutput() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetMorpheusParam() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetMorpheusWorkingMode() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetPortConnections() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetPortStatuses() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetRecMode() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetSparkParam() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetUsbVolume() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetVolumeDown() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutStartAuxBroadcast() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutStartSharePlay() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutStopAuxBroadcast() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutStopSharePlay() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSuspendResume() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSysConfigureOutputMode() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSysGetHdmiMonitorInfo() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSysGetSystemInfo() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSysHdmiMonitorInfoIsSupportedAudioOutMode() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSystemControlGet() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSystemControlSet() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSparkControlSetEqCoef() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceAudioOutSetSystemDebugState() {
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    return ORBIS_OK;
+}
+
+void RegisterLib(Core::Loader::SymbolsResolver* sym) {
+    LIB_FUNCTION("cx2dYFbzIAg", "libSceAudioOutDeviceService", 1, "libSceAudioOut",
+                 sceAudioOutDeviceIdOpen);
+    LIB_FUNCTION("tKumjQSzhys", "libSceAudioDeviceControl", 1, "libSceAudioOut",
+                 sceAudioDeviceControlGet);
+    LIB_FUNCTION("5ChfcHOf3SM", "libSceAudioDeviceControl", 1, "libSceAudioOut",
+                 sceAudioDeviceControlSet);
+    LIB_FUNCTION("Iz9X7ISldhs", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutA3dControl);
+    LIB_FUNCTION("9RVIoocOVAo", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutA3dExit);
+    LIB_FUNCTION("n7KgxE8rOuE", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutA3dInit);
+    LIB_FUNCTION("WBAO6-n0-4M", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutAttachToApplicationByPid);
+    LIB_FUNCTION("O3FM2WXIJaI", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutChangeAppModuleState);
+    LIB_FUNCTION("s1--uE9mBFw", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutClose);
+    LIB_FUNCTION("ol4LbeTG8mc", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutDetachFromApplicationByPid);
+    LIB_FUNCTION("r1V9IFEE+Ts", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutExConfigureOutputMode);
+    LIB_FUNCTION("wZakRQsWGos", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutExGetSystemInfo);
+    LIB_FUNCTION("xjjhT5uw08o", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutExPtClose);
+    LIB_FUNCTION("DsST7TNsyfo", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutExPtGetLastOutputTime);
+    LIB_FUNCTION("4UlW3CSuCa4", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutExPtOpen);
+    LIB_FUNCTION("Xcj8VTtnZw0", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutExSystemInfoIsSupportedAudioOutExMode);
+    LIB_FUNCTION("I3Fwcmkg5Po", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutGetFocusEnablePid);
+    LIB_FUNCTION("Y3lXfCFEWFY", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutGetHandleStatusInfo);
+    LIB_FUNCTION("-00OAutAw+c", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutGetInfo);
+    LIB_FUNCTION("RqmKxBqB8B4", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutGetInfoOpenNum);
+    LIB_FUNCTION("Ptlts326pds", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutGetLastOutputTime);
+    LIB_FUNCTION("GrQ9s4IrNaQ", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutGetPortState);
+    LIB_FUNCTION("c7mVozxJkPU", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutGetSimulatedBusUsableStatusByBusType);
+    LIB_FUNCTION("pWmS7LajYlo", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutGetSimulatedHandleStatusInfo);
+    LIB_FUNCTION("oPLghhAWgMM", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutGetSimulatedHandleStatusInfo2);
+    LIB_FUNCTION("5+r7JYHpkXg", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutGetSparkVss);
+    LIB_FUNCTION("R5hemoKKID8", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutGetSystemState);
+    LIB_FUNCTION("JfEPXVxhFqA", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutInit);
+    LIB_FUNCTION("n16Kdoxnvl0", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutInitIpmiGetSession);
+    LIB_FUNCTION("r+qKw+ueD+Q", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutMasteringGetState);
+    LIB_FUNCTION("xX4RLegarbg", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutMasteringInit);
+    LIB_FUNCTION("4055yaUg3EY", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutMasteringSetParam);
+    LIB_FUNCTION("RVWtUgoif5o", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutMasteringTerm);
+    LIB_FUNCTION("-LXhcGARw3k", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutMbusInit);
+    LIB_FUNCTION("ekNvsT22rsY", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutOpen);
+    LIB_FUNCTION("qLpSK75lXI4", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutOpenEx);
+    LIB_FUNCTION("QOQtbeDqsT4", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutOutput);
+    LIB_FUNCTION("w3PdaSTSwGE", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutOutputs);
+    LIB_FUNCTION("MapHTgeogbk", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutPtClose);
+    LIB_FUNCTION("YZaq+UKbriQ", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutPtGetLastOutputTime);
+    LIB_FUNCTION("xyT8IUCL3CI", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutPtOpen);
+    LIB_FUNCTION("o4OLQQqqA90", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutSetConnections);
+    LIB_FUNCTION("QHq2ylFOZ0k", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutSetConnectionsForUser);
+    LIB_FUNCTION("r9KGqGpwTpg", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutSetDevConnection);
+    LIB_FUNCTION("08MKi2E-RcE", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutSetHeadphoneOutMode);
+    LIB_FUNCTION("18IVGrIQDU4", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutSetJediJackVolume);
+    LIB_FUNCTION("h0o+D4YYr1k", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutSetJediSpkVolume);
+    LIB_FUNCTION("KI9cl22to7E", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutSetMainOutput);
+    LIB_FUNCTION("wVwPU50pS1c", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutSetMixLevelPadSpk);
+    LIB_FUNCTION("eeRsbeGYe20", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutSetMorpheusParam);
+    LIB_FUNCTION("IZrItPnflBM", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutSetMorpheusWorkingMode);
+    LIB_FUNCTION("Gy0ReOgXW00", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutSetPortConnections);
+    LIB_FUNCTION("oRBFflIrCg0", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutSetPortStatuses);
+    LIB_FUNCTION("ae-IVPMSWjU", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutSetRecMode);
+    LIB_FUNCTION("d3WL2uPE1eE", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutSetSparkParam);
+    LIB_FUNCTION("X7Cfsiujm8Y", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutSetUsbVolume);
+    LIB_FUNCTION("b+uAV89IlxE", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutSetVolume);
+    LIB_FUNCTION("rho9DH-0ehs", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutSetVolumeDown);
+    LIB_FUNCTION("I91P0HAPpjw", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutStartAuxBroadcast);
+    LIB_FUNCTION("uo+eoPzdQ-s", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutStartSharePlay);
+    LIB_FUNCTION("AImiaYFrKdc", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutStopAuxBroadcast);
+    LIB_FUNCTION("teCyKKZPjME", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutStopSharePlay);
+    LIB_FUNCTION("95bdtHdNUic", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutSuspendResume);
+    LIB_FUNCTION("oRJZnXxok-M", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutSysConfigureOutputMode);
+    LIB_FUNCTION("Tf9-yOJwF-A", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutSysGetHdmiMonitorInfo);
+    LIB_FUNCTION("y2-hP-KoTMI", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutSysGetSystemInfo);
+    LIB_FUNCTION("YV+bnMvMfYg", "libSceAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutSysHdmiMonitorInfoIsSupportedAudioOutMode);
+    LIB_FUNCTION("JEHhANREcLs", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutSystemControlGet);
+    LIB_FUNCTION("9CHWVv6r3Dg", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutSystemControlSet);
+    LIB_FUNCTION("Mt7JB3lOyJk", "libSceAudioOutSparkControl", 1, "libSceAudioOut",
+                 sceAudioOutSparkControlSetEqCoef);
+    LIB_FUNCTION("7UsdDOEvjlk", "libSceDbgAudioOut", 1, "libSceAudioOut",
+                 sceAudioOutSetSystemDebugState);
+};
+
+} // namespace Libraries::AudioOut

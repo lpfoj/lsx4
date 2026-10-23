@@ -1,0 +1,210 @@
+// SPDX-FileCopyrightText: Copyright 2026 LSX4 Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+
+// The SGSR1 branch is a Vulkan compute adaptation of Qualcomm's BSD-3-Clause
+// sgsr1_shader_mobile.frag. Bilinear/sharp-bilinear and Catmull-Rom are kept in
+// the same pass so switching a cheap spatial filter does not rebuild resources.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform texture2D InputTexture;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D OutputTexture;
+layout(set = 0, binding = 2) uniform sampler LinearSampler;
+
+layout(push_constant) uniform PushConstants {
+    uvec2 inputSize;
+    uvec2 outputSize;
+    uint mode;
+    float sharpness;
+} params;
+
+const uint MODE_BILINEAR = 2u;
+const uint MODE_SHARP_BILINEAR = 3u;
+const uint MODE_BICUBIC = 4u;
+const uint MODE_SGSR1 = 6u;
+
+vec4 SampleLinear(vec2 uv) {
+    return textureLod(sampler2D(InputTexture, LinearSampler), uv, 0.0);
+}
+
+vec4 SampleSharpBilinear(vec2 uv) {
+    vec2 inputExtent = vec2(params.inputSize);
+    vec2 scale = max(floor(vec2(params.outputSize) / inputExtent), vec2(1.0));
+    vec2 texel = uv * inputExtent;
+    vec2 centerDistance = fract(texel) - 0.5;
+    vec2 regionRange = 0.5 - 0.5 / scale;
+    vec2 f = (centerDistance - clamp(centerDistance, -regionRange, regionRange)) *
+                 scale +
+             0.5;
+    vec2 modifiedTexel = floor(texel) + f;
+    vec4 sharp = SampleLinear(modifiedTexel / inputExtent);
+    return mix(SampleLinear(uv), sharp, clamp(params.sharpness, 0.0, 1.0));
+}
+
+vec4 SampleCatmullRom(vec2 uv) {
+    vec2 inputExtent = vec2(params.inputSize);
+    vec2 samplePosition = uv * inputExtent;
+    vec2 texelPosition1 = floor(samplePosition - 0.5) + 0.5;
+    vec2 f = samplePosition - texelPosition1;
+
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    vec2 w12 = w1 + w2;
+    vec2 offset12 = w2 / max(w12, vec2(1.0e-6));
+
+    vec2 texelPosition0 = texelPosition1 - 1.0;
+    vec2 texelPosition3 = texelPosition1 + 2.0;
+    vec2 texelPosition12 = texelPosition1 + offset12;
+    texelPosition0 /= inputExtent;
+    texelPosition3 /= inputExtent;
+    texelPosition12 /= inputExtent;
+
+    vec4 result = vec4(0.0);
+    result += SampleLinear(vec2(texelPosition0.x, texelPosition0.y)) * w0.x * w0.y;
+    result += SampleLinear(vec2(texelPosition12.x, texelPosition0.y)) * w12.x * w0.y;
+    result += SampleLinear(vec2(texelPosition3.x, texelPosition0.y)) * w3.x * w0.y;
+    result += SampleLinear(vec2(texelPosition0.x, texelPosition12.y)) * w0.x * w12.y;
+    result += SampleLinear(vec2(texelPosition12.x, texelPosition12.y)) * w12.x * w12.y;
+    result += SampleLinear(vec2(texelPosition3.x, texelPosition12.y)) * w3.x * w12.y;
+    result += SampleLinear(vec2(texelPosition0.x, texelPosition3.y)) * w0.x * w3.y;
+    result += SampleLinear(vec2(texelPosition12.x, texelPosition3.y)) * w12.x * w3.y;
+    result += SampleLinear(vec2(texelPosition3.x, texelPosition3.y)) * w3.x * w3.y;
+    return result;
+}
+
+float BicubicWeight(float distance, float b, float c) {
+    float x = abs(distance);
+    if (x < 1.0) {
+        return ((12.0 - 9.0 * b - 6.0 * c) * x * x * x +
+                (-18.0 + 12.0 * b + 6.0 * c) * x * x +
+                (6.0 - 2.0 * b)) / 6.0;
+    }
+    if (x < 2.0) {
+        return ((-b - 6.0 * c) * x * x * x +
+                (6.0 * b + 30.0 * c) * x * x +
+                (-12.0 * b - 48.0 * c) * x +
+                (8.0 * b + 24.0 * c)) / 6.0;
+    }
+    return 0.0;
+}
+
+vec4 SampleParameterizedBicubic(vec2 uv, float b, float c) {
+    vec2 inputExtent = vec2(params.inputSize);
+    vec2 samplePosition = uv * inputExtent - 0.5;
+    vec2 base = floor(samplePosition);
+    vec2 phase = samplePosition - base;
+    vec4 result = vec4(0.0);
+    float totalWeight = 0.0;
+    for (int y = -1; y <= 2; ++y) {
+        float wy = BicubicWeight(float(y) - phase.y, b, c);
+        for (int x = -1; x <= 2; ++x) {
+            float weight = BicubicWeight(float(x) - phase.x, b, c) * wy;
+            vec2 coord = (base + vec2(x, y) + 0.5) / inputExtent;
+            result += SampleLinear(coord) * weight;
+            totalWeight += weight;
+        }
+    }
+    return result / max(abs(totalWeight), 1.0e-6);
+}
+
+vec4 SampleSelectedBicubic(vec2 uv) {
+    uint kernel = uint(clamp(params.sharpness, 0.0, 2.0) + 0.5);
+    if (kernel == 1u) {
+        return SampleParameterizedBicubic(uv, 1.0 / 3.0, 1.0 / 3.0);
+    }
+    if (kernel == 2u) {
+        return SampleParameterizedBicubic(uv, 1.0, 0.0);
+    }
+    return SampleCatmullRom(uv);
+}
+
+float FastLanczos2(float x) {
+    float wA = x - 4.0;
+    float wB = x * wA - wA;
+    wA *= wA;
+    return wB * wA;
+}
+
+vec2 SgsrWeight(float dx, float dy, float color, float standardDeviation) {
+    float x = (dx * dx + dy * dy) * 0.55 +
+              clamp(abs(color) * standardDeviation, 0.0, 1.0);
+    float weight = FastLanczos2(x);
+    return vec2(weight, weight * color);
+}
+
+vec4 SampleSgsr1(vec2 uv) {
+    vec2 reciprocalExtent = 1.0 / vec2(params.inputSize);
+    vec2 imageCoord = uv * vec2(params.inputSize) + vec2(-0.5, 0.5);
+    vec2 imagePixel = floor(imageCoord);
+    vec2 phase = imageCoord - imagePixel;
+    vec4 center = SampleLinear(uv);
+    vec2 coord = imagePixel * reciprocalExtent;
+    // Qualcomm's RGBA operation mode intentionally uses component 1 (green) as
+    // the edge guide and applies the resulting luminance delta to all RGB lanes.
+    vec4 left = textureGather(sampler2D(InputTexture, LinearSampler), coord, 1);
+    float edgeVote = abs(left.z - left.y) + abs(center.g - left.y) +
+                     abs(center.g - left.z);
+    if (edgeVote <= 8.0 / 255.0) {
+        return vec4(center.rgb, 1.0);
+    }
+
+    coord.x += reciprocalExtent.x;
+    vec4 right = textureGather(sampler2D(InputTexture, LinearSampler),
+                               coord + vec2(reciprocalExtent.x, 0.0), 1);
+    vec4 upDown;
+    upDown.xy = textureGather(sampler2D(InputTexture, LinearSampler),
+                              coord + vec2(0.0, -reciprocalExtent.y), 1).wz;
+    upDown.zw = textureGather(sampler2D(InputTexture, LinearSampler),
+                              coord + vec2(0.0, reciprocalExtent.y), 1).yx;
+
+    float mean = 0.25 * (left.y + left.z + right.x + right.w);
+    left -= vec4(mean);
+    right -= vec4(mean);
+    upDown -= vec4(mean);
+    float centerDelta = center.g - mean;
+    float deviation = dot(abs(left), vec4(1.0)) + dot(abs(right), vec4(1.0)) +
+                      dot(abs(upDown), vec4(1.0));
+    float standardDeviation = 2.181818 / max(deviation, 1.0e-6);
+    vec2 weighted = vec2(0.0);
+    weighted += SgsrWeight(phase.x, phase.y + 1.0, upDown.x, standardDeviation);
+    weighted += SgsrWeight(phase.x - 1.0, phase.y + 1.0, upDown.y, standardDeviation);
+    weighted += SgsrWeight(phase.x - 1.0, phase.y - 2.0, upDown.z, standardDeviation);
+    weighted += SgsrWeight(phase.x, phase.y - 2.0, upDown.w, standardDeviation);
+    weighted += SgsrWeight(phase.x + 1.0, phase.y - 1.0, left.x, standardDeviation);
+    weighted += SgsrWeight(phase.x, phase.y - 1.0, left.y, standardDeviation);
+    weighted += SgsrWeight(phase.x, phase.y, left.z, standardDeviation);
+    weighted += SgsrWeight(phase.x + 1.0, phase.y, left.w, standardDeviation);
+    weighted += SgsrWeight(phase.x - 1.0, phase.y - 1.0, right.x, standardDeviation);
+    weighted += SgsrWeight(phase.x - 2.0, phase.y - 1.0, right.y, standardDeviation);
+    weighted += SgsrWeight(phase.x - 2.0, phase.y, right.z, standardDeviation);
+    weighted += SgsrWeight(phase.x - 1.0, phase.y, right.w, standardDeviation);
+
+    float finalY = weighted.y / max(abs(weighted.x), 1.0e-6) * sign(weighted.x);
+    float minY = min(min(left.y, left.z), min(right.x, right.w));
+    float maxY = max(max(left.y, left.z), max(right.x, right.w));
+    finalY = clamp(params.sharpness * finalY, minY, maxY);
+    float deltaY = clamp(finalY - centerDelta, -23.0 / 255.0, 23.0 / 255.0);
+    return vec4(clamp(center.rgb + deltaY, 0.0, 1.0), 1.0);
+}
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(pixel, params.outputSize))) {
+        return;
+    }
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(params.outputSize);
+    vec4 color;
+    if (params.mode == MODE_SHARP_BILINEAR) {
+        color = SampleSharpBilinear(uv);
+    } else if (params.mode == MODE_BICUBIC) {
+        color = SampleSelectedBicubic(uv);
+    } else if (params.mode == MODE_SGSR1) {
+        color = SampleSgsr1(uv);
+    } else {
+        color = SampleLinear(uv);
+    }
+    imageStore(OutputTexture, ivec2(pixel), color);
+}
