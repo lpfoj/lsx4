@@ -13,7 +13,9 @@
 
 # LSX4
 
-LSX4 is an open-source PlayStation 4/5 emulator for Android and iOS. The current iOS release supports PS4 gameplay; PS5 gameplay is currently available on Android.
+LSX4 is an open-source PlayStation 4/5 emulator for Android and iOS. Both platforms support PS4 and PS5 gameplay.
+
+PS5 support was added to the public iOS JIT release [128.9558](https://github.com/lpfoj/lsx4/releases/tag/ios-jit-128.9558-r3), tested with God of War: Sons of Sparta, Dreaming Sarah, and Void Terrarium++. Compatibility and performance depend on the platform, device and game. The Vivo screenshots and results below document Android tests, not an iOS compatibility list.
 
 LSX4 does not include games, firmware, or other copyrighted system content.
 
@@ -23,10 +25,12 @@ Development also makes use of current-generation large language models (LLMs).
 
 <p align="center">
   <a href="https://play.google.com/store/apps/details?id=com.jetcalls.lsx4"><img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" height="80" alt="Get it on Google Play"></a>
-  <a href="https://github.com/lpfoj/lsx4/releases/tag/ios-jit-128.9408"><img src="assets/ios-download.svg?v=20261023-2" height="80" alt="Download LSX4 for iOS: IPA and installation instructions on GitHub Releases"></a>
+  <a href="https://github.com/lpfoj/lsx4/releases"><img src="assets/ios-download.svg?v=20261023-2" height="80" alt="Download LSX4 for iOS: IPA and installation instructions on GitHub Releases"></a>
 </p>
 
-**iOS (PS4 & PS5, iOS 26+):** [Latest release](https://github.com/lpfoj/lsx4/releases/tag/ios-jit-128.9408) · [Download IPA](https://github.com/lpfoj/lsx4/releases/download/ios-jit-128.9408/LSX4-JIT-128.9408.ipa) · [IPA + English installation instructions](https://github.com/lpfoj/lsx4/releases/download/ios-jit-128.9408/LSX4-iOS-JIT-128.9408-English.zip). Install with Sideloadly and follow the included on-device JIT setup instructions.
+Support LSX4 at [ko-fi.com/lsx](https://ko-fi.com/lsx). A list of supporters will be added to the app's **Thanks** section on both Android and iOS.
+
+**iOS (PS4 & PS5, iOS 26+):** [Latest release](https://github.com/lpfoj/lsx4/releases/latest) · [Download IPA](https://github.com/lpfoj/lsx4/releases/download/ios-jit-128.9564/LSX4-JIT-128.9564.ipa) · [IPA + English installation instructions](https://github.com/lpfoj/lsx4/releases/download/ios-jit-128.9564/LSX4-iOS-JIT-128.9564-English.zip). Install with Sideloadly and follow the included on-device JIT setup instructions.
 
 ## Contributing
 
@@ -382,7 +386,7 @@ These games reach gameplay and can be played, but performance still needs work o
 
 #### PS5 Playable
 
-Two PS5 games with confirmed gameplay on Vivo. These screenshots come from the tester’s October 21 recordings.
+Two PS5 games with confirmed gameplay on Vivo (Android). These screenshots come from the tester’s October 21 recordings.
 
 <table>
   <tr>
@@ -395,7 +399,7 @@ Two PS5 games with confirmed gameplay on Vivo. These screenshots come from the t
 
 #### PS5 Low FPS
 
-These PS5 games reach gameplay on Vivo, but low frame rates still need improvement.
+These PS5 games reach gameplay on Vivo (Android), but low frame rates still need improvement.
 
 <table>
   <tr>
