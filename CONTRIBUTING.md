@@ -45,3 +45,7 @@ Maintainers may request broader gameplay coverage when a change touches shared m
 No contribution may contain game assets, console firmware, upload keystores, access credentials or private build artifacts. Preserve third-party attribution and comply with the repository's licenses. Do not remove attribution because code was moved or rewritten with a model.
 
 For GitHub's fork workflow, see [Creating a PR from a fork](https://docs.github.com/en/pull-requests/how-tos/create-pull-requests/creating-a-pull-request-from-a-fork).
+
+## Source update schedule
+
+The repository's source code will be updated every two weeks or once a month, depending on the volume of interim changes, so that pull requests are based on an up-to-date codebase rather than intermediate development versions.

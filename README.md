@@ -13,7 +13,9 @@
 
 # LSX4
 
-LSX4 is an open-source PlayStation 4/5 emulator for Android and iOS. The current iOS release supports PS4 gameplay; PS5 gameplay is currently available on Android.
+LSX4 is an open-source PlayStation 4/5 emulator for Android and iOS. Both platforms support PS4 and PS5 gameplay.
+
+PS5 support was added to the public iOS JIT release [128.9558](https://github.com/lpfoj/lsx4/releases/tag/ios-jit-128.9558-r3), tested with God of War: Sons of Sparta, Dreaming Sarah, and Void Terrarium++. Compatibility and performance depend on the platform, device and game. The galleries and compatibility table below distinguish Android and iOS results.
 
 LSX4 does not include games, firmware, or other copyrighted system content.
 
@@ -23,10 +25,12 @@ Development also makes use of current-generation large language models (LLMs).
 
 <p align="center">
   <a href="https://play.google.com/store/apps/details?id=com.jetcalls.lsx4"><img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" height="80" alt="Get it on Google Play"></a>
-  <a href="https://github.com/lpfoj/lsx4/releases/tag/ios-jit-128.9408"><img src="assets/ios-download.svg?v=20261023-2" height="80" alt="Download LSX4 for iOS: IPA and installation instructions on GitHub Releases"></a>
+  <a href="https://github.com/lpfoj/lsx4/releases"><img src="assets/ios-download.svg?v=20261023-2" height="80" alt="Download LSX4 for iOS: IPA and installation instructions on GitHub Releases"></a>
 </p>
 
-**iOS (PS4 & PS5, iOS 26+):** [Latest release](https://github.com/lpfoj/lsx4/releases/tag/ios-jit-128.9408) · [Download IPA](https://github.com/lpfoj/lsx4/releases/download/ios-jit-128.9408/LSX4-JIT-128.9408.ipa) · [IPA + English installation instructions](https://github.com/lpfoj/lsx4/releases/download/ios-jit-128.9408/LSX4-iOS-JIT-128.9408-English.zip). Install with Sideloadly and follow the included on-device JIT setup instructions.
+Support LSX4 at [ko-fi.com/lsx](https://ko-fi.com/lsx). A list of supporters will be added to the app's **Thanks** section on both Android and iOS.
+
+**iOS (PS4 & PS5, iOS 26+):** [Latest release](https://github.com/lpfoj/lsx4/releases/latest) · [Download IPA](https://github.com/lpfoj/lsx4/releases/download/ios-jit-128.9564/LSX4-JIT-128.9564.ipa) · [IPA + English installation instructions](https://github.com/lpfoj/lsx4/releases/download/ios-jit-128.9564/LSX4-iOS-JIT-128.9564-English.zip). Install with Sideloadly and follow the included on-device JIT setup instructions.
 
 ## Contributing
 
@@ -93,7 +97,7 @@ contains the same information in a machine-readable format.
 
 ## Playable games (100+)
 
-Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
+Android results include devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5. iOS results and screenshots are listed separately.
 
 ### Video demonstrations
 
@@ -137,12 +141,12 @@ Earlier demonstrations: [Video 1](https://www.youtube.com/watch?v=CQpTIQlKarM) �
 
 ### Device previews
 
-| [Playable](#playable) | [Low FPS playable](#low-fps-playable) | [In game](#in-game) |
-| :---: | :---: | :---: |
+| [Playable Android](#playable-android) | [Playable iOS (40+)](#playable-ios) | [Low FPS playable](#low-fps-playable) | [In game](#in-game) |
+| :---: | :---: | :---: | :---: |
 
-#### Playable
+#### Playable Android
 
-104 games confirmed playable on test devices.
+104 games confirmed playable on Android test devices.
 
 <table>
   <tr>
@@ -365,6 +369,111 @@ Earlier demonstrations: [Video 1](https://www.youtube.com/watch?v=CQpTIQlKarM) �
 
 The Playable gallery mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026.
 
+#### Playable iOS
+
+**44 games (40+)** from the iOS app catalog. Sonic Mania's two regional entries are shown as one game. Community-reported entries are labelled separately.
+
+Attached iOS screenshots are shown where available. The LSX4 logo marks entries without a screenshot. [Catalog and preview sources](assets/screenshots/ios/SOURCES.md).
+
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/islets.jpg" width="480" alt="Islets on iOS"><br><sub><b>Islets</b><br>iOS · PS4</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Bloodborne"><br><sub><b>Bloodborne</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Sonic Mania"><br><sub><b>Sonic Mania</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Rain World"><br><sub><b>Rain World</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Dead Cells"><br><sub><b>Dead Cells</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Shovel Knight"><br><sub><b>Shovel Knight</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+</table>
+
+<details>
+<summary>Show all remaining iOS catalog entries</summary>
+
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Carto"><br><sub><b>Carto</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Minit"><br><sub><b>Minit</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Mega Shoot"><br><sub><b>Mega Shoot</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Downwell"><br><sub><b>Downwell</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for The Binding of Isaac: Rebirth"><br><sub><b>The Binding of Isaac: Rebirth</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Nidhogg"><br><sub><b>Nidhogg</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Spider: Rite of the Shrouded Moon"><br><sub><b>Spider: Rite of the Shrouded Moon</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Dandara"><br><sub><b>Dandara</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Ninja JaJaMaru Collection"><br><sub><b>Ninja JaJaMaru Collection</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Axiom Verge 2"><br><sub><b>Axiom Verge 2</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for A Short Hike"><br><sub><b>A Short Hike</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Just Shapes &amp; Beats"><br><sub><b>Just Shapes &amp; Beats</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Thomas Was Alone"><br><sub><b>Thomas Was Alone</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for FAR: Lone Sails"><br><sub><b>FAR: Lone Sails</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Nuclear Throne"><br><sub><b>Nuclear Throne</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Undertale"><br><sub><b>Undertale</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Jazzpunk: Director&#x27;s Cut"><br><sub><b>Jazzpunk: Director&#x27;s Cut</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Risk of Rain 2"><br><sub><b>Risk of Rain 2</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Dark Devotion"><br><sub><b>Dark Devotion</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Replay: VHS Is Not Dead"><br><sub><b>Replay: VHS Is Not Dead</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Going Under"><br><sub><b>Going Under</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Fight&#x27;N Rage"><br><sub><b>Fight&#x27;N Rage</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Nidhogg 2"><br><sub><b>Nidhogg 2</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Another World: 20th Anniversary Edition"><br><sub><b>Another World: 20th Anniversary Edition</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Bonfire Peaks"><br><sub><b>Bonfire Peaks</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Broforce"><br><sub><b>Broforce</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Cyber Shadow"><br><sub><b>Cyber Shadow</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Might &amp; Magic: Clash of Heroes"><br><sub><b>Might &amp; Magic: Clash of Heroes</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Owlboy"><br><sub><b>Owlboy</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Trine Enchanted Edition"><br><sub><b>Trine Enchanted Edition</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Hillbilly Doomsday"><br><sub><b>Hillbilly Doomsday</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Turnip Boy Commits Tax Evasion"><br><sub><b>Turnip Boy Commits Tax Evasion</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Cosmophony"><br><sub><b>Cosmophony</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Deltarune"><br><sub><b>Deltarune</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Don&#x27;t Bite Me Bro!"><br><sub><b>Don&#x27;t Bite Me Bro!</b><br>iOS · PS4 · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Lucy Dreaming"><br><sub><b>Lucy Dreaming</b><br>iOS · PS4 · No screenshot attached</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Balatro"><br><sub><b>Balatro</b><br>iOS · PS4 · Community report · No screenshot attached</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/ios/default.png" width="120" height="120" alt="LSX4 logo; no screenshot attached for Farlands Journey"><br><sub><b>Farlands Journey</b><br>iOS · PS4 · Community report · No screenshot attached</sub></td>
+  </tr>
+</table>
+
+</details>
+
 #### Low FPS playable
 
 These games reach gameplay and can be played, but performance still needs work on the tested Vivo device.
@@ -380,11 +489,14 @@ These games reach gameplay and can be played, but performance still needs work o
   </tr>
 </table>
 
-#### PS5 Playable
+#### PS5 Playable (Android + iOS)
 
-Two PS5 games with confirmed gameplay on Vivo. These screenshots come from the tester’s October 21 recordings.
+These three PS5 games are playable on Android and iOS. God of War: Sons of Sparta currently runs at 20-30 FPS on Android. The Dreaming Sarah and Void Terrarium++ screenshots are from the tester’s October 21 Vivo recordings.
 
 <table>
+  <tr>
+    <td align="center" colspan="2"><img src="assets/screenshots/god-of-war-sons-of-sparta-ps5.png" alt="God of War Sons of Sparta running in LSX4 on Android with the PS5 runtime"><br><sub><b>God of War: Sons of Sparta</b> · PS5 · 20-30 FPS</sub></td>
+  </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/dreaming-sarah-ps5-vivo.png" alt="Dreaming Sarah gameplay in LSX4 on Vivo"><br><sub><b>Dreaming Sarah</b> · PS5 · Vivo</sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/void-terrarium-plus-plus-ps5-vivo.png" alt="Void Terrarium++ gameplay in LSX4 on Vivo"><br><sub><b>void tRrLM();++ //Void Terrarium++</b> · PS5 · Vivo</sub></td>
@@ -393,129 +505,123 @@ Two PS5 games with confirmed gameplay on Vivo. These screenshots come from the t
 
 [PS5 screenshot provenance](assets/screenshots/PS5_VIVO_SOURCES.md).
 
-#### PS5 Low FPS
+### Playable compatibility list (Android and iOS)
 
-These PS5 games reach gameplay on Vivo, but low frame rates still need improvement.
+Results are tracked separately for each host platform. The iOS column includes all 44 games from the app catalog, plus the iOS demonstrations linked below. `Reported` identifies community-only results; `-` means no result is listed for that platform, not that the game is unsupported.
 
-<table>
-  <tr>
-    <td align="center"><img src="assets/screenshots/god-of-war-sons-of-sparta-ps5.png" alt="God of War Sons of Sparta running in LSX4 with the PS5 runtime"><br><sub><b>God of War Sons of Sparta</b> · PS5</sub></td>
-  </tr>
-</table>
-
-### Playable compatibility list (104 games)
-
-This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
+Compatibility and performance depend on the device, app version and game. [iOS catalog sources](assets/screenshots/ios/SOURCES.md).
 
 <details>
 <summary>Show complete compatibility list</summary>
 
-| Game | Playable | Notes |
-| --- | :---: | --- |
-| Bloodborne | ✅ | |
-| The Last of Us Remastered | ✅ | |
-| Fear The Spotlight | ✅ | |
-| INSIDE | ✅ | |
-| Wizordum | ✅ | |
-| Hollow Knight | ✅ | |
-| Mortisomem | ✅ | |
-| Cat From Hell 2 | ✅ | |
-| Megaton Rainfall | ✅ | |
-| Trine | ✅ | |
-| Risk of Rain 2 | ✅ | |
-| Rollerdrome | ✅ | |
-| Death's Door | ✅ | |
-| DREDGE | ✅ | |
-| Marble It Up! Ultra | ✅ | |
-| The Gardens Between | ✅ | |
-| The Pedestrian | ✅ | |
-| Going Under | ✅ | |
-| FAR: Lone Sails | ✅ | |
-| Orc Slayer | ✅ | |
-| Jazzpunk: Director's Cut | ✅ | |
-| MediEvil | ✅ | |
-| FATE Reawakened | ✅ | |
-| Buildest | ✅ | |
-| Besiege | ✅ | |
-| Bluey's Quest for the Gold Pen | ✅ | |
-| Fluster Cluck | ✅ | |
-| Super Monkey Ball: Banana Blitz | ✅ | |
-| Can't Drive This | ✅ | |
-| A Short Hike | ✅ | |
-| Old Man's Journey | ✅ | |
-| Nubla | ✅ | |
-| Bonfire Peaks | ✅ | |
-| A Monster's Expedition | ✅ | |
-| MEGALAN 11 | ✅ | |
-| Grand Prix RockN Racing | ✅ | |
-| Rock 'N Racing Off Road DX | ✅ | |
-| Absolute Drift | ✅ | |
-| WHAT THE GOLF? | ✅ | |
-| Lethal League Blaze | ✅ | |
-| RESOGUN | ✅ | |
-| I, AI | ✅ | |
-| Spider: Rite of the Shrouded Moon | ✅ | |
-| Dead Cells | ✅ | |
-| Moonscars | ✅ | |
-| Rogue Legacy 2 | ✅ | |
-| Hyper Light Drifter | ✅ | |
-| Grim Guardians: Demon Purge | ✅ | |
-| Dark Devotion | ✅ | |
-| Rain World | ✅ | |
-| Owlboy | ✅ | |
-| Islets | ✅ | |
-| Thornkin | ✅ | |
-| Axiom Verge 2 | ✅ | |
-| Carto | ✅ | |
-| Dandara | ✅ | |
-| Punch Club 2: Fast Forward | ✅ | |
-| Coffee Talk | ✅ | |
-| Chained Echoes | ✅ | |
-| The Messenger | ✅ | |
-| Cyber Shadow | ✅ | |
-| Broforce | ✅ | |
-| Fight'N Rage | ✅ | |
-| Farlands Journey | ✅ | |
-| Don't Bite Me Bro! | ✅ | |
-| void tRrLM();++ //Void Terrarium++ | ✅ | |
-| Might & Magic: Clash of Heroes | ✅ | |
-| Despot's Game | ✅ | |
-| Lucy Dreaming | ✅ | |
-| Turnip Boy Commits Tax Evasion | ✅ | |
-| Sonic Mania | ✅ | |
-| Shovel Knight | ✅ | |
-| Hillbilly Doomsday | ✅ | |
-| Super Rude Bear Resurrection | ✅ | |
-| Super Meat Boy! | ✅ | |
-| Ultimate Chicken Horse | ✅ | |
-| Toto Temple Deluxe | ✅ | |
-| Perfect Universe | ✅ | |
-| Limbo | ✅ | |
-| Thomas Was Alone | ✅ | |
-| GONNER | ✅ | |
-| Cosmophony | ✅ | |
-| Just Shapes & Beats | ✅ | |
-| The Binding of Isaac: Rebirth | ✅ | |
-| Hotline Miami 2: Wrong Number | ✅ | |
-| NOT A HERO | ✅ | |
-| Nuclear Throne | ✅ | |
-| LEVEL 22 | ✅ | |
-| Nidhogg 2 | ✅ | |
-| Mega Shoot | ✅ | |
-| REPLAY: VHS is not dead | ✅ | |
-| Retrace: Memories of Death | ✅ | |
-| Dreaming Sarah | ✅ | |
-| NEEDY GIRL OVERDOSE | ✅ | |
-| Deltarune Chapters 1 & 2 | ✅ | |
-| Undertale | ✅ | |
-| MediEvil II | ✅ | |
-| FINAL FANTASY II | ✅ |  |
-| FINAL FANTASY | ✅ | |
-| Another World | ✅ | |
-| Ninja JaJaMaru Collection | ✅ | |
-| Downwell | ✅ | |
-| Nidhogg | ✅ | |
-| Minit | ✅ | |
+| Game | Platform | Android | iOS | Notes |
+| --- | :---: | :---: | :---: | --- |
+| Bloodborne | PS4 | ✅ | ✅ |  |
+| The Last of Us Remastered | PS4 | ✅ | ✅ | [iOS gameplay](https://www.youtube.com/watch?v=20qtM8hfL0I). |
+| Fear The Spotlight | PS4 | ✅ | - |  |
+| INSIDE | PS4 | ✅ | - |  |
+| Wizordum | PS4 | ✅ | - |  |
+| Hollow Knight | PS4 | ✅ | - |  |
+| Mortisomem | PS4 | ✅ | - |  |
+| Cat From Hell 2 | PS4 | ✅ | - |  |
+| Megaton Rainfall | PS4 | ✅ | - |  |
+| Trine | PS4 | ✅ | ✅ |  |
+| Risk of Rain 2 | PS4 | ✅ | ✅ |  |
+| Rollerdrome | PS4 | ✅ | - |  |
+| Death's Door | PS4 | ✅ | - |  |
+| DREDGE | PS4 | ✅ | - |  |
+| Marble It Up! Ultra | PS4 | ✅ | - |  |
+| The Gardens Between | PS4 | ✅ | - |  |
+| The Pedestrian | PS4 | ✅ | - |  |
+| Going Under | PS4 | ✅ | ✅ |  |
+| FAR: Lone Sails | PS4 | ✅ | ✅ |  |
+| Orc Slayer | PS4 | ✅ | - |  |
+| Jazzpunk: Director's Cut | PS4 | ✅ | ✅ |  |
+| MediEvil | PS4 | ✅ | - |  |
+| FATE Reawakened | PS4 | ✅ | - |  |
+| Buildest | PS4 | ✅ | - |  |
+| Besiege | PS4 | ✅ | - |  |
+| Bluey's Quest for the Gold Pen | PS4 | ✅ | - |  |
+| Fluster Cluck | PS4 | ✅ | - |  |
+| Super Monkey Ball: Banana Blitz | PS4 | ✅ | - |  |
+| Can't Drive This | PS4 | ✅ | - |  |
+| A Short Hike | PS4 | ✅ | ✅ |  |
+| Old Man's Journey | PS4 | ✅ | - |  |
+| Nubla | PS4 | ✅ | - |  |
+| Bonfire Peaks | PS4 | ✅ | ✅ |  |
+| A Monster's Expedition | PS4 | ✅ | - |  |
+| MEGALAN 11 | PS4 | ✅ | - |  |
+| Grand Prix RockN Racing | PS4 | ✅ | - |  |
+| Rock 'N Racing Off Road DX | PS4 | ✅ | - |  |
+| Absolute Drift | PS4 | ✅ | - |  |
+| WHAT THE GOLF? | PS4 | ✅ | - |  |
+| Lethal League Blaze | PS4 | ✅ | - |  |
+| RESOGUN | PS4 | ✅ | - |  |
+| I, AI | PS4 | ✅ | - |  |
+| Spider: Rite of the Shrouded Moon | PS4 | ✅ | ✅ |  |
+| Dead Cells | PS4 | ✅ | ✅ |  |
+| Moonscars | PS4 | ✅ | - |  |
+| Rogue Legacy 2 | PS4 | ✅ | - |  |
+| Hyper Light Drifter | PS4 | ✅ | - |  |
+| Grim Guardians: Demon Purge | PS4 | ✅ | - |  |
+| Dark Devotion | PS4 | ✅ | ✅ |  |
+| Rain World | PS4 | ✅ | ✅ |  |
+| Owlboy | PS4 | ✅ | ✅ |  |
+| Islets | PS4 | ✅ | ✅ |  |
+| Thornkin | PS4 | ✅ | - |  |
+| Axiom Verge 2 | PS4 | ✅ | ✅ |  |
+| Carto | PS4 | ✅ | ✅ |  |
+| Dandara | PS4 | ✅ | ✅ |  |
+| Punch Club 2: Fast Forward | PS4 | ✅ | - |  |
+| Coffee Talk | PS4 | ✅ | - |  |
+| Chained Echoes | PS4 | ✅ | - |  |
+| The Messenger | PS4 | ✅ | - |  |
+| Cyber Shadow | PS4 | ✅ | ✅ |  |
+| Broforce | PS4 | ✅ | ✅ |  |
+| Fight'N Rage | PS4 | ✅ | ✅ |  |
+| Farlands Journey | PS4 | ✅ | Reported | iOS community report in the app catalog. |
+| Don't Bite Me Bro! | PS4 | ✅ | ✅ |  |
+| void tRrLM();++ //Void Terrarium++ | PS5 | ✅ | ✅ | [iOS gameplay](https://youtu.be/la1JBTy7qj8). |
+| Might & Magic: Clash of Heroes | PS4 | ✅ | ✅ |  |
+| Despot's Game | PS4 | ✅ | - |  |
+| Lucy Dreaming | PS4 | ✅ | ✅ |  |
+| Turnip Boy Commits Tax Evasion | PS4 | ✅ | ✅ |  |
+| Sonic Mania | PS4 | ✅ | ✅ |  |
+| Shovel Knight | PS4 | ✅ | ✅ |  |
+| Hillbilly Doomsday | PS4 | ✅ | ✅ |  |
+| Super Rude Bear Resurrection | PS4 | ✅ | - |  |
+| Super Meat Boy! | PS4 | ✅ | - |  |
+| Ultimate Chicken Horse | PS4 | ✅ | - |  |
+| Toto Temple Deluxe | PS4 | ✅ | - |  |
+| Perfect Universe | PS4 | ✅ | - |  |
+| Limbo | PS4 | ✅ | - |  |
+| Thomas Was Alone | PS4 | ✅ | ✅ |  |
+| GONNER | PS4 | ✅ | - |  |
+| Cosmophony | PS4 | ✅ | ✅ |  |
+| Just Shapes & Beats | PS4 | ✅ | ✅ |  |
+| The Binding of Isaac: Rebirth | PS4 | ✅ | ✅ |  |
+| Hotline Miami 2: Wrong Number | PS4 | ✅ | - |  |
+| NOT A HERO | PS4 | ✅ | - |  |
+| Nuclear Throne | PS4 | ✅ | ✅ |  |
+| LEVEL 22 | PS4 | ✅ | - |  |
+| Nidhogg 2 | PS4 | ✅ | ✅ |  |
+| Mega Shoot | PS4 | ✅ | ✅ |  |
+| REPLAY: VHS is not dead | PS4 | ✅ | ✅ |  |
+| Retrace: Memories of Death | PS4 | ✅ | - |  |
+| Dreaming Sarah | PS5 | ✅ | ✅ | [iOS gameplay](https://youtu.be/la1JBTy7qj8). |
+| NEEDY GIRL OVERDOSE | PS4 | ✅ | - |  |
+| Deltarune Chapters 1 & 2 | PS4 | ✅ | ✅ |  |
+| Undertale | PS4 | ✅ | ✅ |  |
+| MediEvil II | PS4 | ✅ | - |  |
+| FINAL FANTASY II | PS4 | ✅ | - |  |
+| FINAL FANTASY | PS4 | ✅ | - |  |
+| Another World | PS4 | ✅ | ✅ |  |
+| Ninja JaJaMaru Collection | PS4 | ✅ | ✅ |  |
+| Downwell | PS4 | ✅ | ✅ |  |
+| Nidhogg | PS4 | ✅ | ✅ |  |
+| Minit | PS4 | ✅ | ✅ |  |
+| God of War: Sons of Sparta | PS5 | ✅ | ✅ | Android: 20-30 FPS. [iOS gameplay](https://youtu.be/la1JBTy7qj8). |
+| Balatro | PS4 | - | Reported | iOS community report in the app catalog. |
 
 </details>
 

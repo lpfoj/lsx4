@@ -1,0 +1,411 @@
+{
+  "snapshotDate": "2026-11-03",
+  "release": "https://github.com/lpfoj/lsx4/releases/tag/ios-jit-128.9775",
+  "catalogResource": "Payload/LSX4RuntimeProbe.app/ios-gameplay-observations.json",
+  "catalogSha256": "66ac4a0f9ddbb84176984ddb7e9d2d837e4ea9ee40443b4afb270b81b064bc11",
+  "catalogRecords": 45,
+  "uniqueGames": 44,
+  "previewPolicy": "Attached iOS screenshot when present; LSX4 logo otherwise.",
+  "games": [
+    {
+      "title": "Islets",
+      "titleIds": [
+        "CUSA52139"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "islets.jpg",
+      "previewSource": "https://lsx45.app/community-media/342858f983515118c78ee278bce405dd.jpg",
+      "reportSource": "https://lsx45.app/api/community-reports/8207268907814-402e9a58-6832-4cf3-81fd-5591e10a01a5"
+    },
+    {
+      "title": "Bloodborne",
+      "titleIds": [
+        "CUSA03173"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay video",
+      "image": "default.png",
+      "evidence": "https://youtu.be/uIZNsICj8PQ"
+    },
+    {
+      "title": "Sonic Mania",
+      "titleIds": [
+        "CUSA07010",
+        "CUSA07023"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Rain World",
+      "titleIds": [
+        "CUSA05667"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Dead Cells",
+      "titleIds": [
+        "CUSA10484"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Shovel Knight",
+      "titleIds": [
+        "CUSA01867"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Carto",
+      "titleIds": [
+        "CUSA23985"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Minit",
+      "titleIds": [
+        "CUSA09747"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Mega Shoot",
+      "titleIds": [
+        "CUSA59042"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Downwell",
+      "titleIds": [
+        "CUSA04550"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "The Binding of Isaac: Rebirth",
+      "titleIds": [
+        "CUSA00792"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Nidhogg",
+      "titleIds": [
+        "CUSA00920"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Spider: Rite of the Shrouded Moon",
+      "titleIds": [
+        "CUSA02473"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Dandara",
+      "titleIds": [
+        "CUSA10749"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Ninja JaJaMaru Collection",
+      "titleIds": [
+        "CUSA25416"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Axiom Verge 2",
+      "titleIds": [
+        "CUSA29346"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "A Short Hike",
+      "titleIds": [
+        "CUSA30277"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Just Shapes & Beats",
+      "titleIds": [
+        "CUSA10349"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Thomas Was Alone",
+      "titleIds": [
+        "CUSA00909"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "FAR: Lone Sails",
+      "titleIds": [
+        "CUSA14846"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Nuclear Throne",
+      "titleIds": [
+        "CUSA03902"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Undertale",
+      "titleIds": [
+        "CUSA09415"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Jazzpunk: Director's Cut",
+      "titleIds": [
+        "CUSA05228"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Risk of Rain 2",
+      "titleIds": [
+        "CUSA16209"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Dark Devotion",
+      "titleIds": [
+        "CUSA14657"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Replay: VHS Is Not Dead",
+      "titleIds": [
+        "CUSA02765"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Going Under",
+      "titleIds": [
+        "CUSA19050"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Fight'N Rage",
+      "titleIds": [
+        "CUSA17844"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Nidhogg 2",
+      "titleIds": [
+        "CUSA07640"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Another World: 20th Anniversary Edition",
+      "titleIds": [
+        "CUSA00602"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Bonfire Peaks",
+      "titleIds": [
+        "CUSA28188"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Broforce",
+      "titleIds": [
+        "CUSA03887"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Cyber Shadow",
+      "titleIds": [
+        "CUSA24216"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Might & Magic: Clash of Heroes",
+      "titleIds": [
+        "CUSA32398"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Owlboy",
+      "titleIds": [
+        "CUSA09920"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Trine Enchanted Edition",
+      "titleIds": [
+        "CUSA01126"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Hillbilly Doomsday",
+      "titleIds": [
+        "CUSA32036"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Turnip Boy Commits Tax Evasion",
+      "titleIds": [
+        "CUSA35834"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Cosmophony",
+      "titleIds": [
+        "CUSA02483"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Deltarune",
+      "titleIds": [
+        "CUSA15250"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Don't Bite Me Bro!",
+      "titleIds": [
+        "CUSA08921"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Lucy Dreaming",
+      "titleIds": [
+        "CUSA46929"
+      ],
+      "platform": "PS4",
+      "source": "iOS gameplay observation",
+      "image": "default.png"
+    },
+    {
+      "title": "Balatro",
+      "titleIds": [
+        "CUSA47498"
+      ],
+      "platform": "PS4",
+      "source": "Community report",
+      "image": "default.png"
+    },
+    {
+      "title": "Farlands Journey",
+      "titleIds": [
+        "CUSA49898"
+      ],
+      "platform": "PS4",
+      "source": "Community report",
+      "image": "default.png"
+    }
+  ]
+}
