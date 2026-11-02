@@ -85,6 +85,10 @@ struct IOSManagedCatalogue: Codable { let options: [IOSManagedOption] }
             if checked(option) { enabled |= 1 << id }
         }
         if enabled & (1<<5) != 0 { enabled |= 1<<4 }
+        // 360p renders at 656x368 and needs the upscaler chosen next to the
+        // resolution, which the runtime gates behind the FSR option.
+        let resolution=ConsoleRenderResolution.selected
+        if resolution.outputDimensions.0 != resolution.dimensions.0 { present |= 1<<20; enabled |= 1<<20 }
         return (present,enabled)
     }
     func prepare(documents: URL = .documentsDirectory) throws {

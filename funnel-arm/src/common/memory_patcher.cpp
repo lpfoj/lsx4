@@ -566,7 +566,8 @@ void ApplyConfiguredTitleResolutionOverride() {
         target_width != 0 && target_height != 0 &&
         static_cast<u64>(target_width) * 9 == static_cast<u64>(target_height) * 16;
     const bool target_is_aligned_960x544 =
-        target_width == 960 && target_height == 544;
+        (target_width == 960 && target_height == 544) ||
+        (target_width == 656 && target_height == 368);
     const bool target_has_supported_geometry =
         target_is_16_9 || target_is_aligned_960x544;
     const bool target_is_downscale =

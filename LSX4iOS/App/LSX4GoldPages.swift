@@ -67,6 +67,7 @@ struct GoldSettingsView:View {
     @AppStorage("gold.music") private var music=true
     @AppStorage("gold.effects") private var effects=true
     @AppStorage("lsx4.renderResolution") private var resolution="544p"
+    @AppStorage("lsx4.upscaler") private var upscaler=ConsoleUpscaler.fsr1.rawValue
     @AppStorage("lsx4.showExecutionMode") private var showExecutionMode=false
     @AppStorage("lsx4.executionMode") private var mode=""
     @State private var jitSetup=false
@@ -109,7 +110,12 @@ struct GoldSettingsView:View {
         Form {
             Section(G("graphics_resolution","Resolution")) {
                 Picker(L("Разрешение игры и вывода"),selection:$resolution) {ForEach(ConsoleRenderResolution.allCases) {Text($0.label).tag($0.rawValue)}}.accessibilityIdentifier("game-render-resolution")
+                if resolution == ConsoleRenderResolution.low.rawValue {
+                    Picker(G("graphics_upscaler","Upscaler"),selection:$upscaler) {ForEach(ConsoleUpscaler.allCases) {Text($0.label).tag($0.rawValue)}}.accessibilityIdentifier("game-upscaler")
+                    Text(G("graphics_upscaler_hint","360p renders at 656 × 368. An upscaler enlarges it to 960 × 544, even when FSR is off in optimizations; Off shows 656 × 368 as is.")).font(.footnote).foregroundStyle(.secondary)
+                }
                 Text(L("Меньшее разрешение снижает нагрузку на графику и чёткость. Применяется при следующем запуске игры."))
+                Text(G("graphics_bloodborne_preset","Bloodborne uses 360p with AMD FSR 1.0 until you pick a resolution here.")).font(.footnote).foregroundStyle(.secondary)
                 Text(L("Игры с фиксированным внутренним разрешением могут менять только размер выходного кадра.")).font(.footnote).foregroundStyle(.secondary)
             }
             Section {LabeledContent("GPU",value:MTLCreateSystemDefaultDevice()?.name ?? "Apple GPU");LabeledContent(G("graphics_backend","Graphics backend"),value:"Vulkan · MoltenVK · Metal")}

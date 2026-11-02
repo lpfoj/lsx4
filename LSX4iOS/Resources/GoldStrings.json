@@ -653,7 +653,11 @@
     "optimization_fsr": "FSR upscaling",
     "optimization_fsr_hint": "Uses FSR when the adaptive renderer actually upscales a smaller image.",
     "optimization_rcas": "RCAS sharpening",
-    "optimization_rcas_hint": "Enables RCAS sharpening in the adaptive rendering path."
+    "optimization_rcas_hint": "Enables RCAS sharpening in the adaptive rendering path.",
+    "graphics_upscaler": "Upscaler",
+    "graphics_upscaler_hint": "360p renders at 656 × 368. An upscaler enlarges it to 960 × 544, even when FSR is off in optimizations; Off shows 656 × 368 as is.",
+    "graphics_bloodborne_preset": "Bloodborne uses 360p with AMD FSR 1.0 until you pick a resolution here.",
+    "upscaler_bilinear": "Bilinear"
   },
   "ru": {
     "system_info_category_system": "Система",
@@ -846,7 +850,7 @@
     "graphics_fsr_section": "Апскейлинг разрешения",
     "graphics_fsr_enabled": "Включить апскейлинг разрешения",
     "graphics_upscaler_algorithm": "Алгоритм апскейлинга",
-    "upscaler_off": "Выключен",
+    "upscaler_off": "Выкл.",
     "upscaler_auto": "Авто (рекомендуется для GPU)",
     "graphics_upscaled_output_resolution": "Выходное разрешение апскейлера",
     "graphics_rcas_enabled": "Повышение резкости RCAS",
@@ -1309,7 +1313,11 @@
     "optimization_fsr": "Масштабирование FSR",
     "optimization_fsr_hint": "Применяет FSR, когда адаптивный рендерер увеличивает изображение меньшего размера.",
     "optimization_rcas": "Повышение резкости RCAS",
-    "optimization_rcas_hint": "Включает повышение резкости RCAS в адаптивном рендерере."
+    "optimization_rcas_hint": "Включает повышение резкости RCAS в адаптивном рендерере.",
+    "graphics_upscaler": "Апскейлер",
+    "graphics_upscaler_hint": "360p рисует игру в 656 × 368. Апскейлер растягивает до 960 × 544, даже если FSR выключен в оптимизациях; «Выкл.» показывает 656 × 368 как есть.",
+    "graphics_bloodborne_preset": "Bloodborne по умолчанию идёт в 360p с AMD FSR 1.0, пока вы не выберете разрешение здесь.",
+    "upscaler_bilinear": "Билинейный"
   },
   "de": {
     "system_info_category_system": "System",
@@ -1965,7 +1973,11 @@
     "optimization_fsr": "FSR-Skalierung",
     "optimization_fsr_hint": "Verwendet FSR, wenn der adaptive Renderer ein kleineres Bild hochskaliert.",
     "optimization_rcas": "RCAS-Schärfung",
-    "optimization_rcas_hint": "Aktiviert RCAS-Schärfung im adaptiven Renderer."
+    "optimization_rcas_hint": "Aktiviert RCAS-Schärfung im adaptiven Renderer.",
+    "graphics_upscaler": "Hochskalierung",
+    "graphics_upscaler_hint": "360p rendert mit 656 × 368. Die Hochskalierung vergrößert auf 960 × 544, auch wenn FSR in den Optimierungen aus ist; „Aus“ zeigt 656 × 368 unverändert.",
+    "graphics_bloodborne_preset": "Bloodborne nutzt 360p mit AMD FSR 1.0, bis Sie hier eine Auflösung wählen.",
+    "upscaler_bilinear": "Bilinear"
   },
   "es": {
     "system_info_category_system": "System",
@@ -2621,7 +2633,11 @@
     "optimization_fsr": "Escalado FSR",
     "optimization_fsr_hint": "Usa FSR cuando el renderizador adaptativo amplía una imagen menor.",
     "optimization_rcas": "Nitidez RCAS",
-    "optimization_rcas_hint": "Activa la nitidez RCAS en el renderizado adaptativo."
+    "optimization_rcas_hint": "Activa la nitidez RCAS en el renderizado adaptativo.",
+    "graphics_upscaler": "Escalador",
+    "graphics_upscaler_hint": "360p renderiza a 656 × 368. El escalador amplía a 960 × 544 aunque FSR esté desactivado en optimizaciones; «Desactivado» muestra 656 × 368 tal cual.",
+    "graphics_bloodborne_preset": "Bloodborne usa 360p con AMD FSR 1.0 hasta que elijas una resolución aquí.",
+    "upscaler_bilinear": "Bilineal"
   },
   "fr": {
     "system_info_category_system": "System",
@@ -3277,7 +3293,11 @@
     "optimization_fsr": "Mise à l’échelle FSR",
     "optimization_fsr_hint": "Utilise FSR lorsque le rendu adaptatif agrandit une image plus petite.",
     "optimization_rcas": "Netteté RCAS",
-    "optimization_rcas_hint": "Active la netteté RCAS dans le rendu adaptatif."
+    "optimization_rcas_hint": "Active la netteté RCAS dans le rendu adaptatif.",
+    "graphics_upscaler": "Mise à l’échelle",
+    "graphics_upscaler_hint": "360p rend en 656 × 368. La mise à l’échelle agrandit en 960 × 544 même si FSR est désactivé dans les optimisations ; « Désactivé » affiche 656 × 368 tel quel.",
+    "graphics_bloodborne_preset": "Bloodborne utilise 360p avec AMD FSR 1.0 tant que vous ne choisissez pas de résolution ici.",
+    "upscaler_bilinear": "Bilinéaire"
   },
   "zh-Hans": {
     "system_info_category_system": "System",
@@ -3933,7 +3953,11 @@
     "optimization_fsr": "FSR 超分辨率",
     "optimization_fsr_hint": "当自适应渲染器放大较小图像时使用 FSR。",
     "optimization_rcas": "RCAS 锐化",
-    "optimization_rcas_hint": "在自适应渲染路径中启用 RCAS 锐化。"
+    "optimization_rcas_hint": "在自适应渲染路径中启用 RCAS 锐化。",
+    "graphics_upscaler": "超分辨率",
+    "graphics_upscaler_hint": "360p 以 656 × 368 渲染。超分辨率会放大到 960 × 544（即使优化中关闭了 FSR）；“关闭”则按 656 × 368 显示。",
+    "graphics_bloodborne_preset": "在此选择分辨率之前，Bloodborne 默认使用 360p 和 AMD FSR 1.0。",
+    "upscaler_bilinear": "双线性"
   },
   "pt": {
     "patches_title": "Patches de jogos",
@@ -4005,7 +4029,12 @@
     "optimization_anisotropy_guest": "Predefinição do jogo",
     "optimization_anisotropy_1x": "Forçar 1×",
     "optimization_anisotropy_2x": "Limitar a 2×",
-    "category_managed_optimizations": "Otimizações geridas"
+    "category_managed_optimizations": "Otimizações geridas",
+    "graphics_upscaler": "Upscaler",
+    "graphics_upscaler_hint": "360p renderiza em 656 × 368. O upscaler amplia para 960 × 544 mesmo com o FSR desligado nas otimizações; «Desligado» mostra 656 × 368 como está.",
+    "graphics_bloodborne_preset": "Bloodborne usa 360p com AMD FSR 1.0 até escolher uma resolução aqui.",
+    "upscaler_off": "Desligado",
+    "upscaler_bilinear": "Bilinear"
   },
   "zh": {
     "patches_title": "游戏补丁",
@@ -4173,7 +4202,7 @@
     "graphics_fsr_section": "分辨率放大",
     "graphics_fsr_enabled": "启用分辨率放大",
     "graphics_upscaler_algorithm": "放大算法",
-    "upscaler_off": "关闭",
+    "upscaler_off": "關閉",
     "upscaler_auto": "自动（适合 GPU，推荐）",
     "graphics_rcas_enabled": "RCAS 锐化",
     "graphics_upscaler_parameters": "算法参数",
@@ -4661,7 +4690,11 @@
     "optimization_fsr": "FSR 超分辨率",
     "optimization_fsr_hint": "当自适应渲染器放大较小图像时使用 FSR。",
     "optimization_rcas": "RCAS 锐化",
-    "optimization_rcas_hint": "在自适应渲染路径中启用 RCAS 锐化。"
+    "optimization_rcas_hint": "在自适应渲染路径中启用 RCAS 锐化。",
+    "graphics_upscaler": "超分辨率",
+    "graphics_upscaler_hint": "360p 以 656 × 368 渲染。超分辨率會放大到 960 × 544（即使優化中關閉了 FSR）；「關閉」則按 656 × 368 顯示。",
+    "graphics_bloodborne_preset": "在此選擇解析度之前，Bloodborne 預設使用 360p 和 AMD FSR 1.0。",
+    "upscaler_bilinear": "雙線性"
   },
   "pt-BR": {
     "patches_title": "Patches de jogos",
@@ -4733,6 +4766,11 @@
     "optimization_anisotropy_guest": "Predefinição do jogo",
     "optimization_anisotropy_1x": "Forçar 1×",
     "optimization_anisotropy_2x": "Limitar a 2×",
-    "category_managed_optimizations": "Otimizações geridas"
+    "category_managed_optimizations": "Otimizações geridas",
+    "graphics_upscaler": "Upscaler",
+    "graphics_upscaler_hint": "360p renderiza em 656 × 368. O upscaler amplia para 960 × 544 mesmo com o FSR desligado nas otimizações; “Desligado” mostra 656 × 368 como está.",
+    "graphics_bloodborne_preset": "Bloodborne usa 360p com AMD FSR 1.0 até você escolher uma resolução aqui.",
+    "upscaler_off": "Desligado",
+    "upscaler_bilinear": "Bilinear"
   }
 }

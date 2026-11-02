@@ -57,12 +57,41 @@ enum ConsoleRenderResolution: String, CaseIterable, Identifiable {
         case .fullHD: return (1920,1080)
         case .hd: return (1280,720)
         case .compact: return (960,544)
-        case .low: return (640,360)
+        case .low: return (656,368)
         }
     }
-    var label: String { "\(rawValue) · \(dimensions.0) × \(dimensions.1)" }
+    var outputDimensions: (Int, Int) {
+        self == .low && ConsoleUpscaler.selected != .off ? ConsoleRenderResolution.compact.dimensions : dimensions
+    }
+    var label: String {
+        let (width,height)=dimensions,(outWidth,outHeight)=outputDimensions
+        return outWidth == width ? "\(rawValue) · \(width) × \(height)" : "\(rawValue) · \(width) × \(height) → \(outWidth) × \(outHeight)"
+    }
+    // Bloodborne's preset renders 360p and upscales with FSR unless the user
+    // picked a resolution; the graphics page states this next to the picker.
+    static let lowPresetTitles: Set<String> = ["CUSA00207", "CUSA03173", "CUSA00900", "CUSA01363"]
+    nonisolated(unsafe) static var launchTitle: String?
     static var selected: Self {
-        UserDefaults.standard.string(forKey:"lsx4.renderResolution").flatMap(Self.init(rawValue:)) ?? .compact
+        if let chosen = UserDefaults.standard.string(forKey:"lsx4.renderResolution").flatMap(Self.init(rawValue:)) {
+            return chosen
+        }
+        return launchTitle.map(lowPresetTitles.contains) == true ? .low : .compact
+    }
+}
+
+enum ConsoleUpscaler: Int, CaseIterable, Identifiable {
+    case off = 0, fsr1 = 5, nis = 7, bilinear = 2
+    var id: Int { rawValue }
+    var label: String {
+        switch self {
+        case .off: return G("upscaler_off","Off")
+        case .fsr1: return "AMD FSR 1.0"
+        case .nis: return "NVIDIA NIS"
+        case .bilinear: return G("upscaler_bilinear","Bilinear")
+        }
+    }
+    static var selected: Self {
+        (UserDefaults.standard.object(forKey:"lsx4.upscaler") as? Int).flatMap(Self.init(rawValue:)) ?? .fsr1
     }
 }
 
@@ -70,25 +99,32 @@ enum ConsoleRenderResolution: String, CaseIterable, Identifiable {
 // runtime display configuration. No renderer ABI or guest-memory path changes.
 @objc(LSX4RenderResolutionSettings) @MainActor
 public final class LSX4RenderResolutionSettings: NSObject {
-    @objc public static var width: Int { ConsoleRenderResolution.selected.dimensions.0 }
-    @objc public static var height: Int { ConsoleRenderResolution.selected.dimensions.1 }
+    @objc public static var width: Int { ConsoleRenderResolution.selected.outputDimensions.0 }
+    @objc public static var height: Int { ConsoleRenderResolution.selected.outputDimensions.1 }
     @objc public static func prepareForGame() -> String? {
         let selected=ConsoleRenderResolution.selected
         let (width,height)=selected.dimensions
+        let (outWidth,outHeight)=selected.outputDimensions
+        let upscaler=ConsoleUpscaler.selected
         let directory=URL.documentsDirectory.appendingPathComponent("shared-runtime/runtime-config",isDirectory:true)
-        // Version2 is supported by the actual linked runtime. Equal source and
-        // output plus upscaler OFF avoids a hidden second resolution step.
-        let ini="version=2\nfsr_enabled=0\nsource_width=\(width)\nsource_height=\(height)\noutput_width=\(width)\noutput_height=\(height)\n"
+        // Equal source and output keep upscaling off. 360p renders at 656x368:
+        // the Bloodborne resolution layout loses scene lighting at a 640-pixel width.
+        let ini=outWidth == width
+            ? "version=2\nfsr_enabled=0\nsource_width=\(width)\nsource_height=\(height)\noutput_width=\(width)\noutput_height=\(height)\n"
+            : "version=4\nfsr_enabled=1\nupscaler_mode=\(upscaler.rawValue)\nsource_width=\(width)\nsource_height=\(height)\noutput_width=\(outWidth)\noutput_height=\(outHeight)\nfsr1_rcas_enabled=1\nfsr1_rcas_sharpness_milli=800\n"
         do {
             try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true)
             try Data(ini.utf8).write(to:directory.appendingPathComponent("android-render-resolution.ini"),options:.atomic)
-            let receipt: [String:Any] = ["preset":selected.rawValue,"outputWidth":width,"outputHeight":height,
+            // The host rewrites the Android file with its global profile at core
+            // start; the runtime reads an explicit upscale pair from this one.
+            try Data(ini.utf8).write(to:directory.appendingPathComponent("ios-render-resolution.ini"),options:.atomic)
+            let receipt: [String:Any] = ["preset":selected.rawValue,"outputWidth":outWidth,"outputHeight":outHeight,"upscaler":outWidth == width ? 0 : upscaler.rawValue,
                 "requestedGameWidth":width,"requestedGameHeight":height,"timestamp":Date().timeIntervalSince1970,
                 "bundleVersion":Bundle.main.object(forInfoDictionaryKey:"CFBundleVersion") as? String ?? "",
                 "stage":"configured-before-core"]
             try JSONSerialization.data(withJSONObject:receipt,options:.sortedKeys).write(
                 to:URL.documentsDirectory.appendingPathComponent("render-resolution-status.json"),options:.atomic)
-            NSLog("[APPLE_RENDER_RESOLUTION] preset=%@ output=%dx%d requestedGame=%dx%d",selected.rawValue,width,height,width,height)
+            NSLog("[APPLE_RENDER_RESOLUTION] preset=%@ output=%dx%d requestedGame=%dx%d upscaler=%d",selected.rawValue,outWidth,outHeight,width,height,outWidth == width ? 0 : upscaler.rawValue)
             return nil
         } catch { return L("Не удалось применить разрешение игры.") }
     }
@@ -329,6 +365,7 @@ public final class LSX4LaunchSettings: NSObject {
         guard title.count==9, title.hasPrefix("CUSA"), title.dropFirst(4).allSatisfy(\.isNumber) else {
             return CocoaError(.fileReadInvalidFileName).localizedDescription
         }
+        ConsoleRenderResolution.launchTitle = title
         do {
             try IOSGamePatchStore().prepare(title:title,name:name)
             try IOSManagedOptimizationStore(title:title).prepare()

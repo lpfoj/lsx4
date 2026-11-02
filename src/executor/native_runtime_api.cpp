@@ -2406,7 +2406,8 @@ void ConfigureAndroidRuntimeUserPathsAndBaseConfig() {
 #if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)
 bool IsSupportedAndroidFixedSurfaceSize(const int width, const int height) {
     return (width == 320 && height == 180) || (width == 480 && height == 270) ||
-           (width == 640 && height == 360) || (width == 960 && height == 544) ||
+           (width == 640 && height == 360) || (width == 656 && height == 368) ||
+           (width == 960 && height == 544) ||
            (width == 1280 && height == 720) || (width == 1920 && height == 1080) ||
            (width == 2880 && height == 1620);
 }
@@ -2418,16 +2419,11 @@ struct AndroidRenderResolutionSelection {
     u32 output_height{};
 };
 
-std::optional<AndroidRenderResolutionSelection> LoadAndroidRenderResolutionSelection(
-    bool* version2_config_seen = nullptr) {
+std::optional<AndroidRenderResolutionSelection> LoadRenderResolutionSelectionFile(
+    const std::filesystem::path& config, bool* version2_config_seen) {
     if (version2_config_seen != nullptr) {
         *version2_config_seen = false;
     }
-    if (g_root.empty()) {
-        return std::nullopt;
-    }
-    const auto config = std::filesystem::path(g_root) / "runtime-config" /
-                        "android-render-resolution.ini";
     std::ifstream input(config);
     if (!input) {
         return std::nullopt;
@@ -2539,6 +2535,28 @@ std::optional<AndroidRenderResolutionSelection> LoadAndroidRenderResolutionSelec
         return std::nullopt;
     }
     return selection;
+}
+
+std::optional<AndroidRenderResolutionSelection> LoadAndroidRenderResolutionSelection(
+    bool* version2_config_seen = nullptr) {
+    if (g_root.empty()) {
+        if (version2_config_seen != nullptr) {
+            *version2_config_seen = false;
+        }
+        return std::nullopt;
+    }
+    const auto directory = std::filesystem::path(g_root) / "runtime-config";
+#if defined(LSX4_APPLE_RUNTIME)
+    // The iOS settings screen owns ios-render-resolution.ini. The host refreshes
+    // android-render-resolution.ini with its global profile on every launch, so
+    // an explicit iOS source/output pair must not be read from that file.
+    if (auto selection = LoadRenderResolutionSelectionFile(
+            directory / "ios-render-resolution.ini", version2_config_seen)) {
+        return selection;
+    }
+#endif
+    return LoadRenderResolutionSelectionFile(directory / "android-render-resolution.ini",
+                                             version2_config_seen);
 }
 
 std::pair<u32, u32> AndroidInternalResolutionForUpscaler(
