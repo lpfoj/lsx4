@@ -63,7 +63,7 @@ enum LSX4PkgInstaller {
     private static let reserve: Int64 = 128 * 1024 * 1024
 
     static func validID(_ id: String) -> Bool {
-        id.range(of: "^CUSA[0-9]{5}$", options: .regularExpression) != nil
+        id.range(of: "^(CUSA|PPSA)[0-9]{5}$", options: .regularExpression) != nil
     }
     private static func be(_ data: Data, _ offset: Int, _ count: Int) -> UInt64 {
         data[offset..<offset+count].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
@@ -79,7 +79,7 @@ enum LSX4PkgInstaller {
         guard count > 0, count <= 8192, table >= 0x1000, table <= fileSize, count*32 <= fileSize-table,
               pfs <= fileSize, size > 0, size <= fileSize-pfs, declared <= fileSize else { throw Failure.invalid("truncated package or invalid file table") }
         let id = String(data: data[0x47..<0x50], encoding: .utf8) ?? ""
-        guard validID(id) else { throw Failure.invalid("only PS4 CUSA packages are supported") }
+        guard validID(id),id.hasPrefix("CUSA") else { throw Failure.invalid("only PS4 CUSA packages are supported") }
         return id
     }
     private static func sfo(_ data: Data) throws -> [String:String] {
@@ -111,6 +111,22 @@ enum LSX4PkgInstaller {
     }
 
     static func folderMetadata(_ folder: URL) throws -> (id:String,title:String) {
+        let json=folder.appendingPathComponent("sce_sys/param.json")
+        if !regular(folder.appendingPathComponent("sce_sys/param.sfo"),within:folder),regular(json,within:folder) {
+            guard regular(folder.appendingPathComponent("eboot.bin"),within:folder),
+                  let size=try json.resourceValues(forKeys:[.fileSizeKey]).fileSize,size>0,size<=4*1024*1024,
+                  let fields=try JSONSerialization.jsonObject(with:Data(contentsOf:json)) as? [String:Any],
+                  let id=fields["titleId"] as? String,validID(id),id.hasPrefix("PPSA") else {
+                throw Failure.invalid("a PS5 game with eboot.bin and a valid sce_sys/param.json is required")
+            }
+            let localized=fields["localizedParameters"] as? [String:Any]
+            let english=localized?["en-US"] as? [String:Any]
+            let title=english?["titleName"] as? String ?? id
+            let executable=try FileHandle(forReadingFrom:folder.appendingPathComponent("eboot.bin"));defer {try? executable.close()}
+            let magic=Array(try executable.read(upToCount:4) ?? Data())
+            guard magic == [0x7f,0x45,0x4c,0x46] || magic == [0x4f,0x15,0x3d,0x1d] else {throw Failure.invalid("eboot.bin is not a PS5 executable")}
+            return (id,String(title.prefix(512)))
+        }
         let executable=folder.appendingPathComponent("eboot.bin"),param=folder.appendingPathComponent("sce_sys/param.sfo")
         guard regular(executable,within:folder),regular(param,within:folder),
               let size=try param.resourceValues(forKeys:[.fileSizeKey]).fileSize,size<=2*1024*1024 else {
@@ -123,7 +139,7 @@ enum LSX4PkgInstaller {
         // A complete extracted installation may already have an update merged
         // into it; its param.sfo then legitimately retains CATEGORY=gp.
         // Standalone update PKGs remain rejected by install(source:).
-        guard let id=fields["TITLE_ID"],validID(id),fields["CATEGORY"] != "ac" else {
+        guard let id=fields["TITLE_ID"],validID(id),id.hasPrefix("CUSA"),fields["CATEGORY"] != "ac" else {
             throw Failure.invalid("a PS4 base game with a valid CUSA TITLE_ID is required")
         }
         return (id,String((fields["TITLE"] ?? id).prefix(512)))

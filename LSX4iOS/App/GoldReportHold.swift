@@ -5,6 +5,7 @@ import UIKit
 /// Android's mark-on-release thresholds. Scrolling and interrupted touches never publish.
 struct GoldReportHold:UIViewRepresentable {
     var tap:()->Void
+    var details:(()->Void)?=nil
     var mark:(Bool)->Void
     var progress:(Double)->Void
     func makeUIView(context:Context)->Surface {let view=Surface();view.configure(self);return view}
@@ -32,7 +33,7 @@ struct GoldReportHold:UIViewRepresentable {
                 if !bounds.insetBy(dx:-12,dy:-12).contains(point) {recognizer.isEnabled=false;recognizer.isEnabled=true;stop()}
             case .ended:
                 let duration=ProcessInfo.processInfo.systemUptime-started;stop()
-                if duration>=4 {action?.mark(duration>=5)}
+                if duration>=4 {action?.mark(duration>=5)} else {action?.details?()}
             case .cancelled,.failed:stop()
             default:break
             }
@@ -48,7 +49,9 @@ struct GoldReportHold:UIViewRepresentable {
 }
 
 struct GoldReportableRow<Content:View>:View {
-    var tap:()->Void,mark:(Bool)->Void
+    var tap:()->Void
+    var details:(()->Void)?=nil
+    var mark:(Bool)->Void
     var identifier:String
     @ViewBuilder var content:()->Content
     @State private var held:Double=0
@@ -63,6 +66,6 @@ struct GoldReportableRow<Content:View>:View {
             }
         }.buttonStyle(.plain).accessibilityIdentifier(identifier)
             .accessibilityHint(P("hold_accessibility","Hold 4 seconds and release for Unplayable, or 5 seconds for Playable. Also available in the game menu."))
-            .overlay {GoldReportHold(tap:tap,mark:mark,progress:{held=$0})}
+            .overlay {GoldReportHold(tap:tap,details:details,mark:mark,progress:{held=$0})}
     }
 }

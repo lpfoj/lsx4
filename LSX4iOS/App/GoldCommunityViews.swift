@@ -15,7 +15,7 @@ enum GoldReportDevice {
         let count=MemoryLayout.size(ofValue:value.machine)
         return withUnsafePointer(to:&value.machine) {$0.withMemoryRebound(to:CChar.self,capacity:count) {String(cString:$0)}}
     }
-    static var model:String {machine == "iPhone18,2" ? "iPhone 17 Pro Max" : "iPhone (\(machine))"}
+    static var model:String {machine == "iPhone18,2" ? "iPhone 17 Pro Max" : UIDevice.current.model+" (\(machine))"}
     @MainActor static var hardware:LSX4CommunityReport.Hardware {
         let bounds=UIScreen.main.nativeBounds
         return .init(machine:machine,modelName:model,gpu:MTLCreateSystemDefaultDevice()?.name,
@@ -28,6 +28,39 @@ enum GoldReportDevice {
             executionMode:ConsoleExecutionMode.selected.label,result:result,
             notes:quick ? P("report_auto_note","Marked {result} from the LSX4 iOS library.",["result":result.label]) : notes,fps:fps,consent:true,
             hardware:hardware,source:quick ? "ios-quick-mark" : "manual")
+    }
+}
+
+struct GoldReportGameIcon:View {
+    let report:LSX4CommunityReport
+    private var playable:Bool {report.result == "playable"}
+    var body:some View {
+        GoldCover(game:ConsoleTitle(id:report.titleId,title:report.gameTitle,androidStatus:"",bytes:0),showUserStatus:false)
+            .frame(width:52,height:52).clipShape(RoundedRectangle(cornerRadius:10))
+            .overlay(alignment:.bottomTrailing) {
+                Image(systemName:playable ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                    .font(.system(size:18,weight:.semibold)).foregroundStyle(playable ? Color.green : .orange)
+                    .padding(3).background(.black.opacity(0.9),in:Circle()).offset(x:3,y:3)
+            }.accessibilityElement(children:.ignore)
+            .accessibilityLabel(playable ? LSX4ReportedResult.playable.label : LSX4ReportedResult.unplayable.label)
+            .accessibilityIdentifier("report-result-icon-"+report.id)
+    }
+}
+
+struct GoldReportStatusNotes:View {
+    let report:LSX4CommunityReport
+    var conflict=false
+    var body:some View {
+        if LSX4ReportStatus.isOldUnplayable(report) {
+            Text(P("community_old_version","(old version)"))
+                .font(.caption).foregroundStyle(.red)
+                .accessibilityIdentifier("community-old-version-"+report.id)
+        }
+        if conflict {
+            Text(P("community_result_conflict","Possible conflicting results: this game appears in both sections. Check the reported device."))
+                .font(.caption).foregroundStyle(.orange).fixedSize(horizontal:false,vertical:true)
+                .accessibilityIdentifier("community-conflict-"+report.id)
+        }
     }
 }
 
@@ -47,7 +80,7 @@ struct GoldQuickMarkView:View {
                     Text(result == .playable ? P("report_positive_done","Published in the app and on lsx45.app. Open your entry in Tested compatible games to add a screenshot or video.") : P("report_negative_done","Published on lsx45.app. Unplayable reports are excluded from the app’s shared Playable list."))
                 } else {
                     Text(P("report_metadata","Public: game, result, device model, CPU, RAM, GPU, screen size, iOS/app version and JIT mode. No name, unique device ID, saves or logs."))
-                    Text(P("report_scope","Playable appears in the app and on lsx45.app; Unplayable appears only on the website. Community reports are unverified.")).font(.footnote)
+                    Text(P("report_scope_both","Playable and Unplayable appear in their separate community sections in the app and on lsx45.app. Community reports are unverified.")).font(.footnote)
                     Text(P("report_consent_note","After the first confirmation, marks update your public report immediately. You can disable sending in Settings. Optional media is uploaded only when selected.")).font(.footnote)
                     Link(P("privacy_policy","Privacy policy"),destination:URL(string:"https://lsx45.app/privacy/#9-optional-game-compatibility-reports")!)
                     if !error.isEmpty {Text(error).foregroundStyle(.red).accessibilityIdentifier("quick-report-error")}
@@ -127,15 +160,21 @@ struct GoldCommunityReportDetail:View {
     @AppStorage(LSX4ReportSharing.key) private var sharing=true
     @State private var photo:PhotosPickerItem?=nil
     @State private var movie:PhotosPickerItem?=nil
+    @State private var editing=false
+    @ObservedObject private var account=LSX4AccountSession.shared
     @State private var busy=false
     @State private var message=""
-    private var mine:Bool {LSX4ReportOwnership.key(report.id) != nil}
+    private var mine:Bool {LSX4AccountCredentials.owns(report)}
     var body:some View {
         ScrollView {VStack(alignment:.leading,spacing:16) {
-            Text(report.gameTitle).font(.title2)
-            if mine {Label(P("report_mine","Your report · this device"),systemImage:"person.crop.circle.badge.checkmark").foregroundStyle(.mint).accessibilityIdentifier("community-your-report")}
+            HStack(spacing:14) {GoldReportGameIcon(report:report);Text(report.gameTitle).font(.title2)}
+            if let author=report.author {NavigationLink {GoldMemberProfile(user:author)} label: {HStack {GoldMemberAvatar(user:author,size:36);GoldMemberPlatformIcon(user:author);Text(author.username)}}}
+            if mine {Button(P("report_edit","Edit report"),systemImage:"square.and.pencil") {editing=true}.accessibilityIdentifier("report-edit")}
+            Text(report.result == "playable" ? LSX4ReportedResult.playable.label : LSX4ReportedResult.unplayable.label).font(.headline).foregroundStyle(report.result == "playable" ? .mint : .orange)
+            if mine {Label(P("report_mine_short","Your report"),systemImage:"person.crop.circle.badge.checkmark").foregroundStyle(.mint).accessibilityIdentifier("community-your-report")}
             Text(P("report_unverified","User submitted · unverified")).font(.caption).foregroundStyle(.secondary)
             Text([report.device,"iOS "+(report.osVersion ?? ""),report.executionMode ?? "","LSX4 "+report.appVersion,report.titleId].filter {!$0.isEmpty}.joined(separator:" · "))
+            GoldReportStatusNotes(report:report,conflict:LSX4ReportStatus.hasConflict(report,in:LSX4ReportStatus.conflictingGames(cache.reports)))
             if let specs=report.hardware {
                 Text([specs.machine,specs.cpuCores.map {P("device_cores","{count} CPU cores",["count":String($0)])},specs.memoryBytes.map {P("device_ram","{size} GB RAM",["size":String(format:"%.1f",Double($0)/1_073_741_824)])},specs.gpu,
                       specs.screenWidth.flatMap {width in specs.screenHeight.map {"\(width) × \($0) px"}}].compactMap {$0}.joined(separator:" · ")).font(.footnote).foregroundStyle(.secondary)
@@ -170,9 +209,10 @@ struct GoldCommunityReportDetail:View {
             if !message.isEmpty {Text(message).accessibilityIdentifier("community-media-status")}
             Button(P("report_refresh","Refresh report")) {Task {await refresh()}}.disabled(busy).accessibilityIdentifier("community-report-refresh")
             Link(P("report_website","View iOS reports on lsx45.app"),destination:URL(string:"https://lsx45.app/playable/#ios-reports")!)
-        }.frame(maxWidth:.infinity,alignment:.leading).padding()}
-        .navigationTitle(report.gameTitle).navigationBarTitleDisplayMode(.inline)
+        }.frame(maxWidth:900,alignment:.leading).padding().frame(maxWidth:.infinity)}
+        .goldCommunityPage().navigationTitle(report.gameTitle).navigationBarTitleDisplayMode(.inline)
         .interactiveDismissDisabled(busy)
+        .goldModal(isPresented:$editing) {GoldPage(title:P("report_edit","Edit report")) {GoldReportEditor(report:report,saved:{report=$0})}}
         .task {await refresh()}
         .onChange(of:photo) {_,item in guard let item else {return};Task {await selectedPhoto(item)}}
         .onChange(of:movie) {_,item in guard let item else {return};Task {await selectedMovie(item)}}

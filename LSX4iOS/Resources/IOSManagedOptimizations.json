@@ -1,0 +1,205 @@
+{
+  "options": [
+    {
+      "key": "managed_arm_gpu_fast_path",
+      "labelKey": "optimization_arm_gpu_fast_path",
+      "label": "ARM GPU fast path",
+      "defaultEnabled": true,
+      "hintKey": "optimization_arm_gpu_fast_path_hint",
+      "nativeOption": 1,
+      "available": true,
+      "category": "graphics"
+    },
+    {
+      "key": "managed_coarse_fragment_2x2",
+      "labelKey": "optimization_coarse_fragment_2x2",
+      "label": "2×2 coarse fragment shading",
+      "defaultEnabled": false,
+      "hintKey": "optimization_coarse_fragment_2x2_hint",
+      "nativeOption": 2,
+      "available": true,
+      "category": "graphics"
+    },
+    {
+      "key": "managed_disable_vk_robustness",
+      "labelKey": "optimization_disable_vk_robustness",
+      "label": "Disable Vulkan robustness checks",
+      "defaultEnabled": false,
+      "hintKey": "optimization_disable_vk_robustness_hint",
+      "nativeOption": 3,
+      "available": true,
+      "category": "graphics"
+    },
+    {
+      "key": "managed_tiered_jit",
+      "labelKey": "optimization_tiered_jit",
+      "label": "Tiered JIT",
+      "defaultEnabled": false,
+      "hintKey": "optimization_tiered_jit_hint",
+      "nativeOption": 4,
+      "available": true,
+      "category": "cpu"
+    },
+    {
+      "key": "managed_jit_trace_compilation",
+      "labelKey": "optimization_jit_trace_compilation",
+      "label": "JIT trace compilation",
+      "defaultEnabled": false,
+      "hintKey": "optimization_jit_trace_compilation_hint",
+      "nativeOption": 5,
+      "available": true,
+      "category": "cpu"
+    },
+    {
+      "key": "managed_fast_guest_memory",
+      "labelKey": "optimization_fast_guest_memory",
+      "label": "Fast guest memory model",
+      "defaultEnabled": false,
+      "hintKey": "optimization_fast_guest_memory_hint",
+      "nativeOption": 13,
+      "available": true,
+      "category": "cpu"
+    },
+    {
+      "key": "managed_guest_spin_wait_event",
+      "labelKey": "optimization_guest_spin_wait_event",
+      "label": "Event-driven guest spin waits",
+      "defaultEnabled": true,
+      "hintKey": "optimization_guest_spin_wait_event_hint",
+      "nativeOption": 19,
+      "available": true,
+      "category": "cpu"
+    },
+    {
+      "key": "managed_relaxed_fp_fusion",
+      "labelKey": "optimization_relaxed_fp_fusion",
+      "label": "Relaxed scalar FMA fusion",
+      "defaultEnabled": false,
+      "hintKey": "optimization_relaxed_fp_fusion_hint",
+      "nativeOption": 14,
+      "available": true,
+      "category": "cpu"
+    },
+    {
+      "key": "managed_android_performance_hint",
+      "labelKey": "optimization_android_performance_hint",
+      "label": "Android performance hints (ADPF)",
+      "defaultEnabled": true,
+      "hintKey": "optimization_android_performance_hint_hint",
+      "nativeOption": 15,
+      "available": false,
+      "category": "platform"
+    },
+    {
+      "key": "managed_oem_root_performance",
+      "labelKey": "optimization_oem_root_performance",
+      "label": "Maximum CPU/GPU clocks (root)",
+      "defaultEnabled": false,
+      "hintKey": "optimization_oem_root_performance_hint",
+      "nativeOption": null,
+      "available": false,
+      "category": "platform"
+    },
+    {
+      "key": "managed_host_flagm",
+      "labelKey": "optimization_host_flagm",
+      "label": "ARM FlagM/FlagM2 JIT lowering",
+      "defaultEnabled": true,
+      "hintKey": "optimization_host_flagm_hint",
+      "nativeOption": 16,
+      "available": true,
+      "category": "cpu"
+    },
+    {
+      "key": "managed_host_sve2",
+      "labelKey": "optimization_host_sve2",
+      "label": "ARM SVE2 JIT lowering",
+      "defaultEnabled": true,
+      "hintKey": "optimization_host_sve2_hint",
+      "nativeOption": 17,
+      "available": true,
+      "category": "cpu"
+    },
+    {
+      "key": "managed_host_rcpc",
+      "labelKey": "optimization_host_rcpc",
+      "label": "ARM RCpc host acquires",
+      "defaultEnabled": true,
+      "hintKey": "optimization_host_rcpc_hint",
+      "nativeOption": 18,
+      "available": true,
+      "category": "cpu"
+    },
+    {
+      "key": "managed_readback_batching",
+      "labelKey": "optimization_readback_batching",
+      "label": "Submit-scoped GPU readback batching",
+      "defaultEnabled": true,
+      "hintKey": "optimization_readback_batching_hint",
+      "nativeOption": 7,
+      "available": true,
+      "category": "graphics"
+    },
+    {
+      "key": "managed_vulkan_driver_calls",
+      "labelKey": "optimization_vulkan_driver_calls",
+      "label": "Reduce Vulkan driver calls",
+      "defaultEnabled": true,
+      "hintKey": "optimization_vulkan_driver_calls_hint",
+      "nativeOption": 8,
+      "available": true,
+      "category": "graphics"
+    },
+    {
+      "key": "managed_async_pipeline",
+      "labelKey": "optimization_async_pipeline",
+      "label": "Asynchronous shaders and pipelines",
+      "defaultEnabled": true,
+      "hintKey": "optimization_async_pipeline_hint",
+      "nativeOption": 9,
+      "available": true,
+      "category": "graphics"
+    },
+    {
+      "key": "managed_adaptive_mobile_gpu",
+      "labelKey": "optimization_adaptive_mobile_gpu",
+      "label": "Adaptive mobile GPU policy",
+      "defaultEnabled": true,
+      "hintKey": "optimization_adaptive_mobile_gpu_hint",
+      "nativeOption": 10,
+      "available": true,
+      "category": "graphics"
+    },
+    {
+      "key": "managed_audio_simd",
+      "labelKey": "optimization_audio_simd",
+      "label": "SIMD audio mixer",
+      "defaultEnabled": true,
+      "hintKey": "optimization_audio_simd_hint",
+      "nativeOption": 11,
+      "available": true,
+      "category": "audio"
+    },
+    {
+      "key": "managed_fsr",
+      "labelKey": "optimization_fsr",
+      "hintKey": "optimization_fsr_hint",
+      "label": "FSR",
+      "defaultEnabled": true,
+      "nativeOption": 20,
+      "available": true,
+      "category": "graphics"
+    },
+    {
+      "key": "managed_rcas",
+      "labelKey": "optimization_rcas",
+      "hintKey": "optimization_rcas_hint",
+      "label": "RCAS",
+      "defaultEnabled": true,
+      "nativeOption": 21,
+      "available": true,
+      "category": "graphics"
+    }
+  ],
+  "androidCommit": "56ad5a921f29a92529281c506214d559ab8146c9"
+}

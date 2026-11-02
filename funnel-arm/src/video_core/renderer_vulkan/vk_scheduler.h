@@ -774,6 +774,10 @@ public:
 
     void MarkTerminal(vk::Result result, const char* where) noexcept;
 
+    bool BeginResourceBinding();
+    void EndResourceBinding();
+    void DeferResourceDestruction(Common::UniqueFunction<void>&& operation);
+
     void DeferOperation(Common::UniqueFunction<void>&& func) {
         if (master_semaphore.IsDeviceLost()) {
             return;

@@ -3636,6 +3636,33 @@ void Scheduler::PublishMemoryPressureBoundary() {
     if (master_semaphore.IsDeviceLost()) {
         return;
     }
+    static const int claude_depth = [] {
+        const char* raw = std::getenv("EXECUTOR_CLAUDE_MPB_DEPTH");
+        const int n = raw ? std::atoi(raw) : 0;
+        return (n >= 0 && n <= 8) ? n : 0;
+    }();
+    static std::array<u64, 8> claude_boundary_ticks{};
+    static u64 claude_boundary_next{};
+    static u64 claude_boundary_waits{}, claude_boundary_wait_ns{};
+    if (claude_depth > 0) {
+        const u64 oldest = claude_boundary_ticks[(claude_boundary_next + 8 - claude_depth) % 8];
+        if (oldest != 0 && !master_semaphore.IsFree(oldest)) {
+            const auto claude_begin = std::chrono::steady_clock::now();
+            Wait(oldest);
+            ++claude_boundary_waits;
+            claude_boundary_wait_ns += static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                            std::chrono::steady_clock::now() - claude_begin)
+                                                            .count());
+        }
+        claude_boundary_ticks[claude_boundary_next % 8] = CurrentTick();
+        ++claude_boundary_next;
+        if ((claude_boundary_next & 255u) == 0) {
+            std::fprintf(stderr, "[CLAUDE_MPB] boundaries=%llu waits=%llu waitMs=%.1f depth=%d\n",
+                         static_cast<unsigned long long>(claude_boundary_next),
+                         static_cast<unsigned long long>(claude_boundary_waits),
+                         claude_boundary_wait_ns / 1e6, claude_depth);
+        }
+    }
 
     // FlushPlain may legally join the command buffer to the submit coalescer.
     // Memory pressure needs a real publication boundary so objects evicted by
@@ -3730,6 +3757,23 @@ struct ClaudeCallerEntry {
     std::atomic<u64> n{};
 };
 std::array<ClaudeCallerEntry, 32> g_claude_retire_callers{};
+std::array<ClaudeCallerEntry, 48> g_claude_wait_callers{};
+std::array<std::atomic<std::uintptr_t>, 48> g_claude_wait_callers2{};
+void ClaudeNoteWaitCaller(std::uintptr_t caller, std::uintptr_t caller2, u64 ns) {
+    for (std::size_t i = 0; i < g_claude_wait_callers.size(); ++i) {
+        auto& e = g_claude_wait_callers[i];
+        std::uintptr_t expected = 0;
+        if (e.address.load(std::memory_order_relaxed) == caller ||
+            e.address.compare_exchange_strong(expected, caller)) {
+            if (e.address.load(std::memory_order_relaxed) != caller) continue;
+            std::uintptr_t zero = 0;
+            g_claude_wait_callers2[i].compare_exchange_strong(zero, caller2);
+            e.ns.fetch_add(ns, std::memory_order_relaxed);
+            e.n.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
 void ClaudeNoteRetireCaller(std::uintptr_t caller, u64 ns) {
     for (auto& e : g_claude_retire_callers) {
         std::uintptr_t expected = 0;
@@ -3813,6 +3857,22 @@ void ClaudeSchedMaybePrint() {
             }
         }
         std::fprintf(stderr, "[CLAUDE_RETIRE_CALLERS]%s\n", callers);
+        char wcallers[2048]{};
+        int wused = 0;
+        for (std::size_t i = 0; i < g_claude_wait_callers.size(); ++i) {
+            auto& e = g_claude_wait_callers[i];
+            const auto address = e.address.load(std::memory_order_relaxed);
+            const auto address2 = g_claude_wait_callers2[i].load(std::memory_order_relaxed);
+            const u64 n = e.n.exchange(0, std::memory_order_relaxed);
+            const u64 ns = e.ns.exchange(0, std::memory_order_relaxed);
+            if (address != 0 && n != 0 && wused < 1900) {
+                wused += std::snprintf(wcallers + wused, sizeof(wcallers) - wused, " 0x%llx<0x%llx:%llux%.1fms",
+                                       static_cast<unsigned long long>(address - base + 0x100000000ull),
+                                       static_cast<unsigned long long>(address2 ? address2 - base + 0x100000000ull : 0),
+                                       static_cast<unsigned long long>(n), ns / 1e6);
+            }
+        }
+        std::fprintf(stderr, "[CLAUDE_WAIT_CALLERS]%s\n", wcallers);
     }
     std::fprintf(stderr,
                  "[CLAUDE_SCHED] windowMs=%.0f gpucomm: wait=%llux%.1fms(%.1f%%) "
@@ -3915,6 +3975,19 @@ void Scheduler::Finish(const ExecutorFinishReason reason) {
 }
 
 void Scheduler::Wait(u64 tick) {
+    const auto claude_wait_caller = reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
+    const auto claude_wait_caller2 = reinterpret_cast<std::uintptr_t>(__builtin_return_address(1));
+    const bool claude_wait_track = ClaudeSchedEnabled() && ClaudeIsGpuComm();
+    const auto claude_wait_begin = claude_wait_track ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point{};
+    SCOPE_EXIT {
+        if (claude_wait_track) {
+            ClaudeNoteWaitCaller(claude_wait_caller, claude_wait_caller2,
+                                 static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                      std::chrono::steady_clock::now() - claude_wait_begin)
+                                                      .count()));
+        }
+    };
     ClaudeSchedScope claude_scope{&g_claude_sched.wait_ns, &g_claude_sched.wait_n,
                                   &g_claude_sched.other_wait_ns};
 #if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)

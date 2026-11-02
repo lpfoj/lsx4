@@ -1,3 +1,8 @@
+#include "upload_snapshot_retirement.h"
+#if defined(LSX4_APPLE_RUNTIME)
+extern "C" unsigned lsx4_apple_consume_memory_pressure() noexcept;
+#include <execinfo.h>
+#endif
 #include "persistent_upload_write203.h"
 #include "persistent_stream_retirement.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
@@ -4309,6 +4314,18 @@ BufferCache::BufferSyncResult BufferCache::SynchronizeBuffer(
                               SnapshotTransactionResult::Invalid) {
 #if defined(LSX4_APPLE_RUNTIME)
         bounded_child_failure = transaction;
+        static const bool trace_sync_failure = [] {
+            const char* value = std::getenv("LSX4_BUFFER_SYNC_TRACE");
+            return value && value[0] == '1';
+        }();
+        static std::atomic<unsigned> traces{0};
+        if (trace_sync_failure && traces.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::fprintf(stderr, "[APPLE_BUFFER_SYNC_CALLER] address=0x%llx size=%u write=%d texel=%d externalGuard=%d stableReadOnly=%d reason=%s transaction=%u\n",
+                (unsigned long long)device_addr, size, int(is_written), int(is_texel_buffer),
+                int(external_snapshot_guard != nullptr), int(stable_read_only_candidate), reason, unsigned(transaction));
+            void* frames[18]; const int count = backtrace(frames, 18);
+            backtrace_symbols_fd(frames, count, STDERR_FILENO);
+        }
 #endif
 #if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)
         static std::atomic<u64> ordinal{0};
@@ -4466,6 +4483,7 @@ BufferCache::BufferSyncResult BufferCache::SynchronizeBuffer(
     u64 reserved_upload_capacity = 0;
     vk::Buffer reserved_upload_buffer = VK_NULL_HANDLE;
     bool staging_reserved = false;
+    u64 snapshot_source_commit_tick = 0;
     const auto reserve_upload_storage = [&](const u64 required_capacity) {
         if (required_capacity == 0 || required_capacity > upload_capacity) {
             return false;
@@ -4556,8 +4574,16 @@ BufferCache::BufferSyncResult BufferCache::SynchronizeBuffer(
 #endif
     const char* transaction_failure_reason = "snapshot-transaction";
     std::vector<std::pair<VAddr, u64>> transaction_alias_ranges;
-    static constexpr u32 MaxSnapshotTransactionAttempts = 64;
+    static const bool bounded_snapshot_retry = [] {
+        const char* value = std::getenv("LSX4_APPLE_SNAPSHOT_RETRY_BUDGET");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    const auto snapshot_retry_begin = bounded_snapshot_retry ? std::chrono::steady_clock::now()
+                                                            : std::chrono::steady_clock::time_point{};
+    const u32 MaxSnapshotTransactionAttempts = bounded_snapshot_retry ? 4096 : 64;
+    u32 snapshot_attempts = 0;
     for (u32 attempt = 0; attempt < MaxSnapshotTransactionAttempts; ++attempt) {
+        snapshot_attempts = attempt + 1;
 #if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)
         log_compute_dma_phase("transaction-attempt", attempt);
 #endif
@@ -4733,9 +4759,15 @@ BufferCache::BufferSyncResult BufferCache::SynchronizeBuffer(
         }
 #endif
         if (action == SnapshotTransactionAction::Retry) {
-            std::this_thread::yield();
-            if (attempt >= 8) {
-                std::this_thread::sleep_for(std::chrono::microseconds{10});
+            if (bounded_snapshot_retry) {
+                // Per-attempt page/region locks are already released here.
+                // Keep the mapping lease and all original ownership checks.
+                if (std::chrono::steady_clock::now() - snapshot_retry_begin >=
+                    std::chrono::milliseconds{50}) break;
+                std::this_thread::sleep_for(std::chrono::microseconds{50});
+            } else {
+                std::this_thread::yield();
+                if (attempt >= 8) std::this_thread::sleep_for(std::chrono::microseconds{10});
             }
             continue;
         }
@@ -4871,6 +4903,18 @@ BufferCache::BufferSyncResult BufferCache::SynchronizeBuffer(
         }
         break;
     }
+    if (bounded_snapshot_retry && snapshot_attempts > 1) {
+        static u64 retries{};
+        const auto n = ++retries;
+        if (n <= 16 || (n & (n - 1)) == 0) {
+            const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - snapshot_retry_begin).count();
+            std::fprintf(stderr, "[APPLE_SNAPSHOT_RETRY] address=0x%llx size=%u attempts=%u micros=%lld result=%u externalGuard=%u\n",
+                         static_cast<unsigned long long>(device_addr), size, snapshot_attempts,
+                         static_cast<long long>(micros), static_cast<unsigned>(transaction_result),
+                         external_snapshot_guard != nullptr);
+        }
+    }
 #if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)
     if (exact_dirty_upload_reservation && upload_needed) {
         ++upload_reservation_transaction_count;
@@ -4903,6 +4947,7 @@ BufferCache::BufferSyncResult BufferCache::SynchronizeBuffer(
         log_compute_dma_phase("before-staging-commit");
 #endif
         staging_buffer.Commit();
+        snapshot_source_commit_tick = scheduler.CurrentTick();
 #if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)
         log_compute_dma_phase("after-staging-commit");
 #endif
@@ -5034,7 +5079,36 @@ BufferCache::BufferSyncResult BufferCache::SynchronizeBuffer(
                 external_snapshot_guard != nullptr, transient_upload_buffer != nullptr,
                 reserved_upload_buffer == staging_buffer.Handle(), reserved_upload_capacity,
                 total_size_bytes, chunk_limit, staging_buffer.SizeBytes());
-            const bool retained = read_only_retained || written_retained;
+            static const bool retain_committed_snapshot = [] {
+                const auto* value = std::getenv("LSX4_APPLE_RETAIN_UPLOAD_SNAPSHOT");
+                return value && std::strcmp(value, "1") == 0;
+            }();
+            const bool snapshot_retained = retain_committed_snapshot &&
+                Lsx4::Portable::CanRetainCommittedSnapshot({
+                    upload_succeeded, staging_reserved, exact_dirty_upload_reservation,
+                    reserved_upload_buffer != buffer.Handle(), is_written,
+                    transient_upload_buffer != nullptr,
+                    reserved_upload_buffer == staging_buffer.Handle(),
+                    reserved_upload_capacity, total_size_bytes, chunk_limit,
+                    staging_buffer.SizeBytes(), snapshot_source_commit_tick,
+                    scheduler.CurrentTick()});
+            if (snapshot_retained) {
+                staging_buffer.RetainCurrentAllocation();
+                static u64 retained_snapshots{}, guarded_snapshots{}, retained_bytes{};
+                ++retained_snapshots;
+                guarded_snapshots += external_snapshot_guard != nullptr;
+                retained_bytes += total_size_bytes;
+                if (retained_snapshots <= 8 || (retained_snapshots & (retained_snapshots - 1)) == 0) {
+                    std::fprintf(stderr,
+                        "[APPLE_COMMITTED_UPLOAD_RETIREMENT] snapshots=%llu guarded=%llu copiedBytes=%llu commitTick=%llu consumerTick=%llu destinationWritten=%u\n",
+                        static_cast<unsigned long long>(retained_snapshots),
+                        static_cast<unsigned long long>(guarded_snapshots),
+                        static_cast<unsigned long long>(retained_bytes),
+                        static_cast<unsigned long long>(snapshot_source_commit_tick),
+                        static_cast<unsigned long long>(scheduler.CurrentTick()), is_written ? 1u : 0u);
+                }
+            }
+            const bool retained = read_only_retained || written_retained || snapshot_retained;
             if (written_retained) {
                 static std::atomic<u64> writes{};
                 const u64 n=writes.fetch_add(1,std::memory_order_relaxed)+1;
@@ -5043,6 +5117,13 @@ BufferCache::BufferSyncResult BufferCache::SynchronizeBuffer(
                     static_cast<unsigned long long>(n));
             }
             if (retained) {
+                if (snapshot_retained) {
+                    // Finish supplied publication as well as retirement. Keep
+                    // its real queue publication and completed callbacks while
+                    // removing only the whole-queue CPU wait. The consuming
+                    // staging tick was retained above before this advances it.
+                    scheduler.PublishMemoryPressureBoundary();
+                }
                 static std::atomic<u64> retained_uploads{},retained_bytes{};
                 const u64 count=retained_uploads.fetch_add(1,std::memory_order_relaxed)+1;
                 const u64 bytes=retained_bytes.fetch_add(total_size_bytes,std::memory_order_relaxed)+total_size_bytes;
@@ -5327,6 +5408,17 @@ void BufferCache::RunGarbageCollector(
     const bool force_pressure_scan) {
     SCOPE_EXIT {
         ++gc_tick;
+#if defined(LSX4_APPLE_RUNTIME)
+        const unsigned pressure = lsx4_apple_consume_memory_pressure();
+        if (pressure != 0) {
+            const auto pending_before = scheduler.PendingOperationCount();
+            scheduler.PublishMemoryPressureBoundary();
+            std::fprintf(stderr, "[APPLE_MEMORY_RETIRE] level=%u pendingBefore=%llu pendingAfter=%llu known=%llu waited=0\n",
+                pressure, (unsigned long long)pending_before,
+                (unsigned long long)scheduler.PendingOperationCount(),
+                (unsigned long long)scheduler.KnownGpuTick());
+        }
+#endif
     };
 #if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)
     // The proprietary A750 ICD does not expose VK_EXT_memory_budget.  Cache-owned
@@ -5416,8 +5508,17 @@ void BufferCache::RunGarbageCollector(
     scheduler.FlushPendingBufferTransfers();
 #if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)
     const bool protect_a750_bda_identity =
-        ExecutorUsesExactA750TurnipBufferRetirementDrain(instance) &&
-        Config::directMemoryAccess() && instance.IsBufferDeviceAddressSupported();
+        (ExecutorUsesExactA750TurnipBufferRetirementDrain(instance)
+#if defined(LSX4_APPLE_RUNTIME)
+         || [] {
+             static const bool preserve = [] {
+                 const char* value = std::getenv("LSX4_APPLE_PRESERVE_BDA_IDENTITIES");
+                 return value && value[0] == '1';
+             }();
+             return preserve;
+         }()
+#endif
+        ) && Config::directMemoryAccess() && instance.IsBufferDeviceAddressSupported();
     // Transfer materialization and all emergency behavior stay unchanged.
     // Only avoid the LRU walk whose exact-route predicate protects every
     // otherwise clean buffer candidate.
@@ -5549,6 +5650,15 @@ void BufferCache::TouchBuffer(const Buffer& buffer) {
     lru_cache.Touch(buffer.LRUId(), gc_tick);
 }
 
+Buffer& BufferCache::GetRegisteredBufferForBinding(VAddr address, u32 size) {
+    const BufferId id = page_table[address >> CACHING_PAGEBITS].buffer_id;
+    ASSERT_MSG(id, "Prepared descriptor lost its registered backing");
+    Buffer& buffer = slot_buffers[id];
+    ASSERT_MSG(!buffer.is_deleted && buffer.IsInBounds(address, size),
+               "Prepared descriptor no longer fits its authoritative backing");
+    return buffer;
+}
+
 void BufferCache::DeleteBuffer(BufferId buffer_id) {
     // Pending buffer-transfer batches retain raw Vulkan handles until their commands are
     // materialized. Never let a cache slot enter deferred destruction first.
@@ -5557,7 +5667,7 @@ void BufferCache::DeleteBuffer(BufferId buffer_id) {
     const u64 retiring_bytes = Common::AlignUp(buffer.SizeBytes(), CACHING_PAGESIZE);
     Unregister(buffer_id);
     retiring_buffer_bytes.fetch_add(retiring_bytes, std::memory_order_release);
-    scheduler.DeferOperation([this, buffer_id, retiring_bytes] {
+    scheduler.DeferResourceDestruction([this, buffer_id, retiring_bytes] {
         slot_buffers.erase(buffer_id);
         const u64 previous =
             retiring_buffer_bytes.fetch_sub(retiring_bytes, std::memory_order_acq_rel);

@@ -1,0 +1,699 @@
+[
+  {
+    "name": "adler2",
+    "version": "2.0.1",
+    "license": "0BSD OR MIT OR Apache-2.0",
+    "repository": "https://github.com/oyvindln/adler2",
+    "notices": [
+      "adler2-2.0.1/LICENSE-APACHE",
+      "adler2-2.0.1/LICENSE-0BSD",
+      "adler2-2.0.1/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "aes",
+    "version": "0.8.4",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/block-ciphers",
+    "notices": [
+      "aes-0.8.4/LICENSE-APACHE",
+      "aes-0.8.4/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "autocfg",
+    "version": "1.5.1",
+    "license": "Apache-2.0 OR MIT",
+    "repository": "https://github.com/cuviper/autocfg",
+    "notices": [
+      "autocfg-1.5.1/LICENSE-APACHE",
+      "autocfg-1.5.1/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "base64ct",
+    "version": "1.8.3",
+    "license": "Apache-2.0 OR MIT",
+    "repository": "https://github.com/RustCrypto/formats",
+    "notices": [
+      "base64ct-1.8.3/LICENSE-APACHE",
+      "base64ct-1.8.3/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "bitflags",
+    "version": "2.13.2",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/bitflags/bitflags",
+    "notices": [
+      "bitflags-2.13.2/LICENSE-APACHE",
+      "bitflags-2.13.2/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "block-buffer",
+    "version": "0.10.4",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/utils",
+    "notices": [
+      "block-buffer-0.10.4/LICENSE-APACHE",
+      "block-buffer-0.10.4/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "block-padding",
+    "version": "0.3.3",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/utils",
+    "notices": [
+      "block-padding-0.3.3/LICENSE-APACHE",
+      "block-padding-0.3.3/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "byteorder",
+    "version": "1.5.0",
+    "license": "Unlicense OR MIT",
+    "repository": "https://github.com/BurntSushi/byteorder",
+    "notices": [
+      "byteorder-1.5.0/COPYING",
+      "byteorder-1.5.0/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "cbc",
+    "version": "0.1.2",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/block-modes",
+    "notices": [
+      "cbc-0.1.2/LICENSE-APACHE",
+      "cbc-0.1.2/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "cfg-if",
+    "version": "1.0.5",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/rust-lang/cfg-if",
+    "notices": [
+      "cfg-if-1.0.5/LICENSE-APACHE",
+      "cfg-if-1.0.5/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "cipher",
+    "version": "0.4.4",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/traits",
+    "notices": [
+      "cipher-0.4.4/LICENSE-APACHE",
+      "cipher-0.4.4/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "const-oid",
+    "version": "0.9.6",
+    "license": "Apache-2.0 OR MIT",
+    "repository": "https://github.com/RustCrypto/formats/tree/master/const-oid",
+    "notices": [
+      "const-oid-0.9.6/LICENSE-APACHE",
+      "const-oid-0.9.6/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "cpufeatures",
+    "version": "0.2.17",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/utils",
+    "notices": [
+      "cpufeatures-0.2.17/LICENSE-APACHE",
+      "cpufeatures-0.2.17/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "crc32fast",
+    "version": "1.5.3",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/srijs/rust-crc32fast",
+    "notices": [
+      "crc32fast-1.5.3/LICENSE-APACHE",
+      "crc32fast-1.5.3/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "crossbeam-deque",
+    "version": "0.8.8",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/crossbeam-rs/crossbeam",
+    "notices": [
+      "crossbeam-deque-0.8.8/LICENSE-APACHE",
+      "crossbeam-deque-0.8.8/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "crossbeam-epoch",
+    "version": "0.9.21",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/crossbeam-rs/crossbeam",
+    "notices": [
+      "crossbeam-epoch-0.9.21/LICENSE-APACHE",
+      "crossbeam-epoch-0.9.21/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "crossbeam-utils",
+    "version": "0.8.23",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/crossbeam-rs/crossbeam",
+    "notices": [
+      "crossbeam-utils-0.8.23/LICENSE-APACHE",
+      "crossbeam-utils-0.8.23/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "crypto-common",
+    "version": "0.1.7",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/traits",
+    "notices": [
+      "crypto-common-0.1.7/LICENSE-APACHE",
+      "crypto-common-0.1.7/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "der",
+    "version": "0.7.10",
+    "license": "Apache-2.0 OR MIT",
+    "repository": "https://github.com/RustCrypto/formats/tree/master/der",
+    "notices": [
+      "der-0.7.10/LICENSE-APACHE",
+      "der-0.7.10/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "digest",
+    "version": "0.10.7",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/traits",
+    "notices": [
+      "digest-0.10.7/LICENSE-APACHE",
+      "digest-0.10.7/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "either",
+    "version": "1.19.0",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/rayon-rs/either",
+    "notices": [
+      "either-1.19.0/LICENSE-APACHE",
+      "either-1.19.0/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "flate2",
+    "version": "1.1.10",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/rust-lang/flate2-rs",
+    "notices": [
+      "flate2-1.1.10/LICENSE-APACHE",
+      "flate2-1.1.10/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "generic-array",
+    "version": "0.14.7",
+    "license": "MIT",
+    "repository": "https://github.com/fizyk20/generic-array.git",
+    "notices": [
+      "generic-array-0.14.7/LICENSE"
+    ]
+  },
+  {
+    "name": "getrandom",
+    "version": "0.2.17",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/rust-random/getrandom",
+    "notices": [
+      "getrandom-0.2.17/LICENSE-APACHE",
+      "getrandom-0.2.17/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "heck",
+    "version": "0.5.0",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/withoutboats/heck",
+    "notices": [
+      "heck-0.5.0/LICENSE-APACHE",
+      "heck-0.5.0/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "hmac",
+    "version": "0.12.1",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/MACs",
+    "notices": [
+      "hmac-0.12.1/LICENSE-APACHE",
+      "hmac-0.12.1/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "inout",
+    "version": "0.1.4",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/utils",
+    "notices": [
+      "inout-0.1.4/LICENSE-APACHE",
+      "inout-0.1.4/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "lazy_static",
+    "version": "1.5.1",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/rust-lang-nursery/lazy-static.rs",
+    "notices": [
+      "lazy_static-1.5.1/LICENSE-APACHE",
+      "lazy_static-1.5.1/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "libc",
+    "version": "0.2.191",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/rust-lang/libc",
+    "notices": [
+      "libc-0.2.191/LICENSE-APACHE",
+      "libc-0.2.191/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "libm",
+    "version": "0.2.16",
+    "license": "MIT",
+    "repository": "https://github.com/rust-lang/compiler-builtins",
+    "notices": [
+      "libm-0.2.16/LICENSE.txt"
+    ]
+  },
+  {
+    "name": "lsx4-pkg-import",
+    "version": "0.1.0",
+    "license": null,
+    "repository": null,
+    "notices": []
+  },
+  {
+    "name": "memmap2",
+    "version": "0.9.12",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RazrFalcon/memmap2-rs",
+    "notices": [
+      "memmap2-0.9.12/LICENSE-APACHE",
+      "memmap2-0.9.12/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "miniz_oxide",
+    "version": "0.9.1",
+    "license": "MIT OR Zlib OR Apache-2.0",
+    "repository": "https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide",
+    "notices": [
+      "miniz_oxide-0.9.1/LICENSE-MIT.md",
+      "miniz_oxide-0.9.1/LICENSE-ZLIB.md",
+      "miniz_oxide-0.9.1/LICENSE",
+      "miniz_oxide-0.9.1/LICENSE-APACHE.md"
+    ]
+  },
+  {
+    "name": "num-bigint-dig",
+    "version": "0.8.6",
+    "license": "MIT/Apache-2.0",
+    "repository": "https://github.com/dignifiedquire/num-bigint",
+    "notices": [
+      "num-bigint-dig-0.8.6/LICENSE-APACHE",
+      "num-bigint-dig-0.8.6/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "num-integer",
+    "version": "0.1.47",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/rust-num/num-integer",
+    "notices": [
+      "num-integer-0.1.47/LICENSE-APACHE",
+      "num-integer-0.1.47/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "num-iter",
+    "version": "0.1.46",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/rust-num/num-iter",
+    "notices": [
+      "num-iter-0.1.46/LICENSE-APACHE",
+      "num-iter-0.1.46/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "num-traits",
+    "version": "0.2.19",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/rust-num/num-traits",
+    "notices": [
+      "num-traits-0.2.19/LICENSE-APACHE",
+      "num-traits-0.2.19/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "orbis-pfs",
+    "version": "0.1.0",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/videobitva/orbis",
+    "notices": [
+      "orbis-pfs-0.1.0/LICENSE-APACHE",
+      "orbis-pfs-0.1.0/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "orbis-pkg",
+    "version": "0.1.0",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/videobitva/orbis",
+    "notices": [
+      "orbis-pkg-0.1.0/LICENSE-APACHE",
+      "orbis-pkg-0.1.0/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "orbis-pkg-util",
+    "version": "0.1.0",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/videobitva/orbis",
+    "notices": [
+      "orbis-pkg-util-0.1.0/LICENSE-APACHE",
+      "orbis-pkg-util-0.1.0/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "pem-rfc7468",
+    "version": "0.7.0",
+    "license": "Apache-2.0 OR MIT",
+    "repository": "https://github.com/RustCrypto/formats/tree/master/pem-rfc7468",
+    "notices": [
+      "pem-rfc7468-0.7.0/LICENSE-APACHE",
+      "pem-rfc7468-0.7.0/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "pkcs1",
+    "version": "0.7.5",
+    "license": "Apache-2.0 OR MIT",
+    "repository": "https://github.com/RustCrypto/formats/tree/master/pkcs1",
+    "notices": [
+      "pkcs1-0.7.5/LICENSE-APACHE",
+      "pkcs1-0.7.5/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "pkcs8",
+    "version": "0.10.2",
+    "license": "Apache-2.0 OR MIT",
+    "repository": "https://github.com/RustCrypto/formats/tree/master/pkcs8",
+    "notices": [
+      "pkcs8-0.10.2/LICENSE-APACHE",
+      "pkcs8-0.10.2/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "ppv-lite86",
+    "version": "0.2.21",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/cryptocorrosion/cryptocorrosion",
+    "notices": [
+      "ppv-lite86-0.2.21/LICENSE-APACHE",
+      "ppv-lite86-0.2.21/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "proc-macro2",
+    "version": "1.0.107",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/dtolnay/proc-macro2",
+    "notices": [
+      "proc-macro2-1.0.107/LICENSE-APACHE",
+      "proc-macro2-1.0.107/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "quote",
+    "version": "1.0.47",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/dtolnay/quote",
+    "notices": [
+      "quote-1.0.47/LICENSE-APACHE",
+      "quote-1.0.47/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "rand",
+    "version": "0.8.8",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/rust-random/rand",
+    "notices": [
+      "rand-0.8.8/LICENSE-APACHE",
+      "rand-0.8.8/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "rand_chacha",
+    "version": "0.3.1",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/rust-random/rand",
+    "notices": [
+      "rand_chacha-0.3.1/LICENSE-APACHE",
+      "rand_chacha-0.3.1/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "rand_core",
+    "version": "0.6.4",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/rust-random/rand",
+    "notices": [
+      "rand_core-0.6.4/LICENSE-APACHE",
+      "rand_core-0.6.4/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "rayon",
+    "version": "1.12.0",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/rayon-rs/rayon",
+    "notices": [
+      "rayon-1.12.0/LICENSE-APACHE",
+      "rayon-1.12.0/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "rayon-core",
+    "version": "1.13.0",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/rayon-rs/rayon",
+    "notices": [
+      "rayon-core-1.13.0/LICENSE-APACHE",
+      "rayon-core-1.13.0/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "rsa",
+    "version": "0.9.10",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/RSA",
+    "notices": [
+      "rsa-0.9.10/LICENSE-APACHE",
+      "rsa-0.9.10/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "sha2",
+    "version": "0.10.9",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/RustCrypto/hashes",
+    "notices": [
+      "sha2-0.10.9/LICENSE-APACHE",
+      "sha2-0.10.9/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "signature",
+    "version": "2.2.0",
+    "license": "Apache-2.0 OR MIT",
+    "repository": "https://github.com/RustCrypto/traits/tree/master/signature",
+    "notices": [
+      "signature-2.2.0/LICENSE-APACHE",
+      "signature-2.2.0/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "simd-adler32",
+    "version": "0.3.10",
+    "license": "MIT",
+    "repository": "https://github.com/mcountryman/simd-adler32",
+    "notices": [
+      "simd-adler32-0.3.10/LICENSE.md"
+    ]
+  },
+  {
+    "name": "smallvec",
+    "version": "1.16.3",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/servo/rust-smallvec",
+    "notices": [
+      "smallvec-1.16.3/LICENSE-APACHE",
+      "smallvec-1.16.3/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "snafu",
+    "version": "0.8.9",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/shepmaster/snafu",
+    "notices": [
+      "snafu-0.8.9/LICENSE-APACHE",
+      "snafu-0.8.9/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "snafu-derive",
+    "version": "0.8.9",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/shepmaster/snafu",
+    "notices": [
+      "snafu-derive-0.8.9/LICENSE-APACHE",
+      "snafu-derive-0.8.9/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "spin",
+    "version": "0.9.9",
+    "license": "MIT",
+    "repository": "https://github.com/mvdnes/spin-rs.git",
+    "notices": [
+      "spin-0.9.9/LICENSE"
+    ]
+  },
+  {
+    "name": "spki",
+    "version": "0.7.3",
+    "license": "Apache-2.0 OR MIT",
+    "repository": "https://github.com/RustCrypto/formats/tree/master/spki",
+    "notices": [
+      "spki-0.7.3/LICENSE-APACHE",
+      "spki-0.7.3/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "subtle",
+    "version": "2.6.1",
+    "license": "BSD-3-Clause",
+    "repository": "https://github.com/dalek-cryptography/subtle",
+    "notices": [
+      "subtle-2.6.1/LICENSE"
+    ]
+  },
+  {
+    "name": "syn",
+    "version": "2.0.119",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/dtolnay/syn",
+    "notices": [
+      "syn-2.0.119/LICENSE-APACHE",
+      "syn-2.0.119/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "typenum",
+    "version": "1.20.1",
+    "license": "MIT OR Apache-2.0",
+    "repository": "https://github.com/paholg/typenum",
+    "notices": [
+      "typenum-1.20.1/LICENSE-APACHE",
+      "typenum-1.20.1/LICENSE",
+      "typenum-1.20.1/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "unicode-ident",
+    "version": "1.0.27",
+    "license": "(MIT OR Apache-2.0) AND Unicode-3.0",
+    "repository": "https://github.com/dtolnay/unicode-ident",
+    "notices": [
+      "unicode-ident-1.0.27/LICENSE-UNICODE",
+      "unicode-ident-1.0.27/LICENSE-APACHE",
+      "unicode-ident-1.0.27/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "version_check",
+    "version": "0.9.5",
+    "license": "MIT/Apache-2.0",
+    "repository": "https://github.com/SergioBenitez/version_check",
+    "notices": [
+      "version_check-0.9.5/LICENSE-APACHE",
+      "version_check-0.9.5/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "xts-mode",
+    "version": "0.5.1",
+    "license": "MIT",
+    "repository": "https://github.com/pheki/xts-mode",
+    "notices": [
+      "xts-mode-0.5.1/LICENSE.md"
+    ]
+  },
+  {
+    "name": "zerocopy",
+    "version": "0.8.63",
+    "license": "BSD-2-Clause OR Apache-2.0 OR MIT",
+    "repository": "https://github.com/google/zerocopy",
+    "notices": [
+      "zerocopy-0.8.63/LICENSE-APACHE",
+      "zerocopy-0.8.63/LICENSE-BSD",
+      "zerocopy-0.8.63/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "zerocopy-derive",
+    "version": "0.8.63",
+    "license": "BSD-2-Clause OR Apache-2.0 OR MIT",
+    "repository": "https://github.com/google/zerocopy",
+    "notices": [
+      "zerocopy-derive-0.8.63/LICENSE-APACHE",
+      "zerocopy-derive-0.8.63/LICENSE-BSD",
+      "zerocopy-derive-0.8.63/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "zeroize",
+    "version": "1.9.1",
+    "license": "Apache-2.0 OR MIT",
+    "repository": "https://github.com/RustCrypto/utils",
+    "notices": [
+      "zeroize-1.9.1/LICENSE-APACHE",
+      "zeroize-1.9.1/LICENSE-MIT"
+    ]
+  },
+  {
+    "name": "zlib-rs",
+    "version": "0.6.8",
+    "license": "Zlib",
+    "repository": "https://github.com/trifectatechfoundation/zlib-rs",
+    "notices": [
+      "zlib-rs-0.6.8/LICENSE"
+    ]
+  }
+]

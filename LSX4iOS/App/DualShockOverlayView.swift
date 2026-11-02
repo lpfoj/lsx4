@@ -92,10 +92,19 @@ public final class DualShockOverlayView: UIView {
         } else {external.stop()}
         releaseInputs(connected:window != nil)
     }
+    public override func safeAreaInsetsDidChange() {
+        super.safeAreaInsetsDidChange()
+        setNeedsLayout()
+    }
     public override func layoutSubviews() {
         super.layoutSubviews()
         if !contacts.isEmpty { releaseInputs(connected: window != nil) }
-        let w = max(1, bounds.width), h = max(1, bounds.height), m = min(w, h)
+        var layoutBounds = bounds
+        if #available(iOS 27.1, *) {
+            let safeBounds = bounds.inset(by: safeAreaInsets)
+            if safeBounds.width > 0 && safeBounds.height > 0 { layoutBounds = safeBounds }
+        }
+        let w = max(1, layoutBounds.width), h = max(1, layoutBounds.height), m = min(w, h)
         let margin = max(8, w * 0.018), inset = max(28, h * 0.035), bottom = h - inset
         boxes = [:]
         boxes["body"] = CGRect(x: w * 0.33, y: h * 0.94, width: w * 0.34, height: h * 0.06 + 10)
@@ -128,6 +137,18 @@ public final class DualShockOverlayView: UIView {
         let r = max(24, min(m * 0.06, 42)), stickY = min(dy + cluster * 0.44, bottom - r * 0.14)
         boxes["left_stick"] = centered(max(w * 0.3, boxes["dpad"]!.maxX + r * 1.15), stickY, 2*r, 2*r)
         boxes["right_stick"] = centered(min(w * 0.7, boxes["face"]!.minX - r * 1.15), stickY, 2*r, 2*r)
+        if #available(iOS 27.1, *), h > w {
+            for (button, stick) in [("share", "left_stick"), ("options", "right_stick")] {
+                let savedKeys = [button, stick].flatMap { id in
+                    ["x", "y", "scale"].map { "overlay_layout_v1_\(id)_\($0)" }
+                }
+                guard savedKeys.allSatisfy({ UserDefaults.standard.object(forKey: $0) == nil }) else { continue }
+                if let frame = boxes[button], let stickFrame = boxes[stick], frame.intersects(stickFrame) {
+                    let clearance = max(8, m * 0.014)
+                    boxes[button] = frame.offsetBy(dx: 0, dy: min(0, stickFrame.minY-clearance-frame.maxY))
+                }
+            }
+        }
         let groups = ["dpad": ["dpad", "up", "right", "down", "left"], "face": ["face", "triangle", "circle", "cross", "square"],
             "touchpad": ["touchpad", "toggle"]]
         for id in ["dpad", "face", "left_stick", "right_stick", "l1", "l2", "r1", "r2", "options", "share", "ps", "touchpad"] {
@@ -140,6 +161,25 @@ public final class DualShockOverlayView: UIView {
                 boxes[member] = CGRect(x: b.midX + (rect.minX-b.midX)*scale+x, y: b.midY + (rect.minY-b.midY)*scale+y,
                                       width: rect.width*scale, height: rect.height*scale)
             } }
+        }
+        if #available(iOS 27.1, *) {
+            boxes = boxes.mapValues { $0.offsetBy(dx: layoutBounds.minX, dy: layoutBounds.minY) }
+            let regions = reservedRegions(kind: .occlusion) + reservedRegions(kind: .division)
+            let blocked = regions.filter(\.isActive).map(\.frame)
+            let controlGroups = [groups["dpad"]!, groups["face"]!, ["left_stick"], ["right_stick"],
+                ["l1", "l2"], ["r1", "r2"], ["touchpad", "toggle"], ["share"], ["options"], ["ps"]]
+            for members in controlGroups {
+                let visibleMembers = members.filter { visible($0 == "toggle" ? "touchpad" : group($0)) }
+                guard visibleMembers.contains(where: { id in
+                    guard let frame = boxes[id] else { return false }
+                    return blocked.contains(where: { $0.intersects(frame) })
+                }) else { continue }
+                let frame = visibleMembers.compactMap { boxes[$0] }.reduce(CGRect.null) { $0.union($1) }
+                guard !frame.isNull else { continue }
+                let target = LSX4ControlPlacement.avoiding(frame, in: bounds, regions: blocked)
+                let dx = target.minX-frame.minX, dy = target.minY-frame.minY
+                for id in visibleMembers { boxes[id] = boxes[id]?.offsetBy(dx: dx, dy: dy) }
+            }
         }
         stroke = max(1, m * 0.0035); fontSize = max(8, min(m * 0.013, 12)); setNeedsDisplay()
     }
@@ -289,5 +329,22 @@ public final class DualShockOverlayView: UIView {
         LSX4Bridge.updatePad(output.mask,axes:Data(output.axes),connected:output.connected,timestamp:timestamp,
                              touchActive:output.touch != nil,touchX:UInt16((output.touch?.x ?? 0)*1919),touchY:UInt16((output.touch?.y ?? 0)*949))
 #endif
+    }
+}
+
+enum LSX4ControlPlacement {
+    static func avoiding(_ frame: CGRect, in bounds: CGRect, regions: [CGRect]) -> CGRect {
+        let blocked = regions.filter { !$0.isNull && !$0.isEmpty && $0.intersects(bounds) }
+        guard !frame.isNull, !frame.isEmpty, blocked.contains(where: { $0.intersects(frame) }) else { return frame }
+        let xs = [frame.minX, bounds.minX, bounds.maxX-frame.width] + blocked.flatMap { [$0.minX-frame.width, $0.maxX] }
+        let ys = [frame.minY, bounds.minY, bounds.maxY-frame.height] + blocked.flatMap { [$0.minY-frame.height, $0.maxY] }
+        var best: CGRect?, distance = CGFloat.infinity
+        for x in xs { for y in ys {
+            let candidate = CGRect(origin: CGPoint(x: x, y: y), size: frame.size)
+            guard bounds.contains(candidate), !blocked.contains(where: { $0.intersects(candidate) }) else { continue }
+            let delta = pow(x-frame.minX, 2) + pow(y-frame.minY, 2)
+            if delta < distance { best = candidate; distance = delta }
+        } }
+        return best ?? frame
     }
 }

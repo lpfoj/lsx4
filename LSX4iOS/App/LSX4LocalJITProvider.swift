@@ -35,7 +35,8 @@ public final class LSX4LocalJITProvider: NSObject {
         guard #available(iOS 26.0, *) else {
             finish("JIT на устройстве требует iOS 26 или новее."); return
         }
-        guard Bundle.main.object(forInfoDictionaryKey: "LSX4DeviceLocalJit") as? Bool == true else {
+        guard Bundle.main.object(forInfoDictionaryKey: "LSX4DeviceLocalJit") as? Bool == true,
+              Bundle.main.object(forInfoDictionaryKey: "LSX4AppStoreJitless") as? Bool != true else {
             finish("Эта сборка не содержит JIT-помощник."); return
         }
         if let problem = LSX4JITInstallation.problem { finish(problem); return }

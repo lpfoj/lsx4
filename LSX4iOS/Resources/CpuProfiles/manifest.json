@@ -1,7 +1,7 @@
 {
   "version": 1,
   "generatedAt": 1788640486.830719,
-  "resolverSource": "source-input/CpuTuningSettings.java",
+  "resolverSource": "/Users/lmac/Documents/Codex/2026-09-04/td/outputs/LSX4-iOS/android-app/app/src/main/java/app/lsx4/android/CpuTuningSettings.java",
   "resolverSha256": "732d9307e80a5a9556c5f5c2f9d6ed305194fa95f773dd54fd40abe4cb26387e",
   "preferencesSha256": "c954211dee6dfc643cb4130802c5726f0978a85d42abf790f1a4763631965235",
   "androidRequestedBackend": 1,

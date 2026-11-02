@@ -4030,9 +4030,15 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                             regs.num_indices);
     }
 #endif
+    // The iOS MoltenVK geometry library rejects TRIANGLE_FAN pipelines.
+    // Let the existing quad-to-triangle conversion handle these draws.
+#if defined(LSX4_APPLE_RUNTIME)
+    const bool single_quad_fan = false;
+#else
     const bool single_quad_fan =
         regs.primitive_type == AmdGpu::PrimitiveType::QuadList && regs.num_indices == 4 &&
         regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs;
+#endif
     // MoltenVK has no triangle fans: each fan draw costs an index-conversion
     // compute pass and a Metal render pass restart. Draw the quad as two
     // listed triangles in the fan's vertex order (provoking vertices 1 and 2).

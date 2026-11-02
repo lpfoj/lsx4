@@ -1,0 +1,3 @@
+- Performance optimizations and fewer frame-rate drops in demanding games.
+- Fixes for issues affecting some devices.
+- More small games are now playable.

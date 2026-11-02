@@ -746,7 +746,7 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
             }
 #endif
             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)
             const u64 old_label = port->LoadVoLabel(effective_buf_id);
             if (old_label != 1) {
                 if (std::getenv("EXECUTOR_TRACE_PM4") != nullptr ||

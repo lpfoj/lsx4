@@ -152,6 +152,8 @@ public:
         return slot_buffers[id];
     }
 
+    [[nodiscard]] Buffer& GetRegisteredBufferForBinding(VAddr address, u32 size);
+
     StreamBuffer& GetUtilityBuffer(MemoryUsage usage) noexcept {
         switch (usage) {
         case MemoryUsage::Stream:

@@ -6,41 +6,56 @@ import Metal
 struct GoldPage<Content:View>:View {
     let title:String
     var dismissDisabled=false
+    var themeOverride:GoldTheme?=nil
     @ViewBuilder let content:Content
     @Environment(\.dismiss) private var dismiss
     @AppStorage("gold.theme") private var storedTheme=0
+    private var theme:GoldTheme {themeOverride ?? GoldTheme(rawValue:storedTheme) ?? .azure}
     var body:some View {
+        GeometryReader { geometry in
         NavigationStack {
-            ZStack {GoldBackdrop(theme:GoldTheme(rawValue:storedTheme) ?? .azure);content}
+            ZStack {GoldBackdrop(theme:theme);content}
                 .navigationTitle(title).navigationBarTitleDisplayMode(.inline)
                 .toolbar {ToolbarItem(placement:.confirmationAction) {Button(L("Готово")) {dismiss()}.disabled(dismissDisabled).accessibilityIdentifier("gold-page-done")}}
-        }.interactiveDismissDisabled(dismissDisabled).preferredColorScheme(.dark).tint((GoldTheme(rawValue:storedTheme) ?? .azure).accent)
+        }.padding(.top,LSX4WindowChrome.topPadding(safeTop:geometry.safeAreaInsets.top,baseline:0))
+        }.frame(maxWidth:.infinity,maxHeight:.infinity).interactiveDismissDisabled(dismissDisabled).preferredColorScheme(.dark).tint(theme.accent).environment(\.goldPreviewTheme,themeOverride)
     }
 }
 struct GoldThemesView:View {
     @AppStorage("gold.theme") private var applied=0
     @State private var preview=0
     var body:some View {
-        GoldPage(title:G("menu_themes_card","Themes")) {
+        GoldPage(title:G("menu_themes_card","Themes"),themeOverride:GoldTheme(rawValue:preview)) {
             GeometryReader { geometry in
-                VStack(spacing:14) {
-                    HStack(spacing:10) {ForEach(GoldTheme.allCases) {theme in
+                let columns=geometry.size.width<600 ? 2 : 4
+                let rows=(GoldTheme.allCases.count+columns-1)/columns
+                let padding:CGFloat=geometry.size.height<300 ? 8 : 12
+                let gap:CGFloat=geometry.size.height<300 ? 8 : 12
+                let gridHeight=max(0,geometry.size.height-padding*2-44-gap)
+                let height=max(0,min(420,(gridHeight-CGFloat(rows-1)*gap)/CGFloat(rows)))
+                VStack(spacing:gap) {
+                    LazyVGrid(columns:Array(repeating:GridItem(.flexible()),count:columns),spacing:gap) {ForEach(GoldTheme.allCases) {theme in
                         Button {preview=theme.rawValue} label: {
                             ZStack(alignment:.bottomLeading) {
                                 GoldBackdrop(theme:theme,animated:preview == theme.rawValue)
-                                VStack(alignment:.leading,spacing:10) {
-                                    Image(systemName:theme.symbol).font(.system(size:28)).foregroundStyle(theme.accent)
-                                    Spacer()
-                                    Text(theme.label).font(.system(size:geometry.size.width<500 ? 13 : 20,weight:.medium)).lineLimit(2)
-                                    if applied == theme.rawValue {Label(G("menu_selected","Selected"),systemImage:"checkmark.circle.fill").font(.caption2).foregroundStyle(theme.accent)}
-                                }.padding(geometry.size.width<500 ? 10 : 18)
-                            }.clipShape(RoundedRectangle(cornerRadius:16))
-                                .overlay(RoundedRectangle(cornerRadius:16).stroke(preview == theme.rawValue ? theme.accent : .white.opacity(0.12),lineWidth:preview == theme.rawValue ? 3 : 1))
+                                VStack(alignment:.leading,spacing:6) {
+                                    if height>=100 {Image(systemName:theme.symbol).font(.system(size:height<150 ? 23 : 28)).foregroundStyle(theme.accent)}
+                                    Spacer(minLength:0)
+                                    Text(theme.label).font(.system(size:geometry.size.width<500 ? 13 : 18,weight:.medium)).lineLimit(1).minimumScaleFactor(0.7)
+                                    if applied == theme.rawValue {Label(G("menu_selected","Selected"),systemImage:"checkmark.circle.fill").font(.caption2).lineLimit(1).minimumScaleFactor(0.7).foregroundStyle(theme.accent)}
+                                }.padding(height<150 ? 8 : 12)
+                            }.frame(height:height).clipShape(RoundedRectangle(cornerRadius:16))
+                                .overlay(RoundedRectangle(cornerRadius:16).stroke(preview == theme.rawValue ? theme.accent : .white.opacity(0.12),lineWidth:preview == theme.rawValue ? 3 : 1).allowsHitTesting(false))
+                                .contentShape(RoundedRectangle(cornerRadius:16))
                         }.buttonStyle(.plain).accessibilityIdentifier("gold-theme-\(theme.rawValue)")
-                    }}.frame(maxHeight:.infinity)
-                    Text((GoldTheme(rawValue:preview) ?? .azure).label).font(.headline)
-                    Button(G("menu_apply","Apply")) {applied=preview}.buttonStyle(.borderedProminent).accessibilityIdentifier("gold-theme-apply")
-                }.padding(20)
+                            .accessibilityValue(preview == theme.rawValue ? G("menu_selected","Selected") : "")
+                    }}.frame(height:gridHeight)
+                    HStack {
+                        Text((GoldTheme(rawValue:preview) ?? .azure).label).font(.headline).lineLimit(1).minimumScaleFactor(0.7)
+                        Spacer()
+                        Button(G("menu_apply","Apply")) {applied=preview}.buttonStyle(.borderedProminent).accessibilityIdentifier("gold-theme-apply")
+                    }.frame(height:44)
+                }.padding(padding)
             }
         }.onAppear {preview=applied}
     }
@@ -63,24 +78,30 @@ struct GoldSettingsView:View {
                     Button {showingLanguages=true} label: {
                         HStack {Text(G("language","Language"));Spacer();if let choice=ConsoleLocalization.languages.first(where:{$0.id == language}) {Text(choice.flag+" "+choice.label).foregroundStyle(.secondary)}}.contentShape(Rectangle())
                     }.accessibilityIdentifier("ui-language")
+                    NavigationLink {GoldBloggersView()} label: {Label(P("bloggers_title","Blogers&Additional Information"),systemImage:"person.2.wave.2")}.accessibilityIdentifier("settings-bloggers")
+                    NavigationLink {GoldThanksView()} label: {Label(P("thanks_title","Thanks"),systemImage:"heart")}.accessibilityIdentifier("settings-thanks")
 #if LSX4_DEVICE_LOCAL_JIT
                     Button(L("jit.setup.title")) {jitSetup=true}.accessibilityIdentifier("settings-jit-setup")
 #endif
                 }
+                NavigationLink {GoldAccountView()} label: {Label(P("account_title","Account"),systemImage:"person.crop.circle")}.accessibilityIdentifier("settings-account")
+                NavigationLink {GoldMemberDirectory()} label: {Label(P("members_title","All users"),systemImage:"person.2")}.accessibilityIdentifier("settings-all-users")
                 NavigationLink {GoldSharingSettings()} label: {Label(P("sharing_title","Send data to server"),systemImage:"network")}.accessibilityIdentifier("settings-data-sharing")
-                NavigationLink {graphics} label: {category("category_graphics","Graphics","display")}
-                NavigationLink {managed} label: {category("category_managed_optimizations","Managed optimizations","wand.and.stars")}
-                NavigationLink {cpu} label: {category("category_cpu_tuning","CPU tuning","cpu")}
-                NavigationLink {audioSettings} label: {category("category_audio","Audio","speaker.wave.2")}
-                NavigationLink {GoldControlsView()} label: {category("category_controls","Controls","gamecontroller")}
-                NavigationLink {GoldCacheContents(games:[])} label: {category("category_cache","Cache","cube.transparent")}
-                NavigationLink {other} label: {category("category_other","Other","ellipsis.circle")}
-                NavigationLink {Form {Section {Text("PS5").font(.title2);Text(G("gold_ps5_unavailable","PS5 gameplay is not available in this iPhone build."))}}.navigationTitle(G("ps5_preset_title","PS5 Settings"))} label: {category("ps5_preset_title","PS5 Settings","cpu")}
+                NavigationLink {GoldGamePatchesView()} label: {category("patches_title","Game patches","wrench.and.screwdriver")}.accessibilityIdentifier("settings-game-patches")
+                NavigationLink {graphics} label: {category("category_graphics","Graphics","display")}.accessibilityIdentifier("settings-graphics")
+                NavigationLink {GoldManagedOptimizationsView()} label: {category("category_managed_optimizations","Managed optimizations","wand.and.stars")}.accessibilityIdentifier("settings-managed-optimizations")
+                NavigationLink {cpu} label: {category("category_cpu_tuning","CPU tuning","cpu")}.accessibilityIdentifier("settings-cpu")
+                NavigationLink {audioSettings} label: {category("category_audio","Audio","speaker.wave.2")}.accessibilityIdentifier("settings-audio")
+                NavigationLink {GoldControlsView()} label: {category("category_controls","Controls","gamecontroller")}.accessibilityIdentifier("settings-controls")
+                NavigationLink {GoldCacheContents(games:[])} label: {category("category_cache","Cache","cube.transparent")}.accessibilityIdentifier("settings-cache")
+                NavigationLink {GoldHiddenGamesView()} label: {category("game_hidden_title","Hidden games","eye.slash")}.accessibilityIdentifier("settings-hidden-games")
+                NavigationLink {other} label: {category("category_other","Other","ellipsis.circle")}.accessibilityIdentifier("settings-other")
+                NavigationLink {PS5SettingsView()} label: {category("ps5_preset_title","PS5 Settings","cpu")}.accessibilityIdentifier("settings-ps5")
             }.scrollContentBackground(.hidden)
                 .navigationDestination(isPresented:$showingLanguages) {GoldLanguagePicker(language:$language)}
         }.environment(\.locale,Locale(identifier:language))
 #if LSX4_DEVICE_LOCAL_JIT
-            .sheet(isPresented:$jitSetup) {LSX4JITSetupView()}
+            .goldModal(isPresented:$jitSetup) {LSX4JITSetupView()}
 #endif
     }
     private func category(_ key:String,_ name:String,_ icon:String)->some View {Label(G(key,name),systemImage:icon).padding(.vertical,8)}
@@ -130,7 +151,7 @@ struct GoldSettingsView:View {
     }
     private var other:some View {
         Form {
-            Section(G("gold_display","Display")) {Toggle(L("Показывать JIT"),isOn:$showExecutionMode).accessibilityIdentifier("show-execution-mode");Text(L("Название LSX4 и FPS остаются видны. Режим исполнения показывается только при включённом переключателе."))}
+            Section(G("gold_display","Display")) {Toggle(L("Показывать JIT / No-JIT"),isOn:$showExecutionMode).accessibilityIdentifier("show-execution-mode");Text(L("Название LSX4 и FPS остаются видны. Режим исполнения показывается только при включённом переключателе."))}
             Section("LSX4") {LabeledContent(G("version","Version"),value:Bundle.main.object(forInfoDictionaryKey:"CFBundleVersion") as? String ?? "")
                 Link(G("gold_installation","Installation guide"),destination:URL(string:"https://github.com/lpfoj/lsx4/releases")!)}
         }.navigationTitle(G("category_other","Other"))
@@ -179,17 +200,25 @@ struct GoldDeviceView:View {
 
 struct GoldGameDetails:View {
     let game:ConsoleTitle
+    var removalAllowed=true
+    @State private var removing=false
     @State private var classification=""
     @State private var notes=""
     @State private var showingReport=false
     @State private var initializing=true
     var body:some View {
-        GoldPage(title:game.title) {
+        GoldPage(title:game.title,dismissDisabled:removing) {
             Form {
                 GoldCover(game:game,hero:true,fit:true).frame(height:150).listRowBackground(Color.clear)
                 Section {LabeledContent("TITLE_ID",value:game.id);LabeledContent(L("Файлы"),value:game.folder != nil ? L("На iPhone") : L("jit.setup.files.missing"));LabeledContent(G("gold_size","Size"),value:ByteCountFormatter.string(fromByteCount:game.bytes,countStyle:.file))}
                 if let observation=GoldObservation.byID[game.id] {
                     Section("iPhone · JIT") {Text(String(format:"%.1f FPS",observation.fps)).font(.title2).foregroundStyle(.green);Text(G("gold_prior_scope","Previous gameplay observation, not a full-game guarantee or a new measurement.")).font(.footnote);LabeledContent(G("version","Version"),value:observation.build)}
+                }
+                Section {
+                    NavigationLink {
+                        if game.id.hasPrefix("PPSA") {GoldPS5GameSettings(title:game.id)}
+                        else {GoldManagedOptimizationsView(title:game.id,gameTitle:game.title)}
+                    } label: {Label(G("category_managed_optimizations","Managed optimizations"),systemImage:"wand.and.stars")}.accessibilityIdentifier("game-managed-optimizations")
                 }
                 Section(G("gold_your_result","Your result")) {
                     Picker(G("game_status","Status"),selection:$classification) {
@@ -201,13 +230,14 @@ struct GoldGameDetails:View {
                     Button(G("public_report_title","Report a game result"),systemImage:"paperplane") {showingReport=true}
                     ShareLink(item:"LSX4 iPhone report\n\(game.title) · \(game.id)\nVersion: \(Bundle.main.object(forInfoDictionaryKey:"CFBundleVersion") as? String ?? "")\nCPU: \(ConsoleExecutionMode.selected.label)\nResolution: \(ConsoleRenderResolution.selected.rawValue)\nResult: \(classification.isEmpty ? "unclassified" : classification)\n\(notes)") {Label(G("gold_share_report","Share report"),systemImage:"square.and.arrow.up")}
                 }
-            }.scrollContentBackground(.hidden)
+                GoldGameRemovalSection(game:game,allowed:removalAllowed,busy:$removing)
+            }.scrollContentBackground(.hidden).disabled(removing)
         }.onAppear {classification=UserDefaults.standard.string(forKey:"gold.status."+game.id) ?? "";notes=UserDefaults.standard.string(forKey:"gold.notes."+game.id) ?? "";DispatchQueue.main.async {initializing=false}}
             .onChange(of:classification) {_,value in
                 UserDefaults.standard.set(value,forKey:"gold.status."+game.id)
                 if !initializing && !value.isEmpty {showingReport=true}
             }
-            .sheet(isPresented:$showingReport) {GoldPublicReportView(game:game)}
+            .goldModal(isPresented:$showingReport) {GoldPublicReportView(game:game)}
             .onChange(of:notes) {_,value in UserDefaults.standard.set(value,forKey:"gold.notes."+game.id)}
     }
 }
@@ -229,31 +259,45 @@ struct GoldCompatibilityView:View {
     @State private var search=""
     @State private var selectedReport:LSX4CommunityReport?=nil
     @State private var showingReport=false
+    @State private var resultFilter="playable"
+    @State private var onlyMine=false
+    @ObservedObject private var account=LSX4AccountSession.shared
     private var entries:[GoldObservation] {GoldObservation.all.filter {search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)}}
-    private var reports:[LSX4CommunityReport] {cache.reports.filter {search.isEmpty || $0.gameTitle.localizedCaseInsensitiveContains(search) || $0.device.localizedCaseInsensitiveContains(search)}}
+    private var reports:[LSX4CommunityReport] {cache.reports.filter {$0.result == resultFilter && (!onlyMine || LSX4AccountCredentials.owns($0)) && (search.isEmpty || $0.gameTitle.localizedCaseInsensitiveContains(search) || $0.device.localizedCaseInsensitiveContains(search))}}
+    init(games:[ConsoleTitle],cache:LSX4CommunityCache = .shared) {self.games=games;self._cache=ObservedObject(wrappedValue:cache)}
     var body:some View {
-        GoldPage(title:G("menu_compatibility_card","Tested compatible games")) {
+        let conflicts=LSX4ReportStatus.conflictingGames(cache.reports)
+        return GoldPage(title:G("menu_compatibility_card","Tested compatible games")) {
             VStack(spacing:8) {
+                Text(P("community_current_version","Current version: {version}",["version":LSX4ReportStatus.currentVersion]))
+                    .font(.subheadline).frame(maxWidth:.infinity,alignment:.leading).padding(.horizontal)
+                    .accessibilityIdentifier("community-current-version")
                 HStack {Image(systemName:"magnifyingglass");TextField(L("Поиск игры"),text:$search).textFieldStyle(.plain)}.padding(12).goldGlass(radius:12).padding(.horizontal)
+                HStack {
+                    Picker(P("game_status","Result"),selection:$resultFilter) {Text(LSX4ReportedResult.playable.label).tag("playable");Text(LSX4ReportedResult.unplayable.label).tag("not-playable")}.pickerStyle(.segmented).accessibilityIdentifier("community-result-filter")
+                    Toggle(P("reports_mine","Mine"),isOn:$onlyMine).fixedSize().accessibilityIdentifier("community-mine-filter")
+                }.padding(.horizontal)
                 ScrollView {
                     LazyVStack(alignment:.leading,spacing:10) {
+                        NavigationLink {GoldMemberDirectory()} label: {Label(P("members_title","All users"),systemImage:"person.2")}
                         HStack {
-                            Text(P("community_title","iOS community · Playable")).font(.headline)
+                            Text(P("community_all_title","iOS community reports")).font(.headline)
                             Spacer()
                             if cache.loading {ProgressView()}
                             Button {Task {await cache.refresh()}} label: {Image(systemName:"arrow.clockwise")}.accessibilityLabel(P("community_refresh","Refresh community reports")).accessibilityIdentifier("community-refresh")
                         }
-                        Text(P("community_scope","User submitted, unverified. Unplayable reports are available on the website.")).font(.caption).foregroundStyle(.secondary)
+                        Text(P("community_scope_both","User submitted, unverified. Reports include the tested app version.")).font(.caption).foregroundStyle(.secondary)
                         if !cache.error.isEmpty {Text(cache.error).font(.caption).foregroundStyle(.orange).accessibilityIdentifier("community-refresh-error")}
-                        if reports.isEmpty && !cache.loading {Text(search.isEmpty ? P("community_empty","No community Playable reports yet.") : P("community_no_matches","No matching community reports.")).font(.footnote)}
+                        if reports.isEmpty && !cache.loading {Text(search.isEmpty ? P("reports_empty","No reports yet") : P("community_no_matches","No matching community reports.")).font(.footnote)}
                         ForEach(reports) {report in
-                            let mine=LSX4ReportOwnership.key(report.id) != nil
+                            let mine=LSX4AccountCredentials.owns(report)
                             Button {selectedReport=report;showingReport=true} label: {
                                 HStack(spacing:12) {
-                                    Image(systemName:mine ? "person.crop.circle.badge.checkmark" : "gamecontroller").font(.title2).foregroundStyle(mine ? .mint : .white)
+                                    GoldReportGameIcon(report:report)
                                     VStack(alignment:.leading,spacing:5) {
                                         Text(report.gameTitle).font(.headline)
-                                        Text(report.device+" · "+(report.executionMode ?? "")).font(.caption).foregroundStyle(.secondary)
+                                        Text([report.device,"LSX4 "+report.appVersion,report.executionMode ?? ""].joined(separator:" · ")).font(.caption).foregroundStyle(.secondary)
+                                        GoldReportStatusNotes(report:report,conflict:LSX4ReportStatus.hasConflict(report,in:conflicts))
                                         if mine {Text(P("community_mine","Your report · add screenshot or video")).font(.caption).foregroundStyle(.mint)}
                                     }.frame(maxWidth:.infinity,alignment:.leading)
                                     Image(systemName:"chevron.right").font(.caption)
@@ -261,12 +305,14 @@ struct GoldCompatibilityView:View {
                                     .overlay(RoundedRectangle(cornerRadius:14).strokeBorder(mine ? Color.mint.opacity(0.8) : .clear,lineWidth:1.5).allowsHitTesting(false))
                             }.buttonStyle(.plain).accessibilityIdentifier("community-report-"+report.titleId)
                         }
+                        if resultFilter == "playable" && !onlyMine {
                         Divider().padding(.vertical,8)
                         Text(P("community_previous","Previous iPhone gameplay observations")).font(.headline)
                         Text(G("gold_prior_scope","Previous gameplay observation, not a full-game guarantee or a new measurement.")).font(.caption).foregroundStyle(.secondary)
                         ForEach(entries) {entry in
                             NavigationLink {observationDetail(entry)} label: {observationRow(entry)}
                                 .buttonStyle(.plain).accessibilityIdentifier("gold-compatible-\(entry.id)")
+                        }
                         }
                     }.padding()
                 }.refreshable {await cache.refresh()}
@@ -280,7 +326,7 @@ struct GoldCompatibilityView:View {
             Text(entry.title).font(.title2)
             if let game=games.first(where:{$0.id == entry.id}) {GoldCover(game:game,hero:true,fit:true).frame(height:190)}
             Text("iPhone · JIT").font(.caption)
-            Text(String(format:"%.1f FPS",entry.fps)).font(.title).foregroundStyle(.green)
+            Text(entry.fps > 0 ? String(format:"%.1f FPS",entry.fps) : "FPS —").font(.title).foregroundStyle(entry.fps > 0 ? Color.green : Color.secondary)
             Text(G("gold_prior_scope","Previous gameplay observation, not a full-game guarantee or a new measurement.")).font(.footnote)
             Text(entry.id+" · "+entry.build).font(.caption).foregroundStyle(.secondary)
         }.padding()}
@@ -289,7 +335,7 @@ struct GoldCompatibilityView:View {
         HStack(spacing:12) {
             if let game=games.first(where:{$0.id == entry.id}) {GoldCover(game:game).frame(width:44,height:44).clipShape(RoundedRectangle(cornerRadius:6))}
             Text(entry.title).frame(maxWidth:.infinity,alignment:.leading)
-            VStack(alignment:.trailing) {Text(String(format:"%.1f FPS",entry.fps)).foregroundStyle(.green);Text("iPhone · JIT").font(.caption2).foregroundStyle(.secondary)}
+            VStack(alignment:.trailing) {Text(entry.fps > 0 ? String(format:"%.1f FPS",entry.fps) : "FPS —").foregroundStyle(entry.fps > 0 ? Color.green : Color.secondary);Text("iPhone · JIT").font(.caption2).foregroundStyle(.secondary)}
         }.padding(10).contentShape(Rectangle()).goldGlass(radius:12)
     }
 
@@ -412,6 +458,98 @@ struct GoldCacheView:View {
     let games:[ConsoleTitle]
     var body:some View {GoldPage(title:G("menu_render_cache","Render cache")) {GoldCacheContents(games:games)}}
 }
+private struct GoldCacheCube:View {
+    let game:ConsoleTitle
+    var selected:Bool
+    @State private var image:UIImage?
+    @State private var visible=false
+    @State private var applicationActive=false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var body:some View {
+        GoldCacheCubeSurface(image:image,selected:selected,animated:visible && applicationActive && !reduceMotion)
+            .frame(height:112).allowsHitTesting(false).accessibilityHidden(true)
+            .onAppear {visible=true;applicationActive=UIApplication.shared.applicationState == .active}.onDisappear {visible=false}
+            .onReceive(NotificationCenter.default.publisher(for:UIApplication.didBecomeActiveNotification)) {_ in applicationActive=true}
+            .onReceive(NotificationCenter.default.publisher(for:UIScene.didActivateNotification)) {_ in applicationActive=true}
+            .onReceive(NotificationCenter.default.publisher(for:UIScene.willDeactivateNotification)) {_ in applicationActive=false}
+            .onReceive(NotificationCenter.default.publisher(for:UIApplication.willResignActiveNotification)) {_ in applicationActive=false}
+            .task(id:GoldArtwork.url(game)?.path) {
+                guard let url=GoldArtwork.url(game) else {image=nil;return}
+                let loaded=await Task.detached(priority:.utility) {GoldArtwork.load(url,large:false)}.value
+                if !Task.isCancelled {image=loaded}
+            }
+    }
+}
+private struct GoldCacheCubeSurface:UIViewRepresentable {
+    let image:UIImage?
+    let selected:Bool,animated:Bool
+    func makeUIView(context:Context)->GoldCacheCubeLayerView {GoldCacheCubeLayerView()}
+    func updateUIView(_ view:GoldCacheCubeLayerView,context:Context) {view.configure(image:image,selected:selected,animated:animated)}
+}
+private final class GoldCacheCubeLayerView:UIView {
+    private let camera=CALayer(),cube=CATransformLayer(),shadow=CAShapeLayer()
+    private var faces=[CALayer]()
+    override init(frame:CGRect) {
+        super.init(frame:frame);isUserInteractionEnabled=false
+        layer.addSublayer(shadow);layer.addSublayer(camera);camera.addSublayer(cube)
+        for i in 0..<6 {
+            let face=CALayer();face.isDoubleSided=false;face.borderWidth=1
+            face.borderColor=UIColor(red:0.51,green:0.69,blue:0.88,alpha:0.4).cgColor
+            face.backgroundColor=UIColor(red:i<2 ? 0.15 : 0.09,green:i<2 ? 0.29 : 0.19,blue:i<2 ? 0.46 : 0.31,alpha:1).cgColor
+            face.contentsGravity = .resizeAspectFill;face.masksToBounds=true;cube.addSublayer(face);faces.append(face)
+        }
+    }
+    required init?(coder:NSCoder){fatalError("init(coder:) has not been implemented")}
+    func configure(image:UIImage?,selected:Bool,animated:Bool) {
+        CATransaction.begin();CATransaction.setDisableActions(true)
+        let artwork:CGImage?
+        if let image {artwork=image.cgImage}
+        else {
+            artwork=UIGraphicsImageRenderer(size:CGSize(width:128,height:128)).image {_ in
+                UIImage(systemName:"cube.transparent.fill")?.withTintColor(.white).draw(in:CGRect(x:26,y:26,width:76,height:76))
+            }.cgImage
+        }
+        faces[0].contents=artwork;faces[1].contents=artwork
+        shadow.fillColor=(selected ? UIColor.systemBlue.withAlphaComponent(0.3) : UIColor.black.withAlphaComponent(0.25)).cgColor
+        if animated {
+            if cube.animation(forKey:"cache-turn")==nil {
+                let motion=CAKeyframeAnimation(keyPath:"transform")
+                motion.values=(0...90).map {step -> NSValue in
+                    let angle=Double(step)/90*Double.pi*2
+                    var transform=CATransform3DMakeRotation(CGFloat(angle),0,1,0)
+                    transform=CATransform3DRotate(transform,CGFloat(0.17*sin(angle)),1,0,0)
+                    return NSValue(caTransform3D:transform)
+                }
+                motion.duration=10;motion.repeatCount = .infinity;motion.calculationMode = .linear
+                cube.add(motion,forKey:"cache-turn")
+            }
+        } else {cube.removeAnimation(forKey:"cache-turn")}
+        cube.transform=CATransform3DRotate(CATransform3DMakeRotation(-0.35,0,1,0),0.12,1,0,0)
+        CATransaction.commit();setNeedsLayout()
+    }
+    override func layoutSubviews() {
+        super.layoutSubviews();CATransaction.begin();CATransaction.setDisableActions(true)
+        camera.frame=bounds;var perspective=CATransform3DIdentity;perspective.m34 = -1/500;camera.sublayerTransform=perspective
+        cube.position=CGPoint(x:bounds.midX,y:bounds.height*0.45)
+        let side=min(94,bounds.width*0.64,bounds.height*0.78),depth=side*0.36
+        shadow.path=UIBezierPath(ovalIn:CGRect(x:bounds.midX-side*0.5,y:bounds.height-13,width:side,height:10)).cgPath
+        for i in 0..<6 {
+            let width=(2...3).contains(i) ? depth : side,height=i>=4 ? depth : side
+            faces[i].bounds=CGRect(x:0,y:0,width:width,height:height);faces[i].position = .zero
+            var transform:CATransform3D
+            switch i {
+            case 0:transform=CATransform3DMakeTranslation(0,0,depth/2)
+            case 1:transform=CATransform3DRotate(CATransform3DMakeTranslation(0,0,-depth/2),.pi,0,1,0)
+            case 2:transform=CATransform3DRotate(CATransform3DMakeTranslation(-side/2,0,0),-.pi/2,0,1,0)
+            case 3:transform=CATransform3DRotate(CATransform3DMakeTranslation(side/2,0,0),.pi/2,0,1,0)
+            case 4:transform=CATransform3DRotate(CATransform3DMakeTranslation(0,-side/2,0),.pi/2,1,0,0)
+            default:transform=CATransform3DRotate(CATransform3DMakeTranslation(0,side/2,0),-.pi/2,1,0,0)
+            }
+            faces[i].transform=transform
+        }
+        CATransaction.commit()
+    }
+}
 struct GoldCacheContents:View {
     let games:[ConsoleTitle]
     @State private var entries:[GoldCacheEntry]=[]
@@ -428,23 +566,33 @@ struct GoldCacheContents:View {
                 if entries.isEmpty && !busy {ContentUnavailableView(G("gold_cache_empty","No render cache yet"),systemImage:"cube.transparent")}
                 LazyVGrid(columns:[GridItem(.adaptive(minimum:130))],spacing:14) {ForEach(entries) {entry in
                     Button {selected=entry} label: {
-                        VStack(spacing:10) {Image(systemName:"cube.transparent.fill").font(.system(size:42)).rotation3DEffect(.degrees(selected?.id == entry.id ? 15 : -10),axis:(x:0.3,y:1,z:0));Text(games.first(where:{$0.id == entry.id})?.title ?? entry.id).font(.caption).lineLimit(2);Text(ByteCountFormatter.string(fromByteCount:entry.bytes,countStyle:.file)).font(.caption2)}
-                            .frame(maxWidth:.infinity,minHeight:120).padding(10).goldGlass(radius:14)
-                    }.buttonStyle(.plain)
+                        VStack(spacing:8) {GoldCacheCube(game:games.first(where:{$0.id == entry.id}) ?? ConsoleTitle(id:entry.id,title:entry.id,androidStatus:"",bytes:0),selected:selected?.id == entry.id);Text(games.first(where:{$0.id == entry.id})?.title ?? entry.id).font(.caption).lineLimit(2);Text(ByteCountFormatter.string(fromByteCount:entry.bytes,countStyle:.file)).font(.caption2)}
+                            .frame(maxWidth:.infinity,minHeight:120).padding(10).goldGlass(radius:14,selected:selected?.id == entry.id)
+                            .overlay(alignment:.topTrailing) {
+                                if selected?.id == entry.id {Image(systemName:"checkmark.circle.fill").padding(10).accessibilityHidden(true).allowsHitTesting(false)}
+                            }.contentShape(RoundedRectangle(cornerRadius:14))
+                    }.buttonStyle(.plain).disabled(busy).accessibilityIdentifier("cache-entry-"+entry.id)
+                        .accessibilityValue(selected?.id == entry.id ? G("menu_selected","Selected") : "")
                 }}
-                if let selected {
-                    Text(selected.id).font(.headline);Text(P("cache_files","{count} files",["count":String(selected.files)]))
-                    Button(G("cache_clear","Clear selected cache"),role:.destructive) {confirm=true}.disabled(busy)
-                }
                 if let error {Text(error).foregroundStyle(.red).font(.caption)}
             }.padding(18)
         }.navigationTitle(G("menu_render_cache","Render cache"))
-            .confirmationDialog(G("gold_cache_confirm","Clear the selected compiled cache?"),isPresented:$confirm,titleVisibility:.visible) {
-                Button(G("cache_clear","Clear selected cache"),role:.destructive) {
-                    guard let selected else {return};busy=true
-                    Task {do {try await Task.detached(priority:.utility) {try GoldCacheStore.remove(selected)}.value;self.selected=nil;await reload()} catch {self.error=error.localizedDescription;busy=false}}
+            .safeAreaInset(edge:.bottom,spacing:0) {
+                if let selected {
+                    VStack(alignment:.leading,spacing:8) {
+                        Text(selected.id).font(.headline).accessibilityIdentifier("cache-selection")
+                        Text(P("cache_files","{count} files",["count":String(selected.files)])).font(.caption)
+                        Button(G("cache_clear","Clear selected cache"),role:.destructive) {confirm=true}.buttonStyle(.bordered).disabled(busy).accessibilityIdentifier("cache-clear-selected")
+                            .confirmationDialog(G("gold_cache_confirm","Clear the selected compiled cache?"),isPresented:$confirm,titleVisibility:.visible) {
+                                Button(G("cache_clear","Clear selected cache"),role:.destructive) {clearSelected()}.accessibilityIdentifier("cache-confirm-clear")
+                            }
+                    }.frame(maxWidth:.infinity,alignment:.leading).padding(14).goldGlass(radius:16).padding(.horizontal,18).padding(.bottom,8)
                 }
             }.task {await reload()}
+    }
+    private func clearSelected() {
+        guard let selected,!busy else {return};busy=true;error=nil
+        Task {do {try await Task.detached(priority:.utility) {try GoldCacheStore.remove(selected)}.value;self.selected=nil;await reload()} catch {self.error=error.localizedDescription;busy=false}}
     }
     @MainActor private func reload() async {busy=true;entries=await Task.detached(priority:.utility) {GoldCacheStore.scan()}.value;busy=false}
 }

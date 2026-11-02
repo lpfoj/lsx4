@@ -7,6 +7,7 @@
     "Режим": "Mode",
     "Активная сборка": "Active build",
     "Выбор применяется при следующем запуске игры. При смене режима игра запускается заново; сохранения и библиотека остаются доступны.": "The selection applies the next time you launch a game. Changing the mode restarts the game; saves and the library remain available.",
+    "JIT и смена сборки требуют подключённого Mac. No-JIT в активной сборке работает без отладчика.": "JIT and switching builds require a connected Mac. No-JIT in the active build runs without a debugger.",
     "Сравнение": "Comparison",
     "Активный режим и FPS отображаются над игрой. Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.": "The active mode and FPS appear above the game. Compare the same game, save and scene with identical audio and graphics settings.",
     "Готово": "Done",
@@ -47,8 +48,10 @@
     "LSX4\nЭкран остаётся активным во время разработки.": "LSX4\nThe screen stays awake during development.",
     "‹ Библиотека": "‹ Library",
     "Возврат…": "Returning…",
+    "JIT в этой сборке подготавливается на iPhone через LocalDevVPN. Смена JIT/No-JIT сборки требует Mac.": "This build prepares JIT on iPhone using LocalDevVPN. Switching JIT/No-JIT builds requires a Mac.",
     "iOS · общее ядро LSX4 · JIT на устройстве": "iOS · LSX4 shared core · on-device JIT",
     "Отображение": "Display",
+    "Показывать JIT / No-JIT": "Show JIT / No-JIT",
     "Название LSX4 и FPS остаются видны. Режим исполнения показывается только при включённом переключателе.": "LSX4 and FPS stay visible. The execution mode appears only when this switch is enabled.",
     "Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.": "Compare the same game, save and scene with matching audio and video settings.",
     "Графика": "Graphics",
@@ -100,8 +103,7 @@
     "pkg.import.progress": "{bytes} of {total} · {files} of {count} files",
     "pkg.import.cancelling": "Cancelling import…",
     "pkg.import.done": "{title} imported. The game is now in your library.",
-    "pkg.import.folder": "Choose extracted game folder…",
-    "Показывать JIT": "Show JIT"
+    "pkg.import.folder": "Choose extracted game folder…"
   },
   "de": {
     "Настройки": "Einstellungen",
@@ -111,6 +113,7 @@
     "Режим": "Modus",
     "Активная сборка": "Aktiver Build",
     "Выбор применяется при следующем запуске игры. При смене режима игра запускается заново; сохранения и библиотека остаются доступны.": "Die Auswahl gilt beim nächsten Spielstart. Ein Moduswechsel startet das Spiel neu; Spielstände und Bibliothek bleiben verfügbar.",
+    "JIT и смена сборки требуют подключённого Mac. No-JIT в активной сборке работает без отладчика.": "JIT und Build-Wechsel benötigen einen verbundenen Mac. No-JIT läuft im aktiven Build ohne Debugger.",
     "Сравнение": "Vergleich",
     "Активный режим и FPS отображаются над игрой. Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.": "Aktiver Modus und FPS werden über dem Spiel angezeigt. Vergleiche dasselbe Spiel, denselben Spielstand und dieselbe Szene mit gleichen Audio- und Grafikeinstellungen.",
     "Готово": "Fertig",
@@ -152,14 +155,14 @@
     "‹ Библиотека": "‹ Bibliothek",
     "Возврат…": "Zurück…",
     "Отображение": "Anzeige",
+    "Показывать JIT / No-JIT": "JIT / No-JIT anzeigen",
     "Название LSX4 и FPS остаются видны. Режим исполнения показывается только при включённом переключателе.": "LSX4 und FPS bleiben sichtbar. Der Ausführungsmodus wird nur bei aktiviertem Schalter angezeigt.",
     "Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.": "Vergleichen Sie dasselbe Spiel, denselben Spielstand und dieselbe Szene mit gleichen Audio- und Bildeinstellungen.",
     "Графика": "Grafik",
     "Разрешение игры и вывода": "Spiel- und Ausgabeauflösung",
     "Меньшее разрешение снижает нагрузку на графику и чёткость. Применяется при следующем запуске игры.": "Eine niedrigere Auflösung reduziert Grafiklast und Schärfe. Gilt beim nächsten Spielstart.",
     "Игры с фиксированным внутренним разрешением могут менять только размер выходного кадра.": "Spiele mit fester interner Auflösung ändern möglicherweise nur die Ausgabegröße.",
-    "Не удалось применить разрешение игры.": "Die Spielauflösung konnte nicht angewendet werden.",
-    "Показывать JIT": "JIT anzeigen"
+    "Не удалось применить разрешение игры.": "Die Spielauflösung konnte nicht angewendet werden."
   },
   "es": {
     "Настройки": "Ajustes",
@@ -169,6 +172,7 @@
     "Режим": "Modo",
     "Активная сборка": "Compilación activa",
     "Выбор применяется при следующем запуске игры. При смене режима игра запускается заново; сохранения и библиотека остаются доступны.": "La selección se aplica al iniciar una partida. Cambiar de modo reinicia el juego; las partidas guardadas y la biblioteca siguen disponibles.",
+    "JIT и смена сборки требуют подключённого Mac. No-JIT в активной сборке работает без отладчика.": "JIT y el cambio de compilación requieren un Mac conectado. No-JIT funciona en la compilación activa sin depurador.",
     "Сравнение": "Comparación",
     "Активный режим и FPS отображаются над игрой. Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.": "El modo activo y los FPS aparecen sobre el juego. Compara el mismo juego, partida guardada y escena con ajustes de audio y gráficos idénticos.",
     "Готово": "Listo",
@@ -210,14 +214,14 @@
     "‹ Библиотека": "‹ Biblioteca",
     "Возврат…": "Volviendo…",
     "Отображение": "Visualización",
+    "Показывать JIT / No-JIT": "Mostrar JIT / No-JIT",
     "Название LSX4 и FPS остаются видны. Режим исполнения показывается только при включённом переключателе.": "LSX4 y los FPS siguen visibles. El modo de ejecución solo aparece cuando este interruptor está activado.",
     "Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.": "Compare el mismo juego, partida y escena con los mismos ajustes de sonido e imagen.",
     "Графика": "Gráficos",
     "Разрешение игры и вывода": "Resolución del juego y de salida",
     "Меньшее разрешение снижает нагрузку на графику и чёткость. Применяется при следующем запуске игры.": "Una resolución menor reduce la carga gráfica y la nitidez. Se aplica al volver a iniciar el juego.",
     "Игры с фиксированным внутренним разрешением могут менять только размер выходного кадра.": "Los juegos con resolución interna fija pueden cambiar solo el tamaño de salida.",
-    "Не удалось применить разрешение игры.": "No se pudo aplicar la resolución del juego.",
-    "Показывать JIT": "Mostrar JIT"
+    "Не удалось применить разрешение игры.": "No se pudo aplicar la resolución del juego."
   },
   "fr": {
     "Настройки": "Réglages",
@@ -227,6 +231,7 @@
     "Режим": "Mode",
     "Активная сборка": "Version active",
     "Выбор применяется при следующем запуске игры. При смене режима игра запускается заново; сохранения и библиотека остаются доступны.": "Le choix s’applique au prochain lancement du jeu. Changer de mode redémarre le jeu ; les sauvegardes et la bibliothèque restent disponibles.",
+    "JIT и смена сборки требуют подключённого Mac. No-JIT в активной сборке работает без отладчика.": "JIT et le changement de version nécessitent un Mac connecté. No-JIT fonctionne sans débogueur dans la version active.",
     "Сравнение": "Comparaison",
     "Активный режим и FPS отображаются над игрой. Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.": "Le mode actif et les FPS s’affichent au-dessus du jeu. Comparez le même jeu, la même sauvegarde et la même scène avec des réglages audio et graphiques identiques.",
     "Готово": "Terminé",
@@ -268,14 +273,14 @@
     "‹ Библиотека": "‹ Bibliothèque",
     "Возврат…": "Retour…",
     "Отображение": "Affichage",
+    "Показывать JIT / No-JIT": "Afficher JIT / No-JIT",
     "Название LSX4 и FPS остаются видны. Режим исполнения показывается только при включённом переключателе.": "LSX4 et les FPS restent visibles. Le mode d’exécution apparaît uniquement si ce bouton est activé.",
     "Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.": "Comparez le même jeu, la même sauvegarde et la même scène avec les mêmes réglages audio et vidéo.",
     "Графика": "Graphismes",
     "Разрешение игры и вывода": "Résolution du jeu et de sortie",
     "Меньшее разрешение снижает нагрузку на графику и чёткость. Применяется при следующем запуске игры.": "Une résolution réduite diminue la charge graphique et la netteté. Appliquée au prochain lancement du jeu.",
     "Игры с фиксированным внутренним разрешением могут менять только размер выходного кадра.": "Les jeux à résolution interne fixe peuvent uniquement modifier la taille de sortie.",
-    "Не удалось применить разрешение игры.": "Impossible d’appliquer la résolution du jeu.",
-    "Показывать JIT": "Afficher JIT"
+    "Не удалось применить разрешение игры.": "Impossible d’appliquer la résolution du jeu."
   },
   "pt-BR": {
     "Настройки": "Configurações",
@@ -285,6 +290,7 @@
     "Режим": "Modo",
     "Активная сборка": "Versão ativa",
     "Выбор применяется при следующем запуске игры. При смене режима игра запускается заново; сохранения и библиотека остаются доступны.": "A seleção será aplicada na próxima vez que você iniciar um jogo. A mudança de modo reinicia o jogo; os dados salvos e a biblioteca continuam disponíveis.",
+    "JIT и смена сборки требуют подключённого Mac. No-JIT в активной сборке работает без отладчика.": "JIT e a troca de versão exigem um Mac conectado. No-JIT funciona na versão ativa sem depurador.",
     "Сравнение": "Comparação",
     "Активный режим и FPS отображаются над игрой. Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.": "O modo ativo e os FPS aparecem acima do jogo. Compare o mesmo jogo, os mesmos dados salvos e a mesma cena, com configurações idênticas de áudio e imagem.",
     "Готово": "Concluído",
@@ -326,14 +332,14 @@
     "‹ Библиотека": "‹ Biblioteca",
     "Возврат…": "Voltando…",
     "Отображение": "Exibição",
+    "Показывать JIT / No-JIT": "Mostrar JIT / No-JIT",
     "Название LSX4 и FPS остаются видны. Режим исполнения показывается только при включённом переключателе.": "LSX4 e os FPS continuam visíveis. O modo de execução aparece apenas quando esta opção está ativada.",
     "Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.": "Compare o mesmo jogo, save e cena com as mesmas configurações de áudio e vídeo.",
     "Графика": "Gráficos",
     "Разрешение игры и вывода": "Resolução do jogo e de saída",
     "Меньшее разрешение снижает нагрузку на графику и чёткость. Применяется при следующем запуске игры.": "Uma resolução menor reduz a carga gráfica e a nitidez. Aplicada na próxima vez que iniciar o jogo.",
     "Игры с фиксированным внутренним разрешением могут менять только размер выходного кадра.": "Jogos com resolução interna fixa podem alterar apenas o tamanho da saída.",
-    "Не удалось применить разрешение игры.": "Não foi possível aplicar a resolução do jogo.",
-    "Показывать JIT": "Mostrar JIT"
+    "Не удалось применить разрешение игры.": "Não foi possível aplicar a resolução do jogo."
   },
   "ru": {
     "Настройки": "Настройки",
@@ -343,6 +349,7 @@
     "Режим": "Режим",
     "Активная сборка": "Активная сборка",
     "Выбор применяется при следующем запуске игры. При смене режима игра запускается заново; сохранения и библиотека остаются доступны.": "Выбор применяется при следующем запуске игры. При смене режима игра запускается заново; сохранения и библиотека остаются доступны.",
+    "JIT и смена сборки требуют подключённого Mac. No-JIT в активной сборке работает без отладчика.": "JIT и смена сборки требуют подключённого Mac. No-JIT в активной сборке работает без отладчика.",
     "Сравнение": "Сравнение",
     "Активный режим и FPS отображаются над игрой. Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.": "Активный режим и FPS отображаются над игрой. Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.",
     "Готово": "Готово",
@@ -384,6 +391,7 @@
     "‹ Библиотека": "‹ Библиотека",
     "Возврат…": "Возврат…",
     "Отображение": "Отображение",
+    "Показывать JIT / No-JIT": "Показывать JIT / No-JIT",
     "Название LSX4 и FPS остаются видны. Режим исполнения показывается только при включённом переключателе.": "Название LSX4 и FPS остаются видны. Режим исполнения показывается только при включённом переключателе.",
     "Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.": "Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.",
     "Графика": "Графика",
@@ -435,8 +443,7 @@
     "pkg.import.progress": "{bytes} из {total} · файлов: {files} из {count}",
     "pkg.import.cancelling": "Отмена импорта…",
     "pkg.import.done": "{title}: импорт завершён. Игра добавлена в библиотеку.",
-    "pkg.import.folder": "Выбрать распакованную папку…",
-    "Показывать JIT": "Показывать JIT"
+    "pkg.import.folder": "Выбрать распакованную папку…"
   },
   "zh-Hans": {
     "Настройки": "设置",
@@ -446,6 +453,7 @@
     "Режим": "模式",
     "Активная сборка": "当前版本",
     "Выбор применяется при следующем запуске игры. При смене режима игра запускается заново; сохранения и библиотека остаются доступны.": "所选模式将在下次启动游戏时生效。切换模式会重新启动游戏；存档和游戏库仍然保留。",
+    "JIT и смена сборки требуют подключённого Mac. No-JIT в активной сборке работает без отладчика.": "JIT 和切换版本需要连接 Mac。当前版本的 No-JIT 无需调试器即可运行。",
     "Сравнение": "对比",
     "Активный режим и FPS отображаются над игрой. Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.": "当前模式和 FPS 显示在游戏上方。对比时请使用相同的游戏、存档和场景，并保持音频和图像设置一致。",
     "Готово": "完成",
@@ -487,13 +495,13 @@
     "‹ Библиотека": "‹ 游戏库",
     "Возврат…": "正在返回…",
     "Отображение": "显示",
+    "Показывать JIT / No-JIT": "显示 JIT / No-JIT",
     "Название LSX4 и FPS остаются видны. Режим исполнения показывается только при включённом переключателе.": "LSX4 和 FPS 始终可见。仅在此开关开启时显示执行模式。",
     "Сравнивайте одну игру, сохранение и сцену при одинаковых настройках звука и изображения.": "请使用相同的游戏、存档、场景以及音频和画面设置进行比较。",
     "Графика": "图形",
     "Разрешение игры и вывода": "游戏与输出分辨率",
     "Меньшее разрешение снижает нагрузку на графику и чёткость. Применяется при следующем запуске игры.": "较低的分辨率可降低图形负载和清晰度。下次启动游戏时生效。",
     "Игры с фиксированным внутренним разрешением могут менять только размер выходного кадра.": "内部渲染分辨率固定的游戏可能只会改变输出画面尺寸。",
-    "Не удалось применить разрешение игры.": "无法应用游戏分辨率。",
-    "Показывать JIT": "显示 JIT"
+    "Не удалось применить разрешение игры.": "无法应用游戏分辨率。"
   }
 }

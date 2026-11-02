@@ -16,7 +16,7 @@ import UIKit
     private var progress: LSX4PkgProgress?
     private var backgroundTask=UIBackgroundTaskIdentifier.invalid
 
-    func start(_ source: URL,folder:Bool=false) {
+    func start(_ source: URL,folder:Bool=false,localPackage:LSX4LocalPackage?=nil) {
         guard !busy else {return}
         LSX4Diagnostics.shared.record("import_start",["kind":folder ? "folder" : "pkg"])
         busy=true;successful=false;fraction=nil;detail=L("pkg.import.opening")
@@ -36,10 +36,18 @@ import UIKit
         }
         backgroundTask=UIApplication.shared.beginBackgroundTask(withName:"LSX4 PKG import") { box.cancel() }
         LSX4Diagnostics.shared.record("security_scope_will_start")
-        let scoped=source.startAccessingSecurityScopedResource()
+        let scoped=localPackage == nil ? source.startAccessingSecurityScopedResource() : false
         LSX4Diagnostics.shared.record("security_scope_started",["granted":scoped])
         Task.detached(priority:.userInitiated) { [weak self,box] in
             defer {if scoped {source.stopAccessingSecurityScopedResource()}}
+            if let localPackage {
+                let answer=Result {
+                    let local=try LSX4LocalPackages.validatedURL(localPackage,documents:LSX4PkgInstaller.documents)
+                    return try LSX4PkgInstaller.install(source:local,progress:box)
+                }
+                await self?.finish(answer)
+                return
+            }
             var coordinationError:NSError?
             var result:Result<LSX4ImportedGame,Error>?
             LSX4Diagnostics.shared.record("file_coordination_will_start")
@@ -96,7 +104,7 @@ import UIKit
         busy=false;progress=nil
         if backgroundTask != .invalid {UIApplication.shared.endBackgroundTask(backgroundTask);backgroundTask = .invalid}
         switch result {
-        case .success(let game):LSX4Diagnostics.shared.record("import_succeeded");successful=true;fraction=1;detail=L("pkg.import.done",["title":game.title])
+        case .success(let game):LSX4GameRemoval.restoreToList(game.id);LSX4Diagnostics.shared.record("import_succeeded");successful=true;fraction=1;detail=L("pkg.import.done",["title":game.title])
         case .failure(let error):
             let value=error as NSError
             LSX4Diagnostics.shared.record("import_failed",["domain":value.domain,"code":value.code,"message":value.localizedDescription])
@@ -108,11 +116,16 @@ import UIKit
 struct LSX4PkgImportView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var model=LSX4PkgImportModel()
+    @State private var showingLocalPackages=false
     var body: some View {
         NavigationStack {
             Form {
                 Section {
                     Text(L("pkg.import.instructions"))
+                    Button {showingLocalPackages=true} label: {
+                        Label(P("local_pkg_choose","Install a PKG already in LSX4…"),systemImage:"internaldrive")
+                            .frame(maxWidth:.infinity,alignment:.leading).contentShape(Rectangle())
+                    }.disabled(model.busy || model.preparing || model.pickerOpen).accessibilityIdentifier("pkg-choose-local")
                     LSX4GameImportButton(folder:false,model:model)
                     LSX4GameImportButton(folder:true,model:model)
                     Text(L("pkg.import.supported")).font(.footnote).foregroundStyle(.secondary)
@@ -136,6 +149,12 @@ struct LSX4PkgImportView: View {
 
         }.background(LSX4DocumentPickerHost(request:model.pickerRequest,completion:model.selected).frame(width:0,height:0))
         .preferredColorScheme(.dark)
+        .goldModal(isPresented:$showingLocalPackages) {
+            LSX4LocalPackagePicker {package in
+                showingLocalPackages=false
+                model.start(package.url,localPackage:package)
+            }
+        }
     }
 }
 

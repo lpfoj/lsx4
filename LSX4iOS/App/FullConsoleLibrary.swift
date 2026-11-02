@@ -34,11 +34,18 @@ func L(_ key: String, _ values: [String:String] = [:]) -> String {
 }
 
 enum ConsoleExecutionMode: String, CaseIterable, Identifiable {
-    case jit = "jit"
+    case jit = "jit", noJit = "no-jit"
     var id: String { rawValue }
-    var label: String { "JIT" }
-    static var installed: Self { .jit }
-    static var selected: Self { .jit }
+    var label: String { self == .jit ? "JIT" : "No-JIT" }
+    static var installed: Self {
+        Bundle.main.object(forInfoDictionaryKey: "LSX4AppStoreJitless") as? Bool == true ? .noJit : .jit
+    }
+    static var selected: Self {
+#if LSX4_DEVICE_LOCAL_JIT
+        if LSX4JITInstallation.standalone { return installed }
+#endif
+        return UserDefaults.standard.string(forKey: "lsx4.executionMode").flatMap(Self.init(rawValue:)) ?? installed
+    }
 }
 
 
@@ -104,7 +111,13 @@ struct ConsoleExecutionSettings: View {
         Binding(get: { ConsoleExecutionMode(rawValue: storedMode)?.rawValue ?? ConsoleExecutionMode.installed.rawValue },
                 set: { storedMode = $0 })
     }
-    private var canSwitchMode: Bool { false }
+    private var canSwitchMode: Bool {
+#if LSX4_DEVICE_LOCAL_JIT
+        return !LSX4JITInstallation.standalone
+#else
+        return true
+#endif
+    }
     var body: some View {
         NavigationStack {
             Form {
@@ -122,7 +135,7 @@ struct ConsoleExecutionSettings: View {
                     }.pickerStyle(.segmented).accessibilityIdentifier("cpu-execution-mode")
                     LabeledContent(L("Активная сборка"), value: ConsoleExecutionMode.installed.label)
                     Text(L("Выбор применяется при следующем запуске игры. При смене режима игра запускается заново; сохранения и библиотека остаются доступны."))
-                    Text(L("jit.setup.automatic"))
+                    Text(L("JIT в этой сборке подготавливается на iPhone через LocalDevVPN. Смена JIT/No-JIT сборки требует Mac."))
                     } else {
                         LabeledContent(L("Активная сборка"), value: "JIT")
                         Text(L("jit.setup.automatic"))
@@ -143,7 +156,7 @@ struct ConsoleExecutionSettings: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section(L("Отображение")) {
-                    Toggle(L("Показывать JIT"), isOn: $showExecutionMode)
+                    Toggle(L("Показывать JIT / No-JIT"), isOn: $showExecutionMode)
                         .accessibilityIdentifier("show-execution-mode")
                     Text(L("Название LSX4 и FPS остаются видны. Режим исполнения показывается только при включённом переключателе."))
                 }
@@ -154,7 +167,7 @@ struct ConsoleExecutionSettings: View {
                 ToolbarItem(placement: .confirmationAction) { Button(L("Готово")) { dismiss() }.accessibilityIdentifier("settings-done") }
             }
 #if LSX4_DEVICE_LOCAL_JIT
-            .sheet(isPresented: $showingJITSetup) { LSX4JITSetupView() }
+            .goldModal(isPresented: $showingJITSetup) { LSX4JITSetupView() }
 #endif
         }.environment(\.locale,Locale(identifier:language)).preferredColorScheme(.dark)
     }
@@ -249,8 +262,18 @@ enum ConsoleGameplayPriority {
     func launch(_ game: ConsoleTitle) {
         guard pending == nil else { return }
         if game.id.hasPrefix("PPSA") {
-            notice="\(game.title): PS5 Current is not connected to this iOS build yet. Android status does not establish iPhone compatibility."
+            guard let folder=game.folder else {notice=L("Сначала импортируйте файлы игры на iPhone.");return}
+#if LSX4_DEVICE_LOCAL_JIT
+            if LSX4JITInstallation.problem != nil {showingJITSetup=true;return}
+            guard let launch=LSX4LibraryControllerFactory.ps5LaunchHandler else {notice=L("Запуск пока недоступен.");return}
+            notice=launch(game.id,folder.path)
+#else
+            notice=L("Запуск пока недоступен.")
+#endif
             return
+        }
+        if let issue=LSX4LaunchSettings.preparePS4Game(game.id,name:game.title) {
+            notice=issue;return
         }
 #if LSX4_DEVICE_LOCAL_JIT
         if ConsoleExecutionMode.selected == .jit {
@@ -284,8 +307,9 @@ enum ConsoleGameplayPriority {
 @objc(LSX4LibraryControllerFactory) @MainActor public final class LSX4LibraryControllerFactory: NSObject {
 #if LSX4_DEVICE_LOCAL_JIT
     @objc public static var localLaunchHandler: ((String) -> String?)?
+    @objc public static var ps5LaunchHandler: ((String,String) -> String?)?
 #endif
-    @objc public static func makeController() -> UIViewController { UIHostingController(rootView:GoldLibraryView()) }
+    @objc public static func makeController() -> UIViewController { LSX4LibraryHostingController(rootView:GoldLibraryView()) }
     static func writeRequest(action:String,title:String="") throws -> String {
         let id=UUID().uuidString
         var request:[String:Any]=["id":id,"action":action,"title":title,"timestamp":Date().timeIntervalSince1970]
@@ -296,5 +320,19 @@ enum ConsoleGameplayPriority {
     @objc public static func requestLibrary() {
         do { _=try writeRequest(action:"library") }
         catch { NSLog("LSX4 return to library: %@",error.localizedDescription) }
+    }
+}
+
+@objc(LSX4LaunchSettings) @MainActor
+public final class LSX4LaunchSettings: NSObject {
+    @objc public static func preparePS4Game(_ title: String, name: String) -> String? {
+        guard title.count==9, title.hasPrefix("CUSA"), title.dropFirst(4).allSatisfy(\.isNumber) else {
+            return CocoaError(.fileReadInvalidFileName).localizedDescription
+        }
+        do {
+            try IOSGamePatchStore().prepare(title:title,name:name)
+            try IOSManagedOptimizationStore(title:title).prepare()
+            return nil
+        } catch {return error.localizedDescription}
     }
 }
