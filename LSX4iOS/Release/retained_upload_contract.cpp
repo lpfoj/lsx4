@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-#include "../../../funnel-arm/src/video_core/buffer_cache/upload_snapshot_retirement.h"
+#include "../../funnel-arm/src/video_core/buffer_cache/upload_snapshot_retirement.h"
 #include <cassert>
 #include <initializer_list>
 
