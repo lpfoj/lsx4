@@ -39,8 +39,9 @@ static s32 Query(const Config* cfg, Resource* resource) {
     if (cfg->codecType != 0) return Error(1);
     Layout layout{};
     if (!GetLayout(cfg->maxFrameWidth, cfg->maxFrameHeight, layout) ||
-        cfg->maxDpbFrameCount < 0 || cfg->maxDpbFrameCount > 16) return Error(14);
-    const u64 dpb = cfg->maxDpbFrameCount ? cfg->maxDpbFrameCount : 8;
+        cfg->maxDpbFrameCount > 16) return Error(14);
+    // A negative count asks for the codec default; reserve the H.264 maximum.
+    const u64 dpb = cfg->maxDpbFrameCount < 0 ? 16 : (cfg->maxDpbFrameCount ? cfg->maxDpbFrameCount : 8);
     const u64 worst_pitch = (u64(cfg->maxFrameWidth) + 255) & ~u64(255);
     const u64 frame = ((worst_pitch * layout.height * 3 / 2 + 255) & ~u64(255)) + 0x4000;
     *resource = {sizeof(Resource), 16ULL << 20, nullptr,

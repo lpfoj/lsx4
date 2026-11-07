@@ -61,8 +61,16 @@ enum ConsoleRenderResolution: String, CaseIterable, Identifiable {
         }
     }
     var outputDimensions: (Int, Int) {
-        self == .low && ConsoleUpscaler.selected != .off ? ConsoleRenderResolution.compact.dimensions : dimensions
+        guard ConsoleUpscaler.selected != .off else { return dimensions }
+        if self == .low { return ConsoleRenderResolution.compact.dimensions }
+        if self == .compact && ConsoleRenderResolution.launchTitle.map(Self.compactUpscaleTitles.contains) == true {
+            return ConsoleRenderResolution.hd.dimensions
+        }
+        return dimensions
     }
+    // The Last of Us preset patch renders the game at 960x540, so its 544p frame
+    // is upscaled to 1280x720 by the selected upscaler.
+    static let compactUpscaleTitles: Set<String> = ["CUSA00556"]
     var label: String {
         let (width,height)=dimensions,(outWidth,outHeight)=outputDimensions
         return outWidth == width ? "\(rawValue) · \(width) × \(height)" : "\(rawValue) · \(width) × \(height) → \(outWidth) × \(outHeight)"

@@ -398,6 +398,90 @@ void ClaudeSyncNote(int queue, int kind, u32 event_type = 0) {
 } // namespace
 
 namespace AmdGpu {
+// Labels written by GPU completions. A queue parked on a label must observe a
+// value that was published and then overwritten while it waited, as the
+// hardware queue polling that address would.
+struct ExecutorPublishedLabel {
+    u64 address;
+    u64 seq;
+    u64 time_ms;
+    u32 value;
+    bool taken;
+};
+static std::mutex g_executor_published_labels_mutex;
+static std::array<ExecutorPublishedLabel, 1024> g_executor_published_labels{};
+static u64 g_executor_published_label_seq = 0;
+static std::array<u64, 64> g_executor_parked_label_seq{};
+
+static void ExecutorNotePublishedLabel(const void* address, const u64 value) {
+    std::scoped_lock lock{g_executor_published_labels_mutex};
+    const u64 seq = ++g_executor_published_label_seq;
+    const u64 now_ms = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    g_executor_published_labels[seq & 1023] = {reinterpret_cast<u64>(address), seq, now_ms,
+                                               static_cast<u32>(value), false};
+}
+
+// The guest CPU runs far slower than the emulated GPU, so a label a compute
+// queue published can be reset by the CPU before the queue that waits for it
+// reaches its WAIT_REG_MEM; on the console that wait sees the value. When
+// every queue is stalled, a recent satisfying publication nobody took yet
+// stands in for the value the waiter missed.
+template <typename Satisfies>
+static bool ExecutorTakeRecentPublishedLabel(const u64 address, const u64 now_ms,
+                                             Satisfies&& satisfies) {
+    std::scoped_lock lock{g_executor_published_labels_mutex};
+    const u64 end = g_executor_published_label_seq;
+    for (u64 back = 0; back < 1024 && back < end; ++back) {
+        auto& record = g_executor_published_labels[(end - back) & 1023];
+        if (record.seq != end - back || now_ms - record.time_ms > 250) {
+            break;
+        }
+        if (record.address != address) {
+            continue;
+        }
+        if (!satisfies(record.value)) {
+            return false;
+        }
+        record.taken = true;
+        return true;
+    }
+    return false;
+}
+
+static u64 ExecutorPublishedLabelSeq() {
+    std::scoped_lock lock{g_executor_published_labels_mutex};
+    return g_executor_published_label_seq;
+}
+
+template <typename Satisfies>
+static bool ExecutorPublishedLabelSince(const u64 address, u64& since, Satisfies&& satisfies) {
+    std::scoped_lock lock{g_executor_published_labels_mutex};
+    const u64 end = g_executor_published_label_seq;
+    const u64 begin = end - since > 1024 ? end - 1024 : since;
+    since = end;
+    for (u64 seq = begin + 1; seq <= end; ++seq) {
+        const auto& record = g_executor_published_labels[seq & 1023];
+        if (record.seq == seq && record.address == address && satisfies(record.value)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Set while every GPU queue is parked on memory and none can run, so the GPU
+// is waiting on the guest CPU. Submit backpressure must not hold the CPU then:
+// the console has no such bound, and the CPU must submit the work that
+// releases the parked waits.
+static std::atomic<bool> g_executor_gpu_waits_on_cpu{false};
+
+static std::atomic<bool>& ExecutorForcedWaitPass(const u32 queue_id) {
+    static std::array<std::atomic<bool>, 64> forced{};
+    return forced[queue_id & 63];
+}
+
 
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
@@ -948,6 +1032,7 @@ bool ExecutorWriteFenceToCpuAddress(const char* op, void* address, u64 data, u32
                     num_bytes, static_cast<unsigned long long>(data));
             }
         }
+        ExecutorNotePublishedLabel(address, data);
         return true;
     }
 
@@ -966,6 +1051,7 @@ bool ExecutorWriteFenceToCpuAddress(const char* op, void* address, u64 data, u32
                     num_bytes, static_cast<unsigned long long>(data));
             }
         }
+        ExecutorNotePublishedLabel(address, data);
         return true;
     }
 
@@ -998,6 +1084,7 @@ bool ExecutorWriteFenceToCpuAddress(const char* op, void* address, u64 data, u32
                 static_cast<unsigned long long>(data));
         }
     }
+    ExecutorNotePublishedLabel(address, data);
     return true;
 }
 
@@ -2881,6 +2968,7 @@ void Liverpool::ParkMemoryWaitForExecutor(const u32 queue_id,
     if (!parked.active) {
         ++executor_parked_wait_count;
         executor_active_parked_waits.fetch_add(1, std::memory_order_release);
+        g_executor_parked_label_seq[queue_id & 63] = ExecutorPublishedLabelSeq();
     }
     if (rasterizer != nullptr) {
         rasterizer->TrackMemoryWaitWrite(address, sizeof(u32));
@@ -2966,8 +3054,8 @@ void Liverpool::RefreshParkedMemoryWaitsForExecutor() {
             submit_ready_mask.fetch_or(queue_bit, std::memory_order_release);
             continue;
         }
-        const u32 masked_value = value & parked.mask;
-        const bool satisfied = [&] {
+        const auto satisfied_by = [&parked](const u32 sample) {
+            const u32 masked_value = sample & parked.mask;
             switch (static_cast<PM4CmdWaitRegMem::Function>(parked.function)) {
             case PM4CmdWaitRegMem::Function::Always:
                 return true;
@@ -2987,13 +3075,169 @@ void Liverpool::RefreshParkedMemoryWaitsForExecutor() {
             default:
                 return false;
             }
-        }();
+        };
+        bool satisfied = satisfied_by(value);
         if (!satisfied) {
-            continue;
+            // A label another queue released is recorded at packet time but only
+            // reaches memory when the GPU retires it. The waiting queue's own
+            // sidecar lookup orders its work after that completion on the GPU.
+            std::scoped_lock pending_lock{executor_pending_completion_mutex};
+            const ExecutorPendingCompletionWrite first{parked.address, 0, 0, 0,
+                                                       Pm4Engine::Graphics};
+            for (auto it = executor_pending_completion_writes.lower_bound(first);
+                 it != executor_pending_completion_writes.end() &&
+                 it->first.address == parked.address;
+                 ++it) {
+                if (satisfied_by(static_cast<u32>(it->first.value))) {
+                    satisfied = true;
+                    break;
+                }
+            }
+        }
+        if (!satisfied &&
+            ExecutorPublishedLabelSince(parked.address, g_executor_parked_label_seq[queue_id & 63],
+                                        satisfied_by)) {
+            static std::atomic<u32> latched_logs{0};
+            if (latched_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+                std::fprintf(stderr,
+                             "[LSX4_PARKED_WAIT_LATCHED] queue=%u addr=0x%llx ref=0x%x value=0x%x\n",
+                             queue_id, static_cast<unsigned long long>(parked.address),
+                             parked.reference, value);
+            }
+            satisfied = true;
+            ExecutorForcedWaitPass(queue_id).store(true, std::memory_order_release);
+        }
+        if (!satisfied) {
+            // Every queue parked on memory that never changes is a deadlock the
+            // real GPU cannot reach (its queues run independently). Release the
+            // wait after a bound so the frame continues instead of freezing.
+            static std::array<u64, NumTotalQueues> parked_since_ms{};
+            static std::array<VAddr, NumTotalQueues> parked_since_address{};
+            static std::atomic<u32> forced_release_logs{0};
+            static std::array<bool, NumTotalQueues> parked_flushed{};
+            static std::array<u64, NumTotalQueues> parked_unlocked_ms{};
+            static std::array<std::pair<VAddr, u64>, 16> recent_forced{};
+            static std::atomic<u32> parked_unlock_logs{0};
+            static std::atomic<u64> parked_flush_count{0};
+            const u64 now_ms = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+            if (parked_since_address[queue_id] != parked.address ||
+                parked_since_ms[queue_id] == 0) {
+                parked_since_address[queue_id] = parked.address;
+                parked_since_ms[queue_id] = now_ms;
+                parked_flushed[queue_id] = false;
+                parked_unlocked_ms[queue_id] = 0;
+                continue;
+            }
+            const u64 runnable = submit_ready_mask.load(std::memory_order_acquire) &
+                                 ~executor_parked_memory_wait_mask;
+            if (runnable != 0) {
+                g_executor_gpu_waits_on_cpu.store(false, std::memory_order_release);
+                continue;
+            }
+            const u64 parked_ms = now_ms - parked_since_ms[queue_id];
+            // Labels the other queue already released can still sit in an
+            // unsubmitted command buffer; submit it before treating the wait as stuck.
+            if (!parked_flushed[queue_id] && parked_ms >= 2) {
+                parked_flushed[queue_id] = true;
+                parked_flush_count.fetch_add(1, std::memory_order_relaxed);
+                FlushGpuCompletionBatchForExecutor(true, true);
+                continue;
+            }
+            if (parked_ms >= 4 &&
+                ExecutorTakeRecentPublishedLabel(parked.address, now_ms, satisfied_by)) {
+                static std::atomic<u32> pulse_logs{0};
+                if (pulse_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    std::fprintf(stderr,
+                                 "[LSX4_PARKED_WAIT_PULSE] queue=%u addr=0x%llx ref=0x%x "
+                                 "value=0x%x parkedMs=%llu\n",
+                                 queue_id, static_cast<unsigned long long>(parked.address),
+                                 parked.reference, value,
+                                 static_cast<unsigned long long>(parked_ms));
+                }
+                parked_since_ms[queue_id] = 0;
+                parked_since_address[queue_id] = 0;
+                parked_flushed[queue_id] = false;
+                parked_unlocked_ms[queue_id] = 0;
+                ExecutorForcedWaitPass(queue_id).store(true, std::memory_order_release);
+                ReleaseParkedMemoryWaitForExecutor(queue_id);
+                submit_ready_mask.fetch_or(queue_bit, std::memory_order_release);
+                ++executor_parked_wait_wake_count;
+                g_executor_gpu_waits_on_cpu.store(false, std::memory_order_release);
+                continue;
+            }
+            // No queue can move, so the GPU waits on the CPU. The submission lock
+            // set by sceGnmSubmitDone would hold that CPU thread until the GPU goes
+            // idle, which a real PS4 never does; signal idle so the guest can
+            // submit the work that releases this wait.
+            if (parked_ms >= 3 && now_ms - parked_unlocked_ms[queue_id] >= 3) {
+                if (parked_unlocked_ms[queue_id] == 0 &&
+                    parked_unlock_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    std::fprintf(stderr,
+                                 "[LSX4_PARKED_GPU_UNLOCK] queue=%u addr=0x%llx ref=0x%x "
+                                 "value=0x%x parkedMs=%llu\n",
+                                 queue_id, static_cast<unsigned long long>(parked.address),
+                                 parked.reference, value,
+                                 static_cast<unsigned long long>(parked_ms));
+                }
+                parked_unlocked_ms[queue_id] = now_ms;
+                Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+                if (!g_executor_gpu_waits_on_cpu.exchange(true, std::memory_order_acq_rel)) {
+                    submit_cv.notify_all();
+                }
+            }
+            const bool repeat_release = std::ranges::any_of(
+                recent_forced, [&](const std::pair<VAddr, u64>& entry) {
+                    return entry.first == parked.address && now_ms - entry.second < 2000;
+                });
+            if (parked_ms < (repeat_release ? 8u : 100u)) {
+                continue;
+            }
+            {
+                auto* slot = &recent_forced[0];
+                for (auto& entry : recent_forced) {
+                    if (entry.first == parked.address) {
+                        slot = &entry;
+                        break;
+                    }
+                    if (entry.second < slot->second) {
+                        slot = &entry;
+                    }
+                }
+                *slot = {parked.address, now_ms};
+            }
+            if (forced_release_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+                std::fprintf(stderr,
+                             "[LSX4_PARKED_WAIT_FORCED] queue=%u addr=0x%llx func=%u ref=0x%x "
+                             "mask=0x%x value=0x%x parkedMs=%llu submits=%u flushes=%llu\n",
+                             queue_id, static_cast<unsigned long long>(parked.address),
+                             parked.function, parked.reference, parked.mask, value,
+                             static_cast<unsigned long long>(now_ms - parked_since_ms[queue_id]),
+                             num_submits.load(std::memory_order_acquire),
+                             static_cast<unsigned long long>(
+                                 parked_flush_count.load(std::memory_order_relaxed)));
+            }
+            parked_since_ms[queue_id] = 0;
+            parked_since_address[queue_id] = 0;
+            parked_flushed[queue_id] = false;
+            parked_unlocked_ms[queue_id] = 0;
+            // The released queue may produce what the others wait for; give them
+            // a full bound again instead of releasing them in the same stall.
+            for (u32 other = 0; other < NumTotalQueues; ++other) {
+                if (other != queue_id && parked_since_ms[other] != 0) {
+                    parked_since_ms[other] = now_ms;
+                    parked_flushed[other] = false;
+                    parked_unlocked_ms[other] = 0;
+                }
+            }
+            ExecutorForcedWaitPass(queue_id).store(true, std::memory_order_release);
         }
         ReleaseParkedMemoryWaitForExecutor(queue_id);
         submit_ready_mask.fetch_or(queue_bit, std::memory_order_release);
         ++executor_parked_wait_wake_count;
+        g_executor_gpu_waits_on_cpu.store(false, std::memory_order_release);
     }
 }
 #endif
@@ -3134,6 +3378,21 @@ void Liverpool::Process(std::stop_token stoken) {
 #endif
 
     while (!stoken.stop_requested()) {
+#if defined(LSX4_APPLE_RUNTIME)
+        // iOS rejects GPU work committed from the background and reports the
+        // device lost. The lifecycle pause stops guest threads; hold the command
+        // processor as well until the app is active again.
+        if (DebugState.IsGuestThreadsPaused()) {
+            static std::atomic<u32> lifecycle_hold_logs{0};
+            if (lifecycle_hold_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::fprintf(stderr, "[LSX4_GPU_LIFECYCLE_HOLD] engine=command_processor\n");
+            }
+            while (DebugState.IsGuestThreadsPaused() && !stoken.stop_requested() &&
+                   !IsRendererTerminal()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            }
+        }
+#endif
         if (claude_stats.enabled) {
             const auto now = std::chrono::steady_clock::now();
             const u64 window_ns = ClaudeNs(claude_stats.window);
@@ -3356,7 +3615,10 @@ void Liverpool::Process(std::stop_token stoken) {
                     if (ready_mask == 0) {
                         const auto sleep_begin = std::chrono::steady_clock::now();
                         std::unique_lock wait_lock{submit_mutex};
-                        submit_cv.wait(wait_lock, [this, observed_wait_generation, &stoken] {
+                        // Timed so the parked-wait watchdog in
+                        // RefreshParkedMemoryWaitsForExecutor keeps running.
+                        submit_cv.wait_for(wait_lock, std::chrono::milliseconds{5},
+                                           [this, observed_wait_generation, &stoken] {
                             return stoken.stop_requested() ||
                                    executor_wait_event_generation.load(
                                        std::memory_order_acquire) !=
@@ -5665,8 +5927,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory &&
                     ExecutorWaitValueSourceIsManagedMemory(wait_source)) {
                     u32 local_yields = 0;
+                    ExecutorForcedWaitPass(GfxQueueId).store(false, std::memory_order_relaxed);
                     while (!state->abort &&
-                           !TestWaitRegMemValue(*wait_reg_mem, wait_value)) {
+                           !TestWaitRegMemValue(*wait_reg_mem, wait_value) &&
+                           !ExecutorForcedWaitPass(GfxQueueId).exchange(false)) {
 #if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)
                         ++exec_live_summary.wait_yields;
                         ++local_yields;
@@ -5690,6 +5954,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         if (!ExecutorWaitValueSourceIsManagedMemory(wait_source)) {
                             state->abort = true;
                             break;
+                        }
+                        if (!TestWaitRegMemValue(*wait_reg_mem, wait_value)) {
+                            const u64 parked_dependency_tick = ConsumeCompletionWaitForExecutor(
+                                state, Pm4Engine::Graphics, *wait_reg_mem);
+                            if (parked_dependency_tick != 0) {
+                                OrderGpuWorkAfterCompletionForExecutor(parked_dependency_tick);
+                                ++executor_logical_wait_count;
+                                break;
+                            }
                         }
 #endif
                     }
@@ -6548,7 +6821,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                     ++executor_logical_wait_count;
                     break;
                 }
-                while (!TestWaitRegMemValue(*wait_reg_mem, current_value) && !state->abort) {
+                ExecutorForcedWaitPass(vqid + 1).store(false, std::memory_order_relaxed);
+                while (!TestWaitRegMemValue(*wait_reg_mem, current_value) && !state->abort &&
+                       !ExecutorForcedWaitPass(vqid + 1).exchange(false)) {
                     if (ExecutorWaitValueSourceIsManagedMemory(wait_source)) {
                         ParkMemoryWaitForExecutor(vqid + 1, *wait_reg_mem,
                                                   untracked_gpu_publication_deferred);
@@ -6559,6 +6834,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                     if (wait_source == ExecutorWaitValueSource::Unresolved) {
                         state->abort = true;
                         break;
+                    }
+                    if (!TestWaitRegMemValue(*wait_reg_mem, current_value)) {
+                        const u64 parked_dependency_tick = ConsumeCompletionWaitForExecutor(
+                            state, Pm4Engine::Compute, *wait_reg_mem);
+                        if (parked_dependency_tick != 0) {
+                            OrderGpuWorkAfterCompletionForExecutor(parked_dependency_tick);
+                            ++executor_logical_wait_count;
+                            break;
+                        }
                     }
                 }
                 break;
@@ -6962,7 +7246,8 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         submit_cv.wait(lock, [this] {
             return IsRendererTerminal() ||
                    num_submits.load(std::memory_order_acquire) <=
-                       AdaptiveCpuGpuQueueLowWater;
+                       AdaptiveCpuGpuQueueLowWater ||
+                   g_executor_gpu_waits_on_cpu.load(std::memory_order_acquire);
         });
         Common::NoteCpuTuningEvent(Common::CpuTuningEvent::CpuGpuSyncs);
     }
@@ -7135,7 +7420,8 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
         submit_cv.wait(lock, [this] {
             return IsRendererTerminal() ||
                    num_submits.load(std::memory_order_acquire) <=
-                       AdaptiveCpuGpuQueueLowWater;
+                       AdaptiveCpuGpuQueueLowWater ||
+                   g_executor_gpu_waits_on_cpu.load(std::memory_order_acquire);
         });
         Common::NoteCpuTuningEvent(Common::CpuTuningEvent::CpuGpuSyncs);
     }

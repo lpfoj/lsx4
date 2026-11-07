@@ -657,7 +657,12 @@
     "graphics_upscaler": "Upscaler",
     "graphics_upscaler_hint": "360p renders at 656 × 368. An upscaler enlarges it to 960 × 544, even when FSR is off in optimizations; Off shows 656 × 368 as is.",
     "graphics_bloodborne_preset": "Bloodborne uses 360p with AMD FSR 1.0 until you pick a resolution here.",
-    "upscaler_bilinear": "Bilinear"
+    "upscaler_bilinear": "Bilinear",
+    "graphics_upscaler_hint_tlou": "At 544p The Last of Us renders 960 × 540 and the upscaler enlarges it to 1280 × 720; other games show 960 × 544 as is.",
+    "home_layout_cinematic": "Cinematic",
+    "cinematic_games": "Games",
+    "cinematic_library": "Library",
+    "cinematic_empty": "No games"
   },
   "ru": {
     "system_info_category_system": "Система",
@@ -1317,7 +1322,12 @@
     "graphics_upscaler": "Апскейлер",
     "graphics_upscaler_hint": "360p рисует игру в 656 × 368. Апскейлер растягивает до 960 × 544, даже если FSR выключен в оптимизациях; «Выкл.» показывает 656 × 368 как есть.",
     "graphics_bloodborne_preset": "Bloodborne по умолчанию идёт в 360p с AMD FSR 1.0, пока вы не выберете разрешение здесь.",
-    "upscaler_bilinear": "Билинейный"
+    "upscaler_bilinear": "Билинейный",
+    "graphics_upscaler_hint_tlou": "В 544p The Last of Us рисует 960 × 540, а апскейлер растягивает до 1280 × 720; другие игры показывают 960 × 544 как есть.",
+    "home_layout_cinematic": "Кинематографический",
+    "cinematic_games": "Игры",
+    "cinematic_library": "Библиотека",
+    "cinematic_empty": "Нет игр"
   },
   "de": {
     "system_info_category_system": "System",
@@ -1977,7 +1987,12 @@
     "graphics_upscaler": "Hochskalierung",
     "graphics_upscaler_hint": "360p rendert mit 656 × 368. Die Hochskalierung vergrößert auf 960 × 544, auch wenn FSR in den Optimierungen aus ist; „Aus“ zeigt 656 × 368 unverändert.",
     "graphics_bloodborne_preset": "Bloodborne nutzt 360p mit AMD FSR 1.0, bis Sie hier eine Auflösung wählen.",
-    "upscaler_bilinear": "Bilinear"
+    "upscaler_bilinear": "Bilinear",
+    "graphics_upscaler_hint_tlou": "Bei 544p rendert The Last of Us mit 960 × 540 und die Hochskalierung vergrößert auf 1280 × 720; andere Spiele zeigen 960 × 544 unverändert.",
+    "home_layout_cinematic": "Kinoansicht",
+    "cinematic_games": "Spiele",
+    "cinematic_library": "Bibliothek",
+    "cinematic_empty": "Keine Spiele"
   },
   "es": {
     "system_info_category_system": "System",
@@ -2637,7 +2652,12 @@
     "graphics_upscaler": "Escalador",
     "graphics_upscaler_hint": "360p renderiza a 656 × 368. El escalador amplía a 960 × 544 aunque FSR esté desactivado en optimizaciones; «Desactivado» muestra 656 × 368 tal cual.",
     "graphics_bloodborne_preset": "Bloodborne usa 360p con AMD FSR 1.0 hasta que elijas una resolución aquí.",
-    "upscaler_bilinear": "Bilineal"
+    "upscaler_bilinear": "Bilineal",
+    "graphics_upscaler_hint_tlou": "En 544p, The Last of Us renderiza a 960 × 540 y el escalador amplía a 1280 × 720; los demás juegos muestran 960 × 544 tal cual.",
+    "home_layout_cinematic": "Cinemático",
+    "cinematic_games": "Juegos",
+    "cinematic_library": "Biblioteca",
+    "cinematic_empty": "No hay juegos"
   },
   "fr": {
     "system_info_category_system": "System",
@@ -3297,7 +3317,12 @@
     "graphics_upscaler": "Mise à l’échelle",
     "graphics_upscaler_hint": "360p rend en 656 × 368. La mise à l’échelle agrandit en 960 × 544 même si FSR est désactivé dans les optimisations ; « Désactivé » affiche 656 × 368 tel quel.",
     "graphics_bloodborne_preset": "Bloodborne utilise 360p avec AMD FSR 1.0 tant que vous ne choisissez pas de résolution ici.",
-    "upscaler_bilinear": "Bilinéaire"
+    "upscaler_bilinear": "Bilinéaire",
+    "graphics_upscaler_hint_tlou": "En 544p, The Last of Us rend en 960 × 540 et la mise à l’échelle agrandit en 1280 × 720 ; les autres jeux affichent 960 × 544 tel quel.",
+    "home_layout_cinematic": "Cinématique",
+    "cinematic_games": "Jeux",
+    "cinematic_library": "Bibliothèque",
+    "cinematic_empty": "Aucun jeu"
   },
   "zh-Hans": {
     "system_info_category_system": "System",
@@ -3957,7 +3982,12 @@
     "graphics_upscaler": "超分辨率",
     "graphics_upscaler_hint": "360p 以 656 × 368 渲染。超分辨率会放大到 960 × 544（即使优化中关闭了 FSR）；“关闭”则按 656 × 368 显示。",
     "graphics_bloodborne_preset": "在此选择分辨率之前，Bloodborne 默认使用 360p 和 AMD FSR 1.0。",
-    "upscaler_bilinear": "双线性"
+    "upscaler_bilinear": "双线性",
+    "graphics_upscaler_hint_tlou": "544p 下《最后生还者》以 960 × 540 渲染，超分辨率放大到 1280 × 720；其他游戏按 960 × 544 原样显示。",
+    "home_layout_cinematic": "电影视图",
+    "cinematic_games": "游戏",
+    "cinematic_library": "游戏库",
+    "cinematic_empty": "暂无游戏"
   },
   "pt": {
     "patches_title": "Patches de jogos",
@@ -4034,7 +4064,12 @@
     "graphics_upscaler_hint": "360p renderiza em 656 × 368. O upscaler amplia para 960 × 544 mesmo com o FSR desligado nas otimizações; «Desligado» mostra 656 × 368 como está.",
     "graphics_bloodborne_preset": "Bloodborne usa 360p com AMD FSR 1.0 até escolher uma resolução aqui.",
     "upscaler_off": "Desligado",
-    "upscaler_bilinear": "Bilinear"
+    "upscaler_bilinear": "Bilinear",
+    "graphics_upscaler_hint_tlou": "Em 544p, The Last of Us renderiza em 960 × 540 e o upscaler amplia para 1280 × 720; os outros jogos mostram 960 × 544 como está.",
+    "home_layout_cinematic": "Cinematográfico",
+    "cinematic_games": "Jogos",
+    "cinematic_library": "Biblioteca",
+    "cinematic_empty": "Sem jogos"
   },
   "zh": {
     "patches_title": "游戏补丁",
@@ -4694,7 +4729,12 @@
     "graphics_upscaler": "超分辨率",
     "graphics_upscaler_hint": "360p 以 656 × 368 渲染。超分辨率會放大到 960 × 544（即使優化中關閉了 FSR）；「關閉」則按 656 × 368 顯示。",
     "graphics_bloodborne_preset": "在此選擇解析度之前，Bloodborne 預設使用 360p 和 AMD FSR 1.0。",
-    "upscaler_bilinear": "雙線性"
+    "upscaler_bilinear": "雙線性",
+    "graphics_upscaler_hint_tlou": "544p 下《最後生還者》以 960 × 540 渲染，超解析度放大到 1280 × 720；其他遊戲按 960 × 544 原樣顯示。",
+    "home_layout_cinematic": "電影視圖",
+    "cinematic_games": "遊戲",
+    "cinematic_library": "遊戲庫",
+    "cinematic_empty": "暫無遊戲"
   },
   "pt-BR": {
     "patches_title": "Patches de jogos",
@@ -4771,6 +4811,11 @@
     "graphics_upscaler_hint": "360p renderiza em 656 × 368. O upscaler amplia para 960 × 544 mesmo com o FSR desligado nas otimizações; “Desligado” mostra 656 × 368 como está.",
     "graphics_bloodborne_preset": "Bloodborne usa 360p com AMD FSR 1.0 até você escolher uma resolução aqui.",
     "upscaler_off": "Desligado",
-    "upscaler_bilinear": "Bilinear"
+    "upscaler_bilinear": "Bilinear",
+    "graphics_upscaler_hint_tlou": "Em 544p, The Last of Us renderiza em 960 × 540 e o upscaler amplia para 1280 × 720; os outros jogos mostram 960 × 544 como está.",
+    "home_layout_cinematic": "Cinematográfico",
+    "cinematic_games": "Jogos",
+    "cinematic_library": "Biblioteca",
+    "cinematic_empty": "Nenhum jogo"
   }
 }

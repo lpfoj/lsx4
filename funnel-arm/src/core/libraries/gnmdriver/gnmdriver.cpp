@@ -829,15 +829,31 @@ static bool WaitGpuIdle(const char* where = "gnm_wait_gpu_idle") {
     HLE_TRACE;
     std::unique_lock lock{m_submission};
 #if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)
-    (void)where;
     constexpr auto WaitSlice = std::chrono::milliseconds{250};
+    // A PS4 submit after sceGnmSubmitDone does not wait for the GPU; the lock
+    // only orders frames. A GPU queue parked on a label that this thread writes
+    // after submitting never goes idle, so the lock is released after a bound.
+    constexpr auto MaxLockWait = std::chrono::milliseconds{100};
+    const auto lock_deadline = std::chrono::steady_clock::now() + MaxLockWait;
     while (submission_lock != 0) {
         if (liverpool && liverpool->IsRendererTerminal()) {
             submission_lock = 0;
             cv_lock.notify_all();
             return false;
         }
-        cv_lock.wait_for(lock, WaitSlice, [] { return submission_lock == 0; });
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= lock_deadline) {
+            static std::atomic<u32> released_logs{0};
+            if (released_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::fprintf(stderr, "[LSX4_SUBMIT_LOCK_RELEASED] where=%s waitMs=%lld\n",
+                             where, static_cast<long long>(MaxLockWait.count()));
+            }
+            submission_lock = 0;
+            cv_lock.notify_all();
+            break;
+        }
+        cv_lock.wait_until(lock, std::min(lock_deadline, now + WaitSlice),
+                           [] { return submission_lock == 0; });
     }
     if (liverpool && liverpool->IsRendererTerminal()) {
         return false;

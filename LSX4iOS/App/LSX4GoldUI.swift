@@ -21,16 +21,16 @@ enum GoldText {
 func G(_ key:String,_ fallback:String)->String {GoldText.get(key,fallback)}
 
 enum GoldLayout:Int,CaseIterable,Identifiable {
-    case list,ribbonHorizontal,ribbonVertical,libraryHorizontal,libraryVertical,tilesHorizontal,tilesVertical
+    case list,ribbonHorizontal,ribbonVertical,libraryHorizontal,libraryVertical,tilesHorizontal,tilesVertical,cinematic
     var id:Int {rawValue}
-    var horizontal:Bool {[1,3,5].contains(rawValue)}
+    var horizontal:Bool {[1,3,5,7].contains(rawValue)}
     var label:String {
-        let keys=["list","horizontal","vertical","library_horizontal","library_vertical","tiles_horizontal","tiles_vertical"]
-        let names=["List","Ribbon · horizontal","Ribbon · vertical","Library · horizontal","Library · vertical","Tiles · horizontal","Tiles · vertical"]
+        let keys=["list","horizontal","vertical","library_horizontal","library_vertical","tiles_horizontal","tiles_vertical","cinematic"]
+        let names=["List","Ribbon · horizontal","Ribbon · vertical","Library · horizontal","Library · vertical","Tiles · horizontal","Tiles · vertical","Cinematic"]
         return G("home_layout_"+keys[rawValue],names[rawValue])
     }
     var symbol:String {
-        ["list.bullet","rectangle.split.3x1","rectangle.split.1x2","books.vertical","rectangle.grid.1x2","rectangle.grid.2x2","square.grid.2x2"][rawValue]
+        ["list.bullet","rectangle.split.3x1","rectangle.split.1x2","books.vertical","rectangle.grid.1x2","rectangle.grid.2x2","square.grid.2x2","rectangle.on.rectangle"][rawValue]
     }
 }
 enum GoldTheme:Int,CaseIterable,Identifiable {
@@ -353,6 +353,8 @@ struct GoldLibraryView:View {
     @State private var search=""
     @State private var showingSearch=false
     @State private var selectedID:String?
+    @State private var cinematicLibrary=false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var route:GoldRoute?
     @State private var libraryActive=true
     @State private var dragging:String?
@@ -387,22 +389,37 @@ struct GoldLibraryView:View {
             + games.filter {!$0.id.hasPrefix("PPSA")}.map(GoldHomeItem.game)
     }
     private var selected:GoldHomeItem? {entries.first(where:{$0.id == selectedID}) ?? entries.first}
+    private var cinematicSelection:GoldHomeItem? {
+        entries.first(where:{$0.id == selectedID && $0.game != nil})
+            ?? entries.first(where:{$0.game?.folder != nil}) ?? entries.first(where:{$0.game != nil})
+    }
     var body:some View {
         NavigationStack {
             GeometryReader { geometry in
                 ZStack {
-                    GoldBackdrop(theme:theme,animated:libraryActive && route == nil)
-                    if layout != .list,let game=selected?.game {
-                        GoldCover(game:game,hero:true).id(game.id).opacity(0.15).blur(radius:12).ignoresSafeArea().allowsHitTesting(false).transition(.opacity)
+                    if layout == .cinematic {
+                        GoldCinematicBackdrop(game:cinematicSelection?.game, theme:theme)
+                    } else {
+                        GoldBackdrop(theme:theme,animated:libraryActive && route == nil)
+                        if layout != .list,let game=selected?.game {
+                            GoldCover(game:game,hero:true).id(game.id).opacity(0.15).blur(radius:12).ignoresSafeArea().allowsHitTesting(false).transition(.opacity)
+                        }
                     }
                     VStack(spacing:geometry.size.height<430 ? 8 : 14) {
-                        header(compact:geometry.size.width<540)
+                        if layout == .cinematic {
+                            cinematicHeader(compact:geometry.size.width<560,
+                                            narrowLandscape:geometry.size.width>geometry.size.height)
+                        } else {
+                            header(compact:geometry.size.width<540)
+                        }
                         if showingSearch {searchBar.transition(.move(edge:.top).combined(with:.opacity))}
                         if model.pending != nil {pending}
                         GeometryReader { available in
                             content(available.size)
                         }.frame(maxWidth:.infinity,maxHeight:.infinity)
-                    }.padding(.horizontal,20).padding(.top,LSX4WindowChrome.topPadding(safeTop:geometry.safeAreaInsets.top,baseline:12)).padding(.bottom,0).frame(maxWidth:.infinity,maxHeight:.infinity,alignment:.top)
+                    }.padding(.horizontal,layout == .cinematic ? min(40,max(14,geometry.size.width*0.05)) : 20)
+                    .padding(.top,LSX4WindowChrome.topPadding(safeTop:geometry.safeAreaInsets.top,baseline:12))
+                    .padding(.bottom,0).frame(maxWidth:.infinity,maxHeight:.infinity,alignment:.top)
                 }
             }.toolbar(.hidden,for:.navigationBar)
                 .goldModal(item:$route,onDismiss:{model.refresh();model.publishInventory();audio.update(visible:applicationActive)}) { destination in
@@ -469,9 +486,75 @@ struct GoldLibraryView:View {
                 .accessibilityLabel(L("Настройки")).accessibilityIdentifier("library-settings")
         }.padding(.horizontal,12).goldGlass(radius:16)
     }
+    private func cinematicHeader(compact:Bool,narrowLandscape:Bool)->some View {
+        VStack(alignment:.leading,spacing:4) {
+            HStack(spacing:compact ? 4 : 16) {
+                Text("LSX4").font(.system(size:compact ? 21 : 24,weight:.bold))
+                    .fixedSize().accessibilityIdentifier("gold-brand")
+                if !compact || narrowLandscape {cinematicTabs(compact:compact)}
+                Spacer(minLength:4)
+                if !compact {
+                    Button {audio.select();route = .importGame} label: {Image(systemName:"plus").frame(width:44,height:44)}
+                        .accessibilityLabel(L("pkg.import.title")).accessibilityIdentifier("library-import-pkg")
+                    Button {model.refresh();model.publishInventory();audio.select()} label: {Image(systemName:"arrow.clockwise").frame(width:44,height:44)}
+                        .accessibilityLabel(G("device_info_refresh","Refresh")).accessibilityIdentifier("cinematic-refresh")
+                }
+                Menu {
+                    Button(L("Поиск игры"),systemImage:"magnifyingglass") {
+                        audio.select()
+                        showingSearch.toggle()
+                        if !showingSearch {search="";searchFocused=false;selectedID=nil}
+                    }
+                    Menu(G("home_layout_action","Library view")) {layoutOptions}
+                    Menu(G("library_sort","Sort games")) {sortOptions}
+                    if compact {
+                        Button(L("pkg.import.title"),systemImage:"plus") {audio.select();route = .importGame}
+                        Button(G("device_info_refresh","Refresh"),systemImage:"arrow.clockwise") {
+                            model.refresh();model.publishInventory();audio.select()
+                        }
+                    }
+                } label: {Image(systemName:"ellipsis").frame(width:44,height:44)}
+                    .accessibilityLabel(G("home_library_controls","Library controls"))
+                    .accessibilityIdentifier("gold-library-controls")
+                Button {audio.select();route = .settings} label: {Image(systemName:"gearshape").frame(width:44,height:44)}
+                    .accessibilityLabel(L("Настройки")).accessibilityIdentifier("library-settings")
+                if !compact {
+                    TimelineView(.everyMinute) {context in
+                        Text(context.date,format:.dateTime.hour().minute())
+                            .font(.subheadline.weight(.semibold)).monospacedDigit()
+                            .foregroundStyle(.white.opacity(0.72)).fixedSize()
+                    }
+                }
+            }
+            if compact && !narrowLandscape {cinematicTabs(compact:false)}
+        }
+        .buttonStyle(.plain)
+    }
+    private func cinematicTabs(compact:Bool)->some View {
+        HStack(spacing:compact ? 9 : 18) {
+            cinematicTab(G("cinematic_games","Games"),library:false,compact:compact)
+            cinematicTab(G("cinematic_library","Library"),library:true,compact:compact)
+        }
+    }
+    private func cinematicTab(_ title:String,library:Bool,compact:Bool)->some View {
+        let selected=cinematicLibrary == library
+        return Button {
+            if !selected {audio.select()}
+            cinematicLibrary=library
+        } label: {
+            Text(title).font(.system(size:compact ? 16 : 21,weight:.semibold))
+                .lineLimit(1).minimumScaleFactor(0.7).frame(minHeight:44)
+                .foregroundStyle(.white.opacity(selected ? 1 : 0.51))
+        }
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityIdentifier(library ? "cinematic-tab-library" : "cinematic-tab-games")
+    }
     @ViewBuilder private var layoutOptions:some View {
         ForEach(GoldLayout.allCases) { style in
-            Button {storedLayout=style.rawValue;audio.select()} label: {Label(style.label,systemImage:layout == style ? "checkmark" : style.symbol)}
+            Button {
+                if style == .cinematic && layout != style {cinematicLibrary=false}
+                storedLayout=style.rawValue;audio.select()
+            } label: {Label(style.label,systemImage:layout == style ? "checkmark" : style.symbol)}
                 .accessibilityIdentifier("gold-layout-option-\(style.rawValue)")
         }
     }
@@ -505,6 +588,12 @@ struct GoldLibraryView:View {
             case .libraryVertical:libraryVertical(size:size)
             case .tilesHorizontal:tiles(horizontal:true,size:size)
             case .tilesVertical:tiles(horizontal:false,size:size)
+            case .cinematic:
+                GoldCinematicHome(
+                    entries:entries, selected:cinematicSelection, size:size, accent:theme.accent,
+                    showingLibrary:cinematicLibrary,select:select,activate:activate,
+                    details:{audio.select();route = .game($0.id)}
+                )
             }
         }
     }
@@ -529,7 +618,10 @@ struct GoldLibraryView:View {
     }
     private func select(_ item:GoldHomeItem) {
         if selectedID != item.id {audio.select()}
-        withAnimation(.spring(response:0.36,dampingFraction:0.82)) {selectedID=item.id}
+        let animation:Animation? = layout == .cinematic
+            ? (reduceMotion ? nil : .easeInOut(duration:0.23))
+            : .spring(response:0.36,dampingFraction:0.82)
+        withAnimation(animation) {selectedID=item.id}
     }
     private func activate(_ item:GoldHomeItem) {
         if let game=item.game {launch(game)}

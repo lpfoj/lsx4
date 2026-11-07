@@ -23,6 +23,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <thread>
+#include <chrono>
 #include <new>
 
 namespace Libraries::Fiber {
@@ -427,6 +429,12 @@ s32 TraceAndroidFiberResult(const char* operation, const s32 result, const void*
         result == ORBIS_FIBER_ERROR_PERMISSION &&
         operation != nullptr && std::strcmp(operation, "GetSelf") == 0;
     if (result != ORBIS_OK && !expected_get_self_probe) {
+        std::fprintf(stderr,
+                     "[LSX4_FIBER_API_ERROR] op=%s result=0x%08x subject=%p detail0=0x%llx "
+                     "detail1=0x%llx\n",
+                     operation, static_cast<u32>(result), subject,
+                     static_cast<unsigned long long>(detail0),
+                     static_cast<unsigned long long>(detail1));
         LOG_ERROR(Lib_Fiber,
                   "[LSX4_FIBER_API_ERROR] op={} result={:#x} subject={} detail0={:#x} "
                   "detail1={:#x}",
@@ -717,6 +725,31 @@ s32 PS4_SYSV_ABI sceFiberFinalize(OrbisFiber* fiber) {
     return ORBIS_OK;
 }
 
+#if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)
+namespace {
+
+// A fiber leaves Run inside the switch issued by the thread that ran it. A
+// guest scheduler that wakes the fiber from another thread can arrive while
+// that switch is still in flight, so give the owner a short window to finish.
+bool AcquireIdleFiberForRun(OrbisFiber* fiber) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{5};
+    for (u32 attempt = 0;; ++attempt) {
+        FiberState expected = FiberState::Idle;
+        if (fiber->state.compare_exchange_strong(expected, FiberState::Run)) {
+            return true;
+        }
+        if (expected != FiberState::Run || std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        if (attempt >= 64) {
+            std::this_thread::yield();
+        }
+    }
+}
+
+} // namespace
+#endif
+
 s32 PS4_SYSV_ABI sceFiberRunImpl(OrbisFiber* fiber, void* addr_context, u64 size_context,
                                  u64 arg_on_run_to, u64* arg_on_return) {
     if (!fiber) {
@@ -741,10 +774,16 @@ s32 PS4_SYSV_ABI sceFiberRunImpl(OrbisFiber* fiber, void* addr_context, u64 size
         }
     }
 
+#if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)
+    if (!AcquireIdleFiberForRun(fiber)) {
+        return ORBIS_FIBER_ERROR_STATE;
+    }
+#else
     FiberState expected = FiberState::Idle;
     if (!fiber->state.compare_exchange_strong(expected, FiberState::Run)) {
         return ORBIS_FIBER_ERROR_STATE;
     }
+#endif
 
 #if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)
     const s32 android_result = RunAndroidFiber(fiber, arg_on_run_to, arg_on_return);
@@ -823,10 +862,16 @@ s32 PS4_SYSV_ABI sceFiberSwitchImpl(OrbisFiber* fiber, void* addr_context, u64 s
         }
     }
 
+#if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)
+    if (!AcquireIdleFiberForRun(fiber)) {
+        return ORBIS_FIBER_ERROR_STATE;
+    }
+#else
     FiberState expected = FiberState::Idle;
     if (!fiber->state.compare_exchange_strong(expected, FiberState::Run)) {
         return ORBIS_FIBER_ERROR_STATE;
     }
+#endif
 
 #if defined(__ANDROID__) || defined(LSX4_APPLE_RUNTIME)
     const s32 android_result = SwitchAndroidFiber(fiber, arg_on_run_to, arg_on_run);

@@ -12,6 +12,11 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #if defined(LSX4_APPLE_RUNTIME)
+#include <pthread.h>
+#include <thread>
+#include "core/debug_state.h"
+#endif
+#if defined(LSX4_APPLE_RUNTIME)
 #include "AppleHostServices.h"
 #endif
 
@@ -147,10 +152,37 @@ void Swapchain::SetHDR(bool hdr) {
     }
 }
 
+#if defined(LSX4_APPLE_RUNTIME)
+// Presentation submits Metal work too; while the lifecycle pause holds the guest
+// (app inactive or in the background) a present would be rejected and lose the
+// device. Off the main thread, wait for the app to become active again.
+static bool ExecutorPresentationHeldForLifecycle() {
+    if (!DebugState.IsGuestThreadsPaused()) {
+        return false;
+    }
+    if (pthread_main_np() != 0) {
+        return true;
+    }
+    static std::atomic<unsigned> hold_logs{0};
+    if (hold_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
+        std::fprintf(stderr, "[LSX4_GPU_LIFECYCLE_HOLD] engine=presentation\n");
+    }
+    while (DebugState.IsGuestThreadsPaused()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    return false;
+}
+#endif
+
 bool Swapchain::AcquireNextImage() {
     if (terminal) {
         return false;
     }
+#if defined(LSX4_APPLE_RUNTIME)
+    if (ExecutorPresentationHeldForLifecycle()) {
+        return false;
+    }
+#endif
     if (!swapchain || image_acquired.empty()) {
         needs_recreation = true;
         return false;
@@ -208,6 +240,11 @@ bool Swapchain::Present() {
     if (terminal) {
         return false;
     }
+#if defined(LSX4_APPLE_RUNTIME)
+    // The image is already acquired; a main-thread caller cannot wait here, so
+    // it presents as before.
+    (void)ExecutorPresentationHeldForLifecycle();
+#endif
 
 #if defined(LSX4_APPLE_RUNTIME)
     if (const auto capture = Lsx4::Apple::TakeDiagnosticFrameCapture()) {

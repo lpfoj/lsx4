@@ -4019,6 +4019,20 @@ s32 PthreadMutex::SelfLock(const OrbisKernelTimespec* abstime, u64 usec) {
     }
 }
 
+#if defined(LSX4_APPLE_RUNTIME)
+// Plain guest mutexes have no spin phase; titles whose job queues hand over
+// microsecond critical sections set LSX4_CLAUDE_MUTEX_SPIN to spin briefly
+// before parking the host thread.
+static int ClaudeDefaultMutexSpins() {
+    static const int spins = [] {
+        const char* value = std::getenv("LSX4_CLAUDE_MUTEX_SPIN");
+        const int parsed = value != nullptr ? std::atoi(value) : 0;
+        return parsed > 0 && parsed <= 100000 ? parsed : 0;
+    }();
+    return spins;
+}
+#endif
+
 s32 PthreadMutex::Lock(const OrbisKernelTimespec* abstime, u64 usec, void* guest_cell) {
     Pthread* curthread = CurrentMutexThread();
     if (m_owner == curthread || IsOwnedByCurrentHostThread(this)) {
@@ -4027,6 +4041,9 @@ s32 PthreadMutex::Lock(const OrbisKernelTimespec* abstime, u64 usec, void* guest
 
     if (m_protocol == PthreadMutexProt::None) [[likely]] {
         s32 count = m_spinloops;
+#if defined(LSX4_APPLE_RUNTIME)
+        if (count == 0) count = ClaudeDefaultMutexSpins();
+#endif
         while (count--) {
             if (m_lock.try_lock()) {
                 m_owner = curthread;

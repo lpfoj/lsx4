@@ -52,7 +52,7 @@ struct IOSPatchCatalogue: Codable { let games: [IOSPatchGame] }
         objectWillChange.send();defaults.set(value, forKey: prefix(game)+".source")
     }
     func enabled(_ game: IOSPatchGame) -> Bool {
-        defaults.object(forKey: prefix(game)+".enabled") as? Bool ?? game.titleIds.contains("CUSA03173")
+        defaults.object(forKey: prefix(game)+".enabled") as? Bool ?? (game.titleIds.contains("CUSA03173") || game.titleIds.contains("CUSA01715"))
     }
     func setEnabled(_ value: Bool, game: IOSPatchGame) {
         objectWillChange.send();defaults.set(value, forKey: prefix(game)+".enabled")
