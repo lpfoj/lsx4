@@ -57,6 +57,11 @@ struct Decoder {
     std::deque<AVFrame*> ready;
     std::vector<u8> pixels;
     u64 output_count = 0;
+    // A clip that starts (or resumes after Reset) away from a clean reference must not
+    // surface concealed pictures: FFmpeg fills missing references with grey/green
+    // macroblocks, which the PS4 decoder never returns as valid frames.
+    bool clean_frame_seen = false;
+    u64 dropped_corrupt = 0;
     ~Decoder() {
         for (auto* frame : ready) av_frame_free(&frame);
         avcodec_free_context(&codec);
@@ -73,6 +78,16 @@ struct Decoder {
                 return 0;
             }
             if (rc < 0) { av_frame_free(&frame); return Error(17); }
+            const bool corrupt = (frame->flags & AV_FRAME_FLAG_CORRUPT) != 0 ||
+                                 frame->decode_error_flags != 0;
+            if (!clean_frame_seen && corrupt) {
+                if (++dropped_corrupt == 1 || dropped_corrupt % 120 == 0)
+                    LOG_INFO(Lib_AvPlayer, "Dropped concealed frame before first clean picture count={}",
+                             dropped_corrupt);
+                av_frame_free(&frame);
+                continue;
+            }
+            clean_frame_seen = true;
             ready.push_back(frame);
         }
         return Error(0);
@@ -94,6 +109,11 @@ struct Decoder {
         int strides[4]{int(layout.pitch), int(layout.pitch)};
         if (sws_scale(scaler, frame->data, frame->linesize, 0, frame->height, planes, strides)
             != frame->height) return Error(17);
+        // Retire any GPU ownership of the output pages before the CPU writes the
+        // picture. Invalidating only afterwards lets a GPU-modified range (e.g. a
+        // texture the title cleared on the GPU) be read back over the new frame,
+        // which leaves an all-zero NV12 surface: a solid green video.
+        Core::Memory::Instance()->InvalidateMemory(address, layout.bytes);
         // Same ownership lease as AvPlayer. No writes become visible while an
         // old GPU owner or a descriptor-snapshot reader still owns the pages.
         VideoCore::PageManager::PrepareBulkGuestWrite(address, layout.bytes);
@@ -181,6 +201,7 @@ s32 PS4_SYSV_ABI sceVideodecCreateDecoder(const Config* cfg, const Resource* res
     decoder->codec->width = cfg->maxFrameWidth;
     decoder->codec->height = cfg->maxFrameHeight;
     decoder->codec->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
+    decoder->codec->flags &= ~AV_CODEC_FLAG_OUTPUT_CORRUPT;
     // Slice threading avoids extra frame latency and an unbounded CPU cohort.
     decoder->codec->thread_count = 2;
     decoder->codec->thread_type = FF_THREAD_SLICE;
@@ -254,6 +275,7 @@ s32 PS4_SYSV_ABI sceVideodecReset(Control* control) {
     avcodec_flush_buffers(decoder->codec);
     for (auto* frame : decoder->ready) av_frame_free(&frame);
     decoder->ready.clear(); decoder->draining = false;
+    decoder->clean_frame_seen = false;
     return 0;
 }
 s32 PS4_SYSV_ABI sceVideodecDeleteDecoder(Control* control) {

@@ -1873,6 +1873,18 @@ ImageId TextureCache::ExecutorTakeLiveFullResolutionTarget(u32 width, u32 height
         // registered GPU-modified color target, and match the scanout's observable row layout
         // except for the exact tile-height payload and a compatible UNORM/SRGB format.
         const auto& preferred_info = preferred_image->info;
+        // Per-title stability: a resolution-patched title can draw a second full-width
+        // tile-aligned target in some flips (GoW III at 960x544 redraws its title buffer
+        // about once per second). Present the target address that qualifies most often
+        // instead of whichever was drawn last, so the real frame never flickers away.
+        static const bool detached_stable = [] {
+            const char* value = std::getenv("EXECUTOR_STABLE_DETACHED_TILE_ALIGNED_VO");
+            return value != nullptr && value[0] == '1';
+        }();
+        static std::unordered_map<VAddr, u64> detached_hits;
+        ImageId detached_best{};
+        u64 detached_best_hits = 0;
+        boost::container::small_vector<VAddr, 4> detached_seen;
         for (auto it = candidates.rbegin(); it != candidates.rend(); ++it) {
             if (!candidate_valid(*it) || *it == preferred) {
                 continue;
@@ -1912,7 +1924,25 @@ ImageId TextureCache::ExecutorTakeLiveFullResolutionTarget(u32 width, u32 height
                     static_cast<u32>(candidate_info.pixel_format),
                     static_cast<u32>(preferred_info.pixel_format));
             }
-            return *it;
+            if (!detached_stable) {
+                return *it;
+            }
+            const VAddr address = candidate_info.guest_address;
+            if (std::ranges::find(detached_seen, address) == detached_seen.end()) {
+                detached_seen.push_back(address);
+                if (detached_hits.size() > 64) {
+                    detached_hits.clear();
+                }
+                ++detached_hits[address];
+            }
+            const u64 hits = detached_hits[address];
+            if (!detached_best || hits > detached_best_hits) {
+                detached_best = *it;
+                detached_best_hits = hits;
+            }
+        }
+        if (detached_best) {
+            return detached_best;
         }
     }
 
